@@ -1,9 +1,4 @@
-"""Abstract chat-completions client.
-
-Subclass :class:`LLMClient` to plug in a different backend (e.g. Anthropic,
-a local server). The rest of the library talks only to this interface, so a
-new backend is a single new class.
-"""
+"""Abstract chat-completions client."""
 
 from abc import ABC, abstractmethod
 from typing import Any, Optional

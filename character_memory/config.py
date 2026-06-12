@@ -18,6 +18,18 @@ class LLMConfig:
 
 
 @dataclass
+class EmbeddingConfig:
+    """Settings for an embedding client."""
+
+    base_url: str = os.getenv("OPENAI_EMBEDDINGS_BASE_URL", "https://api.openai.com/v1")
+    api_key: str = os.getenv("OPENAI_API_KEY", "")
+    model: str = os.getenv("OPENAI_EMBEDDINGS_MODEL", "text-embedding-ada-002")
+    dim: Optional[int] = None  # inferred from the first request if None
+    batch_size: int = 64
+    timeout: float = 120.0
+
+
+@dataclass
 class ChunkingConfig:
     """Chunker selection + parameters used at index time."""
 
