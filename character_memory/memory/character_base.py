@@ -6,11 +6,9 @@ This is used for a inner memory type, not relevant to the user.
 For example wikis, conversations and base character information.
 """
 
-from __future__ import annotations
-
 from typing import Optional
 
-from ..rag.hybrid_search import HybridSearch
+from ..rag.hybrid import HybridSearch
 from .base import Memory, MemoryItem
 
 

@@ -7,13 +7,11 @@ Subclasses only declare their columns and how a row renders to text; all the
 recall/persist/index plumbing lives here.
 """
 
-from __future__ import annotations
-
 import time
 from typing import Any, Callable, Optional
 
 from ..chunking.base import Chunk
-from ..rag.hybrid_search import HybridSearch
+from ..rag.hybrid import HybridSearch
 from .base import Memory, MemoryItem
 from .decay import age_seconds, decay_score
 from .store import SQLiteStore

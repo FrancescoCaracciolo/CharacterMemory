@@ -4,6 +4,10 @@ from .config import (
     ChunkingConfig,
     LLMConfig,
 )
+from .memory import (
+    MemoryItem,
+    Memory,
+)
 from .llm import (
     LLMClient,
 )
