@@ -8,7 +8,7 @@ them.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
-
+from ..chunking import Chunk
 
 @dataclass
 class MemoryItem:
@@ -30,7 +30,15 @@ class Memory(ABC):
 
     @abstractmethod
     def recall(self, query: str, user_id: str, limit: int) -> list[MemoryItem]:
-        """Return up to ``limit`` items relevant to ``query`` for ``user_id``."""
+        """Return up to `limit` items relevant to `query` for `user_id`."""
+
+    @abstractmethod
+    def build(self, info_chunks:list[Chunk]) -> None:
+        """Build the memory from the given `info_chunks`."""
+
+    @abstractmethod 
+    def persist(self, path: str) -> None:
+        """Persist the memory to `path`."""
 
     @property
     def title(self) -> str:
@@ -38,11 +46,11 @@ class Memory(ABC):
         return self.name.replace("_", " ").title()
 
     def format(self, items: list[MemoryItem]) -> str:
-        """Render recalled ``items`` into a prompt fragment (override me)."""
+        """Render recalled `items` into a prompt fragment (override me)."""
         return "\n".join(f"- {it.text}" for it in items)
 
     def build_section(self, query: str, user_id: str, limit: int) -> Optional[str]:
-        """Recall (if enabled) and format; ``None`` when there is nothing to show."""
+        """Recall (if enabled) and format; `None` when there is nothing to show."""
         items = self.recall(query, user_id, limit) if self.enabled else []
         if not items:
             return None
