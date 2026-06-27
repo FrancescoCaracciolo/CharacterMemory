@@ -4,6 +4,7 @@ import json
 from typing import Optional
 
 from .base import Memory, MemoryItem
+from ..chunking import Chunk
 from .store import SQLiteStore
 
 
@@ -36,7 +37,7 @@ class EmotionStatus(Memory):
             {"user_id": "TEXT PRIMARY KEY", "state": "TEXT NOT NULL"},
         )
 
-    # ----------------------------------------------------------------- state
+    # State
     def _default_user_state(self) -> dict[str, float]:
         return {k: float(v) for k, v in self.user_dims.items()}
 
@@ -64,8 +65,18 @@ class EmotionStatus(Memory):
         self.set_user_state(user_id, current)
         return current
 
-    # ---------------------------------------------------------------- recall
+    # Recall
     def recall(self, query: str, user_id: str, limit: int) -> list[MemoryItem]:
         state = self.get_user_state(user_id)
         parts = [f"{k}={v:.2f}" for k, v in self.baseline.items()]
         parts += [f"{k}(toward {user_id})={v:.2f}" for k, v in state.items()]
+
+    # Implement not needed methods 
+    def build(self, info_chunks: list[Chunk]) -> None:
+        return None
+
+    def load(self, path: str) -> None:
+        return None 
+    
+    def persist(self, path: str) -> None:
+        return None

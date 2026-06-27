@@ -52,6 +52,15 @@ class StructuredMemory(Memory):
         cols = {**COMMON_COLUMNS, **self.extra_columns}
         self.store.create_table(self.table, cols)
 
+    def build(self, info_chunks: list[Chunk]) -> None:
+        return self.hybrid.build(info_chunks)
+
+    def persist(self, path: str) -> None:
+        return self.hybrid.persist(path)
+
+    def load(self, path: str) -> None:
+        return self.hybrid.load(path)
+    
     # MAPPING UTILITIES
     def row_text(self, row: dict[str, Any]) -> str:
         """Text used for embedding + BM25 (override me)."""
@@ -103,7 +112,7 @@ class StructuredMemory(Memory):
             half_life=self.half_life,
         )
 
-    def recall(self, query: str, user_id: str, limit: int, sticky_limit=10) -> list[MemoryItem]:
+    def recall(self, query: str, user_id: str, limit: int, sticky_limit:int=10) -> list[MemoryItem]:
         rows_by_id = {r["id"]: r for r in self.store.select(self.table, {"user_id": user_id})}
         if not rows_by_id:
             return []

@@ -10,7 +10,7 @@ from typing import Optional
 
 from ..rag.hybrid import HybridSearch
 from .base import Memory, MemoryItem
-
+from ..chunking import Chunk
 
 class RAGMemory(Memory):
     """Memory whose recall is just a hybrid search over pre-built chunks."""
@@ -34,6 +34,14 @@ class RAGMemory(Memory):
     def format(self, items: list[MemoryItem]) -> str:
         return "\n\n".join(it.text for it in items)
 
+    def build(self, info_chunks: list[Chunk]) -> None:
+        return self.hybrid.build(info_chunks)
+
+    def persist(self, path: str) -> None:
+        return self.hybrid.persist(path)
+
+    def load(self, path: str) -> None:
+        return self.hybrid.load(path)
 
 class CharacterInfoMemory(RAGMemory):
     """BM25 + similarity search over the character's wiki/story markdown."""

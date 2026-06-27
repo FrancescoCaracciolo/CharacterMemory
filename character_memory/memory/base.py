@@ -40,6 +40,10 @@ class Memory(ABC):
     def persist(self, path: str) -> None:
         """Persist the memory to `path`."""
 
+    @abstractmethod 
+    def load(self, path: str) -> None:
+        """Load the memory from `path`."""
+
     @property
     def title(self) -> str:
         """Header used when this memory's section is rendered."""
