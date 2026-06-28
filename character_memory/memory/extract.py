@@ -1,109 +1,82 @@
 """LLM-based extraction of structured memories from a batch of turns.
 
-Every `extract_interval` turns the agent hands the recent exchanges to an
-`Extractor`, which asks the LLM (via structured output) to surface new
-facts, directives, episodes, and emotion updates. The parsed result is applied
-to the relevant memories.
+Every `extract_interval` turns the agent asks each *enabled* memory for an
+:class:`~character_memory.memory.base.ExtractionSpec`, composes a single
+combined JSON schema + instruction out of those specs, runs one structured-LLM
+call, and hands each memory the value it asked for. Because the schema is built
+from the memories themselves, a disabled (or self-skipping) memory contributes
+nothing — that type simply isn't extracted.
 """
 
 from typing import Any
 
 from ..llm.base import LLMClient
+from .base import ExtractionSpec
 
-SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "facts": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "type": {"type": "string"},
-                    "content": {"type": "string"},
-                    "importance": {"type": "number"},
-                    "confidence": {"type": "number"},
-                },
-                "required": ["type", "content", "importance", "confidence"],
-            },
-        },
-        "directives": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string"},
-                    "importance": {"type": "number"},
-                    "keywords": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["content", "importance", "keywords"],
-            },
-        },
-        "episodes": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string"},
-                    "importance": {"type": "number"},
-                    "emotional_shift": {"type": "number"},
-                },
-                "required": ["summary", "importance", "emotional_shift"],
-            },
-        },
-        "emotion_deltas": {
-            "type": "object",
-            "description": "Signed adjustments to per-user emotion dims.",
-            "additionalProperties": {"type": "number"},
-        },
-    },
-    "required": ["facts", "directives", "episodes", "emotion_deltas"],
-}
-
-DEFAULT_INSTRUCTION = (
+_INSTRUCTION_HEADER = (
     "You are a memory extractor for a role-play character. Analyze the recent "
     "conversation and extract durable, reusable information about the USER and "
     "about events.\n"
-    "- facts: stable facts about the user (occupation, preferences, relationships, "
-    "goals) or general facts the user stated. importance 0-1 (how much it should "
-    "shape the character's behaviour), confidence 0-1.\n"
-    "- directives: standing instructions the user gave (e.g. 'always answer "
-    "formally'). importance 0-1. keywords: terms that should trigger retrieval.\n"
-    "- episodes: notable things that happened. emotional_shift -1..1 (negative to "
-    "positive) capturing how the event shifted the character's feelings.\n"
-    "- emotion_deltas: small signed adjustments to the character's feelings toward "
-    "this user (affection, valence, trust, ...).\n"
-    "Only include genuinely new, non-trivial items. Return [] where nothing fits.\n\n"
+)
+_INSTRUCTION_FOOTER = (
+    "Only include genuinely new, non-trivial items. Return [] where nothing "
+    "fits, and omit fields entirely if they are not present in the schema.\n\n"
     "Recent conversation:"
 )
+
+
+def build_extraction(specs: list[ExtractionSpec]) -> tuple[dict[str, Any], str]:
+    """Compose one JSON schema + instruction from the given memory specs.
+
+    Each spec contributes one property (keyed by ``spec.field``) and one bullet
+    line to the instruction. The returned schema/instruction are passed to a
+    single structured-LLM call.
+    """
+    properties = {s.field: s.schema for s in specs}
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "required": [s.field for s in specs],
+    }
+    instruction = _INSTRUCTION_HEADER + "\n".join(s.instruction for s in specs) + "\n" + _INSTRUCTION_FOOTER
+    return schema, instruction
 
 
 class Extractor:
     """Turns recent exchanges into structured-memory updates."""
 
-    def __init__(self, llm: LLMClient, instruction: str = DEFAULT_INSTRUCTION) -> None:
+    def __init__(self, llm: LLMClient) -> None:
         self.llm = llm
-        self.instruction = instruction
 
-    def extract(self, turns: list[dict[str, str]]) -> dict[str, Any]:
-        """`turns` is a list of `{"role": "user"|"assistant", "content": ...}`."""
+    def extract(
+        self,
+        turns: list[dict[str, str]],
+        schema: dict[str, Any],
+        instruction: str,
+    ) -> dict[str, Any]:
+        """Run one structured extraction pass.
+
+        `turns` is a list of `{"role": "user"|"assistant", "content": ...}`.
+        `schema`/`instruction` are built by :func:`build_extraction` from the
+        participating memories' specs.
+        """
         transcript = "\n\n".join(
             f"{'User' if t['role'] == 'user' else 'Character'}: {t['content']}"
             for t in turns
             if t.get("content")
         )
+        fields = list(schema.get("properties", {}).keys())
+        empty = {f: ([] if schema["properties"][f].get("type") == "array" else {}) for f in fields}
         if not transcript.strip():
-            return {"facts": [], "directives": [], "episodes": [], "emotion_deltas": {}}
+            return empty
         messages = [
-            {"role": "system", "content": self.instruction},
+            {"role": "system", "content": instruction},
             {"role": "user", "content": transcript},
         ]
         try:
-            result = self.llm.chat_structured(messages, SCHEMA)
+            result = self.llm.chat_structured(messages, schema)
         except Exception as exc:  # pragma: no cover - network/model errors
-            return {"facts": [], "directives": [], "episodes": [], "emotion_deltas": {},
-                    "error": str(exc)}
-        result.setdefault("facts", [])
-        result.setdefault("directives", [])
-        result.setdefault("episodes", [])
-        result.setdefault("emotion_deltas", {})
+            return {**empty, "error": str(exc)}
+        for f, default in empty.items():
+            result.setdefault(f, default)
         return result

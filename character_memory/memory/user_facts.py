@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from .base import MemoryItem
+from .base import ExtractionSpec, MemoryItem
 from .structured import StructuredMemory
 
 
@@ -45,3 +45,41 @@ class UserFactMemory(StructuredMemory):
     def row_item(self, row: dict[str, Any], score: float) -> MemoryItem:
         text = f"{row.get('content', '')} (type: {row.get('type', 'general')}, confidence: {row.get('confidence', 0):.2f})"
         return MemoryItem(text=text, score=score, kind=self.name, metadata=dict(row))
+
+    # Extraction ----------------------------------------------------------
+    def extraction_spec(self) -> ExtractionSpec:
+        return ExtractionSpec(
+            field="facts",
+            schema={
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "content": {"type": "string"},
+                        "importance": {"type": "number"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["type", "content", "importance", "confidence"],
+                },
+            },
+            instruction=(
+                "- facts: stable facts about the user (occupation, preferences, "
+                "relationships, goals) or general facts the user stated. importance "
+                "0-1 (how much it should shape the character's behaviour), "
+                "confidence 0-1."
+            ),
+        )
+
+    def apply_extraction(self, value: Any, user_id: str) -> None:
+        for f in value or []:
+            content = (f.get("content") or "").strip()
+            if not content or self._has_text(user_id, content, "content"):
+                continue
+            self.add_fact(
+                user_id,
+                content,
+                type=str(f.get("type", "general")),
+                importance=self._clip(f.get("importance", 0.5)),
+                confidence=self._clip(f.get("confidence", 0.5)),
+            )

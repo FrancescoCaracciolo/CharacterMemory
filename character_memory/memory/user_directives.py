@@ -3,7 +3,7 @@
 import json
 from typing import Any
 
-from .base import MemoryItem
+from .base import ExtractionSpec, MemoryItem
 from .structured import StructuredMemory
 
 
@@ -67,3 +67,38 @@ class UserDirectiveMemory(StructuredMemory):
 
     def row_item(self, row: dict[str, Any], score: float) -> MemoryItem:
         return MemoryItem(text=row.get("content", ""), score=score, kind=self.name, metadata=dict(row))
+
+    # Extraction ----------------------------------------------------------
+    def extraction_spec(self) -> ExtractionSpec:
+        return ExtractionSpec(
+            field="directives",
+            schema={
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "importance": {"type": "number"},
+                        "keywords": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["content", "importance", "keywords"],
+                },
+            },
+            instruction=(
+                "- directives: standing instructions the user gave (e.g. 'always "
+                "answer formally'). importance 0-1. keywords: terms that should "
+                "trigger retrieval."
+            ),
+        )
+
+    def apply_extraction(self, value: Any, user_id: str) -> None:
+        for d in value or []:
+            content = (d.get("content") or "").strip()
+            if not content or self._has_text(user_id, content, "content"):
+                continue
+            self.add_directive(
+                user_id,
+                content,
+                importance=self._clip(d.get("importance", 0.5)),
+                retrieval_keywords=d.get("keywords") or [],
+            )

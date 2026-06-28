@@ -73,6 +73,21 @@ class StructuredMemory(Memory):
     def _row_meta(self, row: dict[str, Any]) -> dict:
         return {"id": row["id"], "user_id": row["user_id"]}
 
+    # Extraction helpers (used by subclasses' apply_extraction).
+    def _has_text(self, user_id: str, text: str, content_col: str = "content") -> bool:
+        """True if a row for `user_id` already stores `text` (case-insensitive)."""
+        rows = self.store.select(self.table, {"user_id": user_id})
+        return any((r.get(content_col) or "").strip().lower() == text.strip().lower() for r in rows)
+
+    @staticmethod
+    def _clip(v: Any, lo: float = 0.0, hi: float = 1.0) -> float:
+        """Coerce a possibly-bad LLM value into a clamped float in [lo, hi]."""
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            x = 0.5
+        return max(lo, min(hi, x))
+
     # ADD ELEMENT
     def add(self, user_id: str, importance: float, **fields) -> int:
         now = self._now()

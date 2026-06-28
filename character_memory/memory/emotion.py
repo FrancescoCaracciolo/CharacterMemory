@@ -1,9 +1,9 @@
 """Emotion status: a user-independent baseline plus configurable per-user dims."""
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
-from .base import Memory, MemoryItem
+from .base import ExtractionSpec, Memory, MemoryItem
 from ..chunking import Chunk
 from .store import SQLiteStore
 
@@ -70,13 +70,34 @@ class EmotionStatus(Memory):
         state = self.get_user_state(user_id)
         parts = [f"{k}={v:.2f}" for k, v in self.baseline.items()]
         parts += [f"{k}(toward {user_id})={v:.2f}" for k, v in state.items()]
+        return [MemoryItem(text=p, score=1.0, kind=self.name) for p in parts]
 
-    # Implement not needed methods 
+    # Implement not needed methods
     def build(self, info_chunks: list[Chunk]) -> None:
         return None
 
     def load(self, path: str) -> None:
-        return None 
-    
+        return None
+
     def persist(self, path: str) -> None:
         return None
+
+    # Extraction ----------------------------------------------------------
+    def extraction_spec(self) -> ExtractionSpec:
+        dims = ", ".join(self.user_dims) or "affection, valence, trust"
+        return ExtractionSpec(
+            field="emotion_deltas",
+            schema={
+                "type": "object",
+                "description": "Signed adjustments to per-user emotion dims.",
+                "additionalProperties": {"type": "number"},
+            },
+            instruction=(
+                f"- emotion_deltas: small signed adjustments to the character's "
+                f"feelings toward this user. Allowed dims: {dims}."
+            ),
+        )
+
+    def apply_extraction(self, value: Any, user_id: str) -> None:
+        if value:
+            self.update(user_id, value)

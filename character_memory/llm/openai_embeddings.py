@@ -4,7 +4,7 @@ from typing import Optional
 import numpy as np
 from openai import OpenAI
 from ..config import EmbeddingConfig
-from .embeddings_base import EmbeddingProvider
+from .embedding_base import EmbeddingProvider
 
 
 class OpenAICompatibleEmbeddings(EmbeddingProvider):

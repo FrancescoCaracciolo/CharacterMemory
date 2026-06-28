@@ -1,5 +1,5 @@
 from .base import Memory, MemoryItem
-from .character_info import CharacterInfoMemory, DialogueStyleMemory, RAGMemory
+from .character_base import CharacterInfoMemory, DialogueStyleMemory, RAGMemory
 from .emotion import EmotionStatus
 from .episodic import EpisodicMemory
 from .extract import Extractor
