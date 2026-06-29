@@ -42,7 +42,7 @@ def main() -> None:
         mem.persist(index_dir)
 
     # 4) Search for the exchange most similar to a new user line.
-    for hit in mem.recall("Christina", user_id="anyone", limit=3):
+    for hit in mem.recall("What is the phonewave?", user_id="anyone", limit=3):
         print("---", hit.score)
         print(hit.text)
 
