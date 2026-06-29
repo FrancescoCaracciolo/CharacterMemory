@@ -17,7 +17,7 @@ import faiss
 import numpy as np
 
 from ..chunking.base import Chunk
-from ..llm.embeddings_base import EmbeddingProvider
+from ..llm.embedding_base import EmbeddingProvider
 from .base import Hit, RAGSystem
 
 # llama-index as a library: node schema + BM25 retriever.

@@ -1,27 +1,76 @@
-"""character_memory: a modular memory system for role-play characters."""
+"""character_memory, a modular memory system for role-play characters.
 
+Public surface:
+
+* `CharacterMemoryConfig` / sub-configs — configure models, toggles, decay.
+* `CharacterAgent` - the orchestrator (recall -> prompt -> LLM -> learn).
+* Memory classes, the RAG system, chunkers, and the LLM/embedding abstractions
+  are all re-exported for direct use or subclassing.
+"""
+
+from .agent import CharacterAgent
 from .config import (
+    CharacterMemoryConfig,
     ChunkingConfig,
+    EmbeddingConfig,
     LLMConfig,
-)
-from .memory import (
-    MemoryItem,
-    Memory,
+    MemoryConfig,
 )
 from .llm import (
+    EmbeddingProvider,
     LLMClient,
+    OpenAICompatibleEmbeddings,
+    OpenAICompatibleLLM,
 )
+from .memory import (
+    CharacterInfoMemory,
+    DialogueStyleMemory,
+    EmotionStatus,
+    EpisodicMemory,
+    Extractor,
+    HeartbeatJournal,
+    Memory,
+    MemoryItem,
+    SQLiteStore,
+    StructuredMemory,
+    UserDirectiveMemory,
+    UserFactMemory,
+)
+from .prompts import PromptConfig
+from .rag import Hit, HybridSearch, RAGSystem
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "CharacterAgent",
+    "CharacterMemoryConfig",
     "LLMConfig",
+    "EmbeddingConfig",
     "ChunkingConfig",
+    "MemoryConfig",
+    "PromptConfig",
     "LLMClient",
+    "EmbeddingProvider",
+    "OpenAICompatibleLLM",
+    "OpenAICompatibleEmbeddings",
+    "RAGSystem",
+    "HybridSearch",
+    "Hit",
     "Chunker",
     "Chunk",
     "get_chunker",
     "register_chunker",
+    "Memory",
+    "MemoryItem",
+    "StructuredMemory",
+    "CharacterInfoMemory",
+    "DialogueStyleMemory",
+    "UserFactMemory",
+    "UserDirectiveMemory",
+    "EpisodicMemory",
+    "EmotionStatus",
+    "HeartbeatJournal",
+    "SQLiteStore",
+    "Extractor",
 ]
 
-from .chunking import Chunk, Chunker, get_chunker, register_chunker 

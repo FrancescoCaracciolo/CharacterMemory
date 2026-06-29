@@ -5,6 +5,34 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 
+
+def _load_dotenv() -> None:
+    """Minimal, dependency-free `.env` loader.
+
+    Reads `KEY=VALUE` lines from a `.env` file at the project root (the parent
+    of this package) and exports them via :func:`os.environ.setdefault`, so
+    values already present in the real environment win. Runs at import time,
+    before the config dataclasses evaluate their `os.getenv` defaults.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for root in (os.getcwd(), os.path.dirname(here)):
+        path = os.path.join(root, ".env")
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key:
+                    os.environ.setdefault(key, value)
+        break
+
+
+_load_dotenv()
+
 @dataclass
 class LLMConfig:
     """Settings for a chat-completions client."""
@@ -39,3 +67,73 @@ class ChunkingConfig:
     dialogue_turns_per_chunk: int = 6
     dialogue_context_width: int = 3       # preceding turns carried as context
 
+
+@dataclass
+class MemoryConfig:
+    """Per-memory toggles and retrieval knobs.
+
+    Every memory can be enabled/disabled independently via `enabled_*`.
+    """
+
+    # Toggles
+    enabled_character_info: bool = True
+    enabled_dialogue_style: bool = True
+    enabled_user_facts: bool = True
+    enabled_user_directives: bool = True
+    enabled_episodic: bool = True
+    enabled_emotion: bool = True
+    enabled_heartbeat: bool = True
+
+    # Retrivial Sizes
+    character_info_k: int = 4
+    dialogue_style_k: int = 4
+    user_facts_k: int = 5
+    user_directives_k: int = 4
+    episodic_k: int = 4
+    heartbeat_k: int = 4
+
+    # Structured Memory behavior
+    # Facts/directives whose effective importance is at/above this value are
+    # always injected into the prompt ("sticky"), regardless of the query.
+    sticky_threshold: float = 0.95
+    # Extraction of facts/directives/episodes runs every N turns.
+    extract_interval: int = 5
+    # Decay half-life (seconds). Used by facts/episodic/heartbeat.
+    decay_half_life: float = 60 * 60 * 24 * 3 # Three days
+
+    # EMOTIONS
+    # Baseline (user-independent) emotion vector.
+    emotion_baseline: dict = field(
+        default_factory=lambda: {
+            "neutral": 0.5, "joy": 0.2, "sadness": 0.1, "anxiety": 0,
+            "anger": 0.1, "surprise": 0.1,
+        }
+    )
+    # Per-user dimensions maintained alongside the baseline.
+    emotion_user_dims: dict = field(
+        default_factory=lambda: {"affection": 0.0, "valence": 0.0, "trust": 0.0}
+    )
+
+    def is_enabled(self, name: str) -> bool:
+        return bool(getattr(self, f"enabled_{name}", False))
+
+    def k_for(self, name: str) -> int:
+        return int(getattr(self, f"{name}_k", 4))
+
+
+@dataclass
+class CharacterMemoryConfig:
+    """Top-level config: everything needed to build the whole system."""
+
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+
+    # Directory used for the SQLite store + persisted RAG indexes.
+    data_dir: str = ".cm_data"
+
+    @classmethod
+    def default(cls) -> "CharacterMemoryConfig":
+        """A config pointing at a local OpenAI-compatible server."""
+        return cls()
