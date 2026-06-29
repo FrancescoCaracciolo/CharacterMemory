@@ -58,6 +58,7 @@ Several months before the start of the story, she is contacted by her father who
 - “Shut up! I stopped wearing teddie bear panties a few years ago!...Ah!”
 
 ## Trivia
+
 - Like many other anime girls (and some guys), Kurisu entered Saimoe Contests.
 - Kurisu has two separate endings associated with her. While both focus on her relationship with Rintaro Okabe, only one of them will lead to the true outcome of the game (both Mayuri Shiina and Kurisu being saved).
 - Okabe gives Kurisu several nicknames over the course of Steins;Gate, only calling her by her real name in serious situations. Kurisu's most frequent nicknames are "Assistant" or "Christina" (by adding '-tina' to 'Kurisu'), but Okabe also calls her "The Zombie", "Money Bags", "@Channeler", "Mongolian Spot", "Experiment-Loving Girl", "Perverted Genius Girl", "Cold-Blooded Perverted Girl Genius", "Experiment-Loving Perverted Genius Girl", "Celeb Seventeen" (sometimes shortened to "Celeb Sev"), "Celeb Thirty". Even though Kurisu seems to hate being nicknamed, she thinks it is hopeless to point that out to Okabe.

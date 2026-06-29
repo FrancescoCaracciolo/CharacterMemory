@@ -5579,7 +5579,6 @@ Kurisu: Lie down! I'll call an ambulance!
 Okabe: I'm going to save you.
 
 Kurisu: What--
-----
 
 Suzuha: Once we arrive, I'll probably disappear. I won't be able to thank you for bringing me to Steins Gate.
 
