@@ -4,9 +4,9 @@ A `Chunker` turn a raw document in a list of `Chunk`.
 """
 
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-
 
 @dataclass
 class Chunk:
@@ -24,4 +24,16 @@ class Chunker(ABC):
 
     @abstractmethod
     def chunk(self, text: str, source: str = "") -> list[Chunk]:
-        """Split ``text`` into chunks, tagging each with ``source``."""
+        """Split `text` into chunks, tagging each with `source`."""
+
+    def chunk_files(self, files: list[str]) -> list[Chunk]:
+        """Read `files` and call `chunk` on each."""
+        chunks = []
+        for f in files:
+            with open(f) as fp:
+                chunks.extend(self.chunk(fp.read(), source=f))
+        return chunks
+
+    def chunk_directory(self, directory: str) -> list[Chunk]:
+        """Read files in `directory` and call `chunk` on each."""
+        return self.chunk_files([f"{directory}/{f}" for f in os.listdir(directory)])

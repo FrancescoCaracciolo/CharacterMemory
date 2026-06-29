@@ -4,8 +4,6 @@ Register a new chunker with `register_chunker` (or just pass an instance
 directly to the index builder).
 """
 
-from __future__ import annotations
-
 from typing import Callable
 
 from .base import Chunker
