@@ -46,7 +46,7 @@ class UserFactMemory(StructuredMemory):
         text = f"{row.get('content', '')} (type: {row.get('type', 'general')}, confidence: {row.get('confidence', 0):.2f})"
         return MemoryItem(text=text, score=score, kind=self.name, metadata=dict(row))
 
-    # Extraction ----------------------------------------------------------
+    # Extraction
     def extraction_spec(self) -> ExtractionSpec:
         return ExtractionSpec(
             field="facts",

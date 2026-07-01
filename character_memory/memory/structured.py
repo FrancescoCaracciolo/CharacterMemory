@@ -42,8 +42,9 @@ class StructuredMemory(Memory):
         half_life: float = 60 * 60 * 24 * 7,
         sticky_threshold: float = 0.8,
         clock: Optional[Callable[[], float]] = None,
+        name: Optional[str] = None,
     ) -> None:
-        super().__init__(enabled=enabled)
+        super().__init__(enabled=enabled, name=name)
         self.store = store
         self.hybrid = hybrid
         self.half_life = half_life

@@ -48,8 +48,10 @@ class Memory(ABC):
 
     name: str = "memory"
 
-    def __init__(self, *, enabled: bool = True) -> None:
+    def __init__(self, *, enabled: bool = True, name: Optional[str] = None) -> None:
         self.enabled = enabled
+        if name is not None:
+            self.name = name
 
     @abstractmethod
     def recall(self, query: str, user_id: str, limit: int) -> list[MemoryItem]:

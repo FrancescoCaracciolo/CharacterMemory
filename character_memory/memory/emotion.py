@@ -26,8 +26,9 @@ class EmotionStatus(Memory):
         enabled: bool = True,
         baseline: Optional[dict[str, float]] = None,
         user_dims: Optional[dict[str, float]] = None,
+        name: Optional[str] = None
     ) -> None:
-        super().__init__(enabled=enabled)
+        super().__init__(enabled=enabled, name=name)
         self.store = store
         self.baseline = dict(baseline or {"neutral": 0.5, "joy": 0.2, "sadness": 0.1, "anger": 0, "anxiety": 0})
         self.user_dims = dict(user_dims or {"affection": 0.0, "valence": 0.0, "trust": 0.0})

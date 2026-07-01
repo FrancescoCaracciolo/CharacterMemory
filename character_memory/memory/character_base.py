@@ -15,8 +15,8 @@ from ..chunking import Chunk
 class RAGMemory(Memory):
     """Memory whose recall is just a hybrid search over pre-built chunks."""
 
-    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True, _title: Optional[str] = None) -> None:
-        super().__init__(enabled=enabled)
+    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True, _title: Optional[str] = None, name: Optional[str] = None) -> None:
+        super().__init__(enabled=enabled, name=name)
         self.hybrid = hybrid
         self._title = _title
 
@@ -48,8 +48,8 @@ class CharacterInfoMemory(RAGMemory):
 
     name = "character_info"
 
-    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True) -> None:
-        super().__init__(hybrid, enabled=enabled, _title="Character Information")
+    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True, name: Optional[str] = None) -> None:
+        super().__init__(hybrid, enabled=enabled, _title="Character Information", name=name)
 
 
 class DialogueStyleMemory(RAGMemory):
@@ -57,8 +57,8 @@ class DialogueStyleMemory(RAGMemory):
 
     name = "dialogue_style"
 
-    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True) -> None:
-        super().__init__(hybrid, enabled=enabled, _title="Example Exchanges (style reference)")
+    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True, name: Optional[str] = None) -> None:
+        super().__init__(hybrid, enabled=enabled, _title="Example Exchanges (style reference)", name=name)
 
     def format(self, items: list[MemoryItem]) -> str:
         out = []
