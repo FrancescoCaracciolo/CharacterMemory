@@ -128,7 +128,14 @@ class StructuredMemory(Memory):
             half_life=self.half_life,
         )
 
-    def recall(self, query: str, user_id: str, limit: int, sticky_limit:int=10) -> list[MemoryItem]:
+    def recall(
+        self,
+        query: str,
+        user_id: str,
+        limit: int,
+        sticky_limit: int = 10,
+        state_changing: bool = True,
+    ) -> list[MemoryItem]:
         rows_by_id = {r["id"]: r for r in self.store.select(self.table, {"user_id": user_id})}
         if not rows_by_id:
             return []
@@ -153,10 +160,21 @@ class StructuredMemory(Memory):
         scored.sort(key=lambda kv: kv[0], reverse=True)
         chosen = scored[:limit]
 
-        # Bump recall counters for what we surfaced.
-        self._bump_recall([row["id"] for _, row in chosen])
+        # Bump recall counters for what we surfaced (skipped when read-only).
+        if state_changing:
+            self._bump_recall([row["id"] for _, row in chosen])
 
         return [self.row_item(row, score) for score, row in chosen]
+
+    def get_memories(self, limit: int = 0) -> list[MemoryItem]:
+        """All rows in this memory's table, rendered as items.
+
+        `limit=0` returns every row; otherwise the top `limit` by id order.
+        """
+        rows = self.all_rows()
+        if limit and limit > 0:
+            rows = rows[:limit]
+        return [self.row_item(r, self._effective(r)) for r in rows]
 
     def _bump_recall(self, ids: list[int]) -> None:
         if not ids:

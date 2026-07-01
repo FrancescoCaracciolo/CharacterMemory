@@ -54,8 +54,16 @@ class Memory(ABC):
             self.name = name
 
     @abstractmethod
-    def recall(self, query: str, user_id: str, limit: int) -> list[MemoryItem]:
-        """Return up to `limit` items relevant to `query` for `user_id`."""
+    def recall(
+        self, query: str, user_id: str, limit: int, state_changing: bool = True
+    ) -> list[MemoryItem]:
+        """Return up to `limit` items relevant to `query` for `user_id`.
+
+        When `state_changing` is `False`, the recall is read-only: memories
+        must not mutate any bookkeeping (e.g. recall-count bumps or
+        last-recalled timestamps). Useful for inspection / context preview
+        without skewing decay statistics.
+        """
 
     @abstractmethod
     def build(self, info_chunks:list[Chunk]) -> None:
@@ -78,12 +86,30 @@ class Memory(ABC):
         """Render recalled `items` into a prompt fragment (override me)."""
         return "\n".join(f"- {it.text}" for it in items)
 
-    def build_section(self, query: str, user_id: str, limit: int) -> Optional[str]:
-        """Recall (if enabled) and format; `None` when there is nothing to show."""
-        items = self.recall(query, user_id, limit) if self.enabled else []
+    def build_section(
+        self, query: str, user_id: str, limit: int, state_changing: bool = True
+    ) -> Optional[str]:
+        """Recall (if enabled) and format; `None` when there is nothing to show.
+
+        `state_changing` is forwarded to :meth:`recall`.
+        """
+        items = (
+            self.recall(query, user_id, limit, state_changing=state_changing)
+            if self.enabled
+            else []
+        )
         if not items:
             return None
         return self.format(items)
+
+    def get_memories(self, limit: int = 0) -> list[MemoryItem]:
+        """Return every memory stored in this memory's backend.
+
+        `limit=0` (the default) returns everything; a positive `limit` caps
+        the result. Memories without a backing store return an empty list.
+        Override in subclasses that own a database or index.
+        """
+        return []
 
     # Extraction
     def extraction_spec(self) -> Optional[ExtractionSpec]:

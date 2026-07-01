@@ -24,11 +24,26 @@ class RAGMemory(Memory):
     def title(self) -> str:
         return self._title or super().title
 
-    def recall(self, query: str, user_id: str, limit: int) -> list[MemoryItem]:
+    def recall(self, query: str, user_id: str, limit: int, state_changing: bool = True) -> list[MemoryItem]:
+        # RAG recall is read-only by nature; `state_changing` is accepted for
+        # interface symmetry but has no effect.
         hits = self.hybrid.search(query, k=limit)
         return [
             MemoryItem(text=h.text, score=h.score, kind=self.name, metadata=h.metadata)
             for h in hits
+        ]
+
+    def get_memories(self, limit: int = 0) -> list[MemoryItem]:
+        """Every chunk held in this memory's index, as items.
+
+        `limit=0` returns everything; otherwise the top `limit` chunks by index order.
+        """
+        docs = self.hybrid.documents
+        if limit and limit > 0:
+            docs = docs[:limit]
+        return [
+            MemoryItem(text=d.text, score=0.0, kind=self.name, metadata=dict(d.metadata or {}))
+            for d in docs
         ]
 
     def format(self, items: list[MemoryItem]) -> str:

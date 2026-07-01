@@ -67,11 +67,27 @@ class EmotionStatus(Memory):
         return current
 
     # Recall
-    def recall(self, query: str, user_id: str, limit: int) -> list[MemoryItem]:
+    def recall(self, query: str, user_id: str, limit: int, state_changing: bool = True) -> list[MemoryItem]:
+        # Emotion recall never mutates state; `state_changing` is accepted
+        # for interface symmetry but has no effect.
         state = self.get_user_state(user_id)
         parts = [f"{k}={v:.2f}" for k, v in self.baseline.items()]
         parts += [f"{k}(toward {user_id})={v:.2f}" for k, v in state.items()]
         return [MemoryItem(text=p, score=1.0, kind=self.name) for p in parts]
+
+    def get_memories(self, limit: int = 0) -> list[MemoryItem]:
+        """Every stored per-user emotion state, one item per user.
+
+        `limit=0` returns all users; otherwise the first `limit` rows. Only rows
+        actually persisted in the database are returned (the baseline is not stored).
+        """
+        rows = self.store.select(self.table, order_by="user_id")
+        if limit and limit > 0:
+            rows = rows[:limit]
+        return [
+            MemoryItem(text=f"{r['user_id']}: {r['state']}", score=1.0, kind=self.name, metadata=dict(r))
+            for r in rows
+        ]
 
     # Implement not needed methods
     def build(self, info_chunks: list[Chunk]) -> None:

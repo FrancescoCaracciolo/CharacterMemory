@@ -42,8 +42,15 @@ class UserDirectiveMemory(StructuredMemory):
         except (TypeError, ValueError):
             return []
 
-    def recall(self, query: str, user_id: str, limit: int, sticky_limit: int = 10) -> list[MemoryItem]:
-        items = super().recall(query, user_id, limit, sticky_limit)
+    def recall(
+        self,
+        query: str,
+        user_id: str,
+        limit: int,
+        sticky_limit: int = 10,
+        state_changing: bool = True,
+    ) -> list[MemoryItem]:
+        items = super().recall(query, user_id, limit, sticky_limit, state_changing=state_changing)
         # Keyword boost: directives whose keywords appear in the query are
         # surfaced even if hybrid recall missed them.
         ql = query.lower()

@@ -31,7 +31,14 @@ class HeartbeatJournal(StructuredMemory):
     ) -> int:
         return self.add(user_id, importance, summary=summary, kind=kind)
 
-    def recall(self, query: str, user_id: str, limit: int, sticky_limit: int = 10) -> list[MemoryItem]:
+    def recall(
+        self,
+        query: str,
+        user_id: str,
+        limit: int,
+        sticky_limit: int = 10,
+        state_changing: bool = True,
+    ) -> list[MemoryItem]:
         # The journal is character-scoped, not per-user; ignore user_id.
         # There are no sticky memories in the journal.
         rows = self.store.select(self.table, order_by="id DESC", limit=self.hybrid.candidate_pool)
@@ -43,7 +50,8 @@ class HeartbeatJournal(StructuredMemory):
         scored = [(self._effective(rows_by_id[i]), rows_by_id[i]) for i in dict.fromkeys(ids) if i in rows_by_id]
         scored.sort(key=lambda kv: kv[0], reverse=True)
         chosen = scored[:limit]
-        self._bump_recall([row["id"] for _, row in chosen])
+        if state_changing:
+            self._bump_recall([row["id"] for _, row in chosen])
         return [self.row_item(row, score) for score, row in chosen]
 
     def row_text(self, row: dict[str, Any]) -> str:
