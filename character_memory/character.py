@@ -1,4 +1,4 @@
-
+"""A character bundles an identity with the memory systems it can recall from and write to."""
 
 from typing import Optional
 from character_memory.llm.base import LLMClient
@@ -68,6 +68,13 @@ class Character:
         """Full system-style context block (system line + all sections)."""
         sections = self.build_context(query, user_id, limits=limits)
         if self.prompts is None:
-            return "\n\n".join(sections.values())
-        system = self.prompts.system.format(character_name=self.character_name)
+            parts = []
+            if self.base_instruction:
+                parts.append(self.base_instruction)
+            parts.extend(sections.values())
+            return "\n\n".join(parts)
+        system = self.prompts.system.format(
+            character_name=self.character_name,
+            base_instruction=self.base_instruction.strip(),
+        )
         return system + "\n\n" + "\n\n".join(sections[n] for n in self.prompts.section_order if n in sections)

@@ -15,6 +15,7 @@ class PromptConfig:
     """All prompt templates, each individually overridable."""
 
     system: str = (
+        "{base_instruction}\n\n"
         "You are {character_name}, role-playing as this character. Stay in "
         "character at all times and reflect the personality, knowledge and "
         "speech style shown in the provided material. Use the memories below "
