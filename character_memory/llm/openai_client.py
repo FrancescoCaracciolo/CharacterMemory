@@ -2,7 +2,7 @@
 
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from openai import OpenAI
 
@@ -56,6 +56,28 @@ class OpenAICompatibleLLM(LLMClient):
             max_tokens=self.config.max_tokens if max_tokens is None else max_tokens,
         )
         return resp.choices[0].message.content or ""
+
+    def chat_stream(
+        self,
+        messages: list[dict],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Iterator[str]:
+        """Yield assistant text deltas as they arrive from the server."""
+        stream = self._client.chat.completions.create(
+            model=self.config.model,
+            messages=messages,
+            temperature=self.config.temperature if temperature is None else temperature,
+            max_tokens=self.config.max_tokens if max_tokens is None else max_tokens,
+            stream=True,
+        )
+        for event in stream:
+            if not event.choices:
+                continue
+            delta = event.choices[0].delta.content
+            if delta:
+                yield delta
 
     def chat_structured(
         self,
