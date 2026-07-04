@@ -9,6 +9,14 @@ Public surface:
 """
 
 from .agent import CharacterAgent
+from .character import Character
+from .chat import Chat
+from .chunking import (
+    Chunk,
+    Chunker,
+    get_chunker,
+    register_chunker,
+)
 from .config import (
     CharacterMemoryConfig,
     ChunkingConfig,
@@ -43,6 +51,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "CharacterAgent",
+    "Character",
+    "Chat",
     "CharacterMemoryConfig",
     "LLMConfig",
     "EmbeddingConfig",

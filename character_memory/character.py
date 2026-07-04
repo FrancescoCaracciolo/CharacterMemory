@@ -9,13 +9,13 @@ from .memory.base import Memory
 
 class Character:
 
-    def __init__(self, character_name: str, base_instruction: str = "", memories: list[Memory] = [], llm: Optional[LLMClient] = None, prompts: Optional[PromptConfig] = None) -> None:
+    def __init__(self, character_name: str, base_instruction: str = "", memories: Optional[list[Memory]] = None, llm: Optional[LLMClient] = None, prompts: Optional[PromptConfig] = None) -> None:
         self.character_name = character_name
         self.base_instruction = base_instruction
-        self.memories = memories
+        self.memories = memories if memories is not None else []
         self.llm = llm
         self.prompts = prompts
-        self._by_name = {m.name: m for m in memories}
+        self._by_name = {m.name: m for m in self.memories}
 
     def add_memory(self, memory: Memory):
         self.memories.append(memory)
