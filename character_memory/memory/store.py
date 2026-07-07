@@ -47,6 +47,7 @@ class SQLiteStore:
         where: Optional[dict[str, Any]] = None,
         order_by: Optional[str] = None,
         limit: Optional[int] = None,
+        offset: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         sql = f"SELECT * FROM {table}"
         params: list[Any] = []
@@ -58,6 +59,9 @@ class SQLiteStore:
             sql += f" ORDER BY {order_by}"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
+        if offset is not None:
+            # Requires a LIMIT in standard SQLite; guard with -1 (unlimited).
+            sql += f" OFFSET {int(offset)}"
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
