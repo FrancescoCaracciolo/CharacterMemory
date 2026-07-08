@@ -1,6 +1,6 @@
 # CharacterMemory Test files 
 .cm_data
-
+.cm_servers
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
