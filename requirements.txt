@@ -1,0 +1,13 @@
+
+# Core
+openai>=2.0
+numpy>=2.0
+
+# RAG (HybridSearch: BM25 + FAISS similarity, fused with RRF)
+llama-index-core>=0.14
+llama-index-retrievers-bm25>=0.7
+faiss-cpu>=1.13
+rank-bm25>=0.2.2
+
+# Tokenization for header-based chunking budgets
+tiktoken>=0.13
