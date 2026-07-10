@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "charactermemory"
+dynamic = ["version"]
+description = "A modular memory system for LLM-based role-play characters."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPLv3"
+authors = [{ name = "Francesco Caracciolo" }]
+keywords = ["llm", "memory", "rag", "character", "agents"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # Core
+    "openai>=2.0",
+    "numpy>=2.0",
+    # RAG (HybridSearch: BM25 + FAISS similarity, fused with RRF)
+    "llama-index-core>=0.14",
+    "llama-index-retrievers-bm25>=0.7",
+    "faiss-cpu>=1.13",
+    "rank-bm25>=0.2.2",
+    # Tokenization for header-based chunking budgets
+    "tiktoken>=0.13",
+]
+
+[project.optional-dependencies]
+# The optional FastAPI server + memory-browser GUI.
+# Install with:  pip install charactermemory[server]
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+# Everything needed to develop the project locally.
+dev = [
+    "charactermemory[server]",
+    "build>=1",
+]
+
+[project.scripts]
+charactermemory-server = "character_memory.server.api:main"
+
+[project.urls]
+Homepage = "https://github.com/FrancescoCaracciolo/CharacterMemory"
+Repository = "https://github.com/FrancescoCaracciolo/CharacterMemory"
+
+[tool.setuptools.dynamic]
+version = { attr = "character_memory.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["character_memory*"]
+exclude = ["examples*", "tests*", "assets*"]
+
+# Ship the memory-browser GUI static assets inside the wheel so
+# `GET /gui` works after `pip install charactermemory[server]`.
+[tool.setuptools.package-data]
+"character_memory.server.static" = ["*.html", "*.js", "*.css"]
