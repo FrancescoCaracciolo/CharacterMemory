@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Character Memory Browser</title>
+  <link rel="stylesheet" href="/gui/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="logo">◆</span> Character Memory</div>
+      <div class="topbar-actions">
+        <label class="char-picker">
+          <span>Character</span>
+          <select id="character" title="Switch character"></select>
+        </label>
+        <button id="refresh" class="btn icon-btn" title="Reload overview" aria-label="Reload overview">↻</button>
+        <a class="btn ghost" href="/" title="JSON index">{ }</a>
+      </div>
+    </header>
+
+    <div class="main">
+      <aside class="sidebar">
+        <div class="side-head">
+          <input id="memory-filter" class="filter-input" placeholder="Filter memories…" autocomplete="off">
+        </div>
+        <nav id="memories" class="mem-list" aria-label="Memories"></nav>
+      </aside>
+
+      <section class="content">
+        <div class="content-head">
+          <div class="ch-title">
+            <h2 id="mem-title">—</h2>
+            <span id="mem-kind" class="chip kind-chip"></span>
+            <span id="mem-count" class="count"></span>
+            <span id="mem-disabled" class="chip warn-chip hidden">disabled</span>
+          </div>
+          <div class="tools">
+            <div class="search">
+              <span class="search-ico">⌕</span>
+              <input id="q" placeholder="Search this memory…" autocomplete="off" spellcheck="false">
+              <button id="q-clear" class="q-clear hidden" title="Clear search" aria-label="Clear search">×</button>
+            </div>
+            <select id="user-filter" class="user-filter" title="Filter by user"></select>
+          </div>
+        </div>
+
+        <div id="extra" class="extra"></div>
+        <div id="records" class="records"></div>
+        <div id="paginator" class="paginator"></div>
+        <div id="status" class="status hidden"></div>
+      </section>
+    </div>
+  </div>
+  <script src="/gui/static/app.js"></script>
+</body>
+</html>
