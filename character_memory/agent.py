@@ -43,10 +43,12 @@ from .llm.base import LLMClient
 from .llm.embedding_base import EmbeddingProvider
 from .memory.base import Memory
 from .memory.character_base import CharacterInfoMemory, DialogueStyleMemory
+from .memory.dedup import Deduplicator, DedupReport
 from .memory.emotion import EmotionStatus
 from .memory.episodic import EpisodicMemory
 from .memory.heartbeat import HeartbeatJournal
 from .memory.store import SQLiteStore
+from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
 from .prompts import PromptConfig
@@ -57,7 +59,6 @@ _DIALOGUE_GLOB = "Dialogues"
 
 # Names of the two RAG memories populated from the character directory and of
 # the structured memories whose hybrid index is rebuilt from SQLite rows.
-_RAG_MEMORIES = ("character_info", "dialogue_style")
 _STRUCTURED_MEMORIES = ("user_facts", "user_directives", "episodic", "heartbeat")
 
 # Anything generate_answer / build_context / render_prompt accepts as a
@@ -88,6 +89,7 @@ class CharacterAgent:
         self.store: Optional[SQLiteStore] = None
         self.memories: dict[str, Memory] = {}
         self.character: Optional[Character] = None
+        self.deduplicator: Optional[Deduplicator] = None
         self._limits: dict[str, int] = {}
         self._chats: Optional[_ChatBackend] = None
         self._built = False
@@ -176,6 +178,16 @@ class CharacterAgent:
 
         def hybrid() -> HybridSearch:
             return HybridSearch(self.embedder)  # type: ignore[arg-type]
+
+        # A shared deduplicator, built when dedup is enabled. It is *not*
+        # injected into memories — it runs as a post-extraction step on the
+        # items each memory reports having added. Its LLM prompts come from the
+        # agent's PromptConfig so they are overridable like every other prompt.
+        self.deduplicator: Optional[Deduplicator] = (
+            Deduplicator(self.embedder, self.llm, m.dedup, prompts=self.prompts)
+            if m.dedup.enabled
+            else None
+        )
 
         self.memories["character_info"] = CharacterInfoMemory(
             hybrid(), enabled=m.is_enabled("character_info")
@@ -468,6 +480,9 @@ class CharacterAgent:
         result = self.character.extract(turns, user_id=user_id)
         if result is not None:
             self.persist_structured()
+            # Post-extraction dedup: compact the freshly-added items against
+            # each memory's existing rows.
+            self._dedup_added(result.pop("__added__", {}))
         # Mark extracted whether or not the extractor returned data: a None
         # return means no participating memories, so there is nothing to learn.
         assert self.store is not None
@@ -486,6 +501,49 @@ class CharacterAgent:
         if not rows:
             return
         self._extract_messages(rows[-window:], chat.user_id)
+
+    def _dedup_added(self, added: dict[str, list]) -> None:
+        """Post-extraction step: compact freshly-added items per memory.
+
+        ``added`` maps memory name -> the items that memory's
+        ``apply_extraction`` reported as newly added. Only runs when a
+        `Deduplicator` is configured.
+        """
+        if not self.deduplicator:
+            return
+        for name, items in added.items():
+            mem = self.memories.get(name)
+            if isinstance(mem, StructuredMemory) and items:
+                self.deduplicator.dedup_items(mem, items)
+
+    def dedup(
+        self,
+        memory_name: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> dict[str, DedupReport]:
+        """Sweep one or all structured memories for duplicates and compact them.
+
+        - `memory_name`: sweep just that memory; `None` sweeps every structured
+          memory (``user_facts``, ``user_directives``, ``episodic``, ``heartbeat``).
+        - `user_id`: sweep a single user's rows only.
+
+        Returns a ``{memory_name: DedupReport}`` mapping. Uses the agent's
+        `Deduplicator` if configured; otherwise uses the `Deduplicator` when dedup is
+        configured; otherwise a fresh default-config one is built on the fly so
+        a one-off sweep is always possible.
+        """
+        self._require_loaded()
+        assert self.embedder is not None
+        dedup = self.deduplicator or Deduplicator(
+            self.embedder, self.llm, prompts=self.prompts
+        )
+        names = (memory_name,) if memory_name else _STRUCTURED_MEMORIES
+        reports: dict[str, DedupReport] = {}
+        for name in names:
+            mem = self.memories.get(name)
+            if isinstance(mem, StructuredMemory):
+                reports[name] = dedup.sweep(mem, user_id=user_id)
+        return reports
 
     def extract(self, target: Optional[Union[Chat, str]] = None) -> None:
         """Run memory extraction over messages that have not been processed.

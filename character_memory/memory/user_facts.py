@@ -21,6 +21,7 @@ class UserFactMemory(StructuredMemory):
         "content": "TEXT NOT NULL",
         "confidence": "REAL NOT NULL DEFAULT 0.5",
     }
+    text_column = "content"
 
     def add_fact(
         self,
@@ -71,15 +72,20 @@ class UserFactMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> None:
+    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+        added: list[MemoryItem] = []
         for f in value or []:
             content = (f.get("content") or "").strip()
             if not content or self._has_text(user_id, content, "content"):
                 continue
-            self.add_fact(
+            row_id = self.add_fact(
                 user_id,
                 content,
                 type=str(f.get("type", "general")),
                 importance=self._clip(f.get("importance", 0.5)),
                 confidence=self._clip(f.get("confidence", 0.5)),
             )
+            row = self.get_row(row_id)
+            if row is not None:
+                added.append(self.row_item(row, self._effective(row)))
+        return added

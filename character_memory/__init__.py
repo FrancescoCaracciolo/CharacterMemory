@@ -20,6 +20,7 @@ from .chunking import (
 from .config import (
     CharacterMemoryConfig,
     ChunkingConfig,
+    DedupConfig,
     EmbeddingConfig,
     LLMConfig,
     MemoryConfig,
@@ -33,6 +34,8 @@ from .llm import (
 from .memory import (
     CharacterInfoMemory,
     DialogueStyleMemory,
+    DedupReport,
+    Deduplicator,
     EmotionStatus,
     EpisodicMemory,
     Extractor,
@@ -58,6 +61,7 @@ __all__ = [
     "EmbeddingConfig",
     "ChunkingConfig",
     "MemoryConfig",
+    "DedupConfig",
     "PromptConfig",
     "LLMClient",
     "EmbeddingProvider",
@@ -82,5 +86,7 @@ __all__ = [
     "HeartbeatJournal",
     "SQLiteStore",
     "Extractor",
+    "Deduplicator",
+    "DedupReport",
 ]
 

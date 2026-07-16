@@ -69,6 +69,38 @@ class ChunkingConfig:
 
 
 @dataclass
+class DedupConfig:
+    """Deduplication behaviour for structured memories.
+
+    A memory entry is considered a duplicate when it passes every *enabled*
+    gate, evaluated in escalating order: exact match → similarity → LLM judge.
+    If `consolidate` is on, a confirmed duplicate is merged into one entry
+    instead of being dropped.
+
+    - `enabled`: master switch. When False, memories fall back to the legacy
+      exact-only guard.
+    - `exact`: case-insensitive, stripped string equality (cheapest gate).
+    - `similarity_threshold`: cosine similarity above which two entries are
+      considered candidate duplicates. `None` disables the similarity gate.
+    - `llm_judge`: when True, an LLM confirms that a similarity candidate is
+      genuinely the same information. Needs an `LLMClient`.
+    - `consolidate`: when True, confirmed duplicates are rewritten into a
+      single merged entry instead of the newer one being dropped. Needs an
+      `LLMClient`.
+    - `per_user`: during a sweep, only compare entries sharing a `user_id`.
+    - `candidate_pool`: per-item guard — how many RAG hits to re-rank.
+    """
+
+    enabled: bool = False
+    exact: bool = True
+    similarity_threshold: Optional[float] = 0.92
+    llm_judge: bool = False
+    consolidate: bool = False
+    per_user: bool = True
+    candidate_pool: int = 10
+
+
+@dataclass
 class MemoryConfig:
     """Per-memory toggles and retrieval knobs.
 
@@ -113,6 +145,9 @@ class MemoryConfig:
     emotion_user_dims: dict = field(
         default_factory=lambda: {"affection": 0.0, "valence": 0.0, "trust": 0.0}
     )
+
+    # DEDUPLICATION
+    dedup: DedupConfig = field(default_factory=DedupConfig)
 
     def is_enabled(self, name: str) -> bool:
         return bool(getattr(self, f"enabled_{name}", False))

@@ -115,6 +115,7 @@ class EmotionStatus(Memory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> None:
+    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
         if value:
             self.update(user_id, value)
+        return []

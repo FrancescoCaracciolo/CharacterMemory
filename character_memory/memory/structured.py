@@ -32,6 +32,7 @@ class StructuredMemory(Memory):
 
     table: str = "structured"
     extra_columns: dict[str, str] = {}  # memory-specific columns
+    text_column: str = "content"        # column holding the primary text for this memory
 
     def __init__(
         self,
@@ -188,3 +189,15 @@ class StructuredMemory(Memory):
 
     def all_rows(self, user_id: Optional[str] = None) -> list[dict[str, Any]]:
         return self.store.select(self.table, {"user_id": user_id} if user_id else None, order_by="id")
+
+    def get_row(self, row_id: int) -> Optional[dict[str, Any]]:
+        rows = self.store.select(self.table, {"id": row_id})
+        return rows[0] if rows else None
+
+    def update_row(self, row: dict[str, Any]) -> None:
+        """Write a (possibly merged) row back via upsert. Does not touch the index."""
+        self.store.upsert(self.table, row)
+
+    def delete_row(self, row_id: int) -> None:
+        """Delete a row by id. Does not touch the index."""
+        self.store.delete(self.table, {"id": row_id})

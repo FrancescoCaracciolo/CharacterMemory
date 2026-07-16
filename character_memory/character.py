@@ -4,7 +4,7 @@ from typing import Optional
 from character_memory.llm.base import LLMClient
 from character_memory.prompts import PromptConfig
 from .memory.extract import Extractor, build_extraction
-from .memory.base import Memory
+from .memory.base import Memory, MemoryItem
 
 
 class Character:
@@ -45,8 +45,14 @@ class Character:
             return None
         schema, instruction = build_extraction([spec for _, spec in participants])
         extracted = Extractor(llm).extract(turns, schema=schema, instruction=instruction)
+        added: dict[str, list[MemoryItem]] = {}
         for mem, spec in participants:
-            mem.apply_extraction(extracted.get(spec.field), user_id)
+            items = mem.apply_extraction(extracted.get(spec.field), user_id)
+            if items:
+                added[mem.name] = items
+        # Carry the freshly-added items so the caller (e.g. a deduplicator)
+        # can act on them without re-querying the memories.
+        extracted["__added__"] = added
         return extracted
 
     def build_context(self, query: str, user_id: str = "default", limits: dict[str, int] = {}) -> dict[str, str]:

@@ -18,6 +18,7 @@ class EpisodicMemory(StructuredMemory):
         "summary": "TEXT NOT NULL",
         "emotional_shift": "REAL NOT NULL DEFAULT 0.0",
     }
+    text_column = "summary"
 
     def add_episode(
         self,
@@ -75,14 +76,20 @@ class EpisodicMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> None:
+    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+        added: list[MemoryItem] = []
         for e in value or []:
             summary = (e.get("summary") or "").strip()
             if not summary:
                 continue
-            self.add_episode(
+            emotional_shift = float(e.get("emotional_shift", 0.0))
+            row_id = self.add_episode(
                 user_id,
                 summary,
                 importance=self._clip(e.get("importance", 0.5)),
-                emotional_shift=float(e.get("emotional_shift", 0.0)),
+                emotional_shift=emotional_shift,
             )
+            row = self.get_row(row_id)
+            if row is not None:
+                added.append(self.row_item(row, self._effective(row)))
+        return added

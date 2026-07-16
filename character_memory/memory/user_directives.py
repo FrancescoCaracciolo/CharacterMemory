@@ -20,6 +20,7 @@ class UserDirectiveMemory(StructuredMemory):
         "content": "TEXT NOT NULL",
         "retrieval_keywords": "TEXT NOT NULL DEFAULT '[]'",  # JSON array
     }
+    text_column = "content"
 
     def add_directive(
         self,
@@ -98,14 +99,20 @@ class UserDirectiveMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> None:
+    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+        added: list[MemoryItem] = []
         for d in value or []:
             content = (d.get("content") or "").strip()
             if not content or self._has_text(user_id, content, "content"):
                 continue
-            self.add_directive(
+            keywords = d.get("keywords") or []
+            row_id = self.add_directive(
                 user_id,
                 content,
                 importance=self._clip(d.get("importance", 0.5)),
-                retrieval_keywords=d.get("keywords") or [],
+                retrieval_keywords=keywords,
             )
+            row = self.get_row(row_id)
+            if row is not None:
+                added.append(self.row_item(row, self._effective(row)))
+        return added

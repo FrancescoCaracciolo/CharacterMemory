@@ -121,10 +121,12 @@ class Memory(ABC):
         """
         return None
 
-    def apply_extraction(self, value: Any, user_id: str) -> None:
+    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
         """Consume this memory's portion of an extraction result.
 
         `value` is whatever the LLM produced under this memory's `field`
-        (a list, a dict, … depending on the schema). No-op by default.
+        (a list, a dict, … depending on the schema). Returns the items that
+        were actually added to the memory, so callers (e.g. a deduplicator)
+        can act on the freshly-written rows. No-op implementations return `[]`.
         """
-        return None
+        return []

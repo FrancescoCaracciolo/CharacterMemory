@@ -1,5 +1,6 @@
 from .base import Memory, MemoryItem
 from .character_base import CharacterInfoMemory, DialogueStyleMemory, RAGMemory
+from .dedup import DedupReport, Deduplicator
 from .emotion import EmotionStatus
 from .episodic import EpisodicMemory
 from .extract import Extractor
@@ -23,4 +24,6 @@ __all__ = [
     "StructuredMemory",
     "SQLiteStore",
     "Extractor",
+    "Deduplicator",
+    "DedupReport",
 ]

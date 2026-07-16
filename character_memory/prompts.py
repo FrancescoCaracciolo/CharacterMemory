@@ -5,7 +5,6 @@ overridable via `PromptConfig`. Each placeholder ``{name}`` is filled by
 the agent at render time.
 """
 
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 
@@ -36,6 +35,24 @@ class PromptConfig:
     episodic_header: str = "Episodes you've shared with this user"
     heartbeat_header: str = "Recent discoveries / actions of yours"
     emotion_header: str = "Emotional state"
+
+    # Deduplication LLM prompts (see character_memory.memory.dedup).
+    dedup_judge: str = (
+        "You are a duplicate detector for a character memory store. You will be "
+        "given two memory entries. Decide whether they convey the same piece of "
+        "information (one is a restatement, paraphrase, or subset of the other) or "
+        "whether they are genuinely distinct. Minor wording or formatting "
+        "differences do NOT make them distinct. "
+        'Respond ONLY with a single JSON object: {"same": true} or {"same": false}.'
+    )
+
+    dedup_consolidate: str = (
+        "You are consolidating two near-duplicate memory entries into one. Merge "
+        "them into a single concise entry that preserves every distinct fact from "
+        "both, removes redundancy, and keeps the same tone and tense. Do not invent "
+        "new information. "
+        'Respond ONLY with a single JSON object: {"text": "<the merged entry>."}'
+    )
 
     # Order in which memory sections appear in the prompt.
     section_order: list[str] = field(

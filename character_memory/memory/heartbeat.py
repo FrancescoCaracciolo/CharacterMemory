@@ -20,6 +20,7 @@ class HeartbeatJournal(StructuredMemory):
         "summary": "TEXT NOT NULL",
         "kind": "TEXT NOT NULL DEFAULT 'discovery'",
     }
+    text_column = "summary"
 
     def add_entry(
         self,
