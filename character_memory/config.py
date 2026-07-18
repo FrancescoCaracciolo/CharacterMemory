@@ -140,6 +140,7 @@ class MemoryConfig:
     enabled_episodic: bool = True
     enabled_emotion: bool = True
     enabled_heartbeat: bool = True
+    enabled_user_summary: bool = True
 
     # Retrivial Sizes
     character_info_k: int = 4
@@ -148,6 +149,7 @@ class MemoryConfig:
     user_directives_k: int = 4
     episodic_k: int = 4
     heartbeat_k: int = 4
+    user_summary_k: int = 2
 
     # Structured Memory behavior
     # Facts/directives whose effective importance is at/above this value are

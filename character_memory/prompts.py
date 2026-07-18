@@ -34,6 +34,8 @@ class PromptConfig:
     user_directives_header: str = "Standing instructions from this user"
     episodic_header: str = "Episodes you've shared with this user"
     heartbeat_header: str = "Recent discoveries / actions of yours"
+    user_summary_header: str = "Summary of this user"
+    user_summary_header_multi: str = "Summaries of these users"
     emotion_header: str = "Emotional state"
 
     # Plural headers used when a section is rendered for a multi-participant
@@ -117,6 +119,7 @@ class PromptConfig:
             "user_facts",
             "episodic",
             "heartbeat",
+            "user_summary",
             "dialogue_style",
         ]
     )

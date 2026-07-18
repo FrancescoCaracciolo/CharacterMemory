@@ -210,6 +210,20 @@ function renderHeartbeat(rec) {
   return card;
 }
 
+function renderUserSummary(rec) {
+  const f = rec.fields || {};
+  let aliases = [];
+  try { aliases = JSON.parse(f.aliases || "[]"); } catch (e) { aliases = []; }
+  const body = el("div", {}, [el("div", { class: "text" }, f.summary || rec.text)]);
+  if (aliases.length) {
+    body.appendChild(el("div", { class: "kw-chips" }, aliases.map(kwChip)));
+  }
+  const card = wrapCard([body], rec);
+  addTag(card, chip(f.name || "user", "kind-chip"));
+  if (f.importance != null) card.appendChild(fieldBar("importance", f.importance));
+  return card;
+}
+
 function renderRag(rec) {
   const src = (rec.meta && rec.meta.source) || (rec.fields && rec.fields.source) || "";
   const card = wrapCard([el("div", { class: "md", html: markdown(rec.text || "") })], rec);
@@ -266,6 +280,7 @@ const RENDERERS = {
   user_directives: renderDirective,
   episodic: renderEpisode,
   heartbeat: renderHeartbeat,
+  user_summary: renderUserSummary,
   character_info: renderRag,
   dialogue_style: renderDialogue,
   emotion: renderEmotion,

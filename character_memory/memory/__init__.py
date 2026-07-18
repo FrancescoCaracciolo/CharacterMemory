@@ -9,6 +9,7 @@ from .store import SQLiteStore
 from .structured import StructuredMemory
 from .user_directives import UserDirectiveMemory
 from .user_facts import UserFactMemory
+from .user_summary import UserSummaryMemory
 
 __all__ = [
     "Memory",
@@ -23,6 +24,7 @@ __all__ = [
     "EpisodicMemory",
     "EmotionStatus",
     "HeartbeatJournal",
+    "UserSummaryMemory",
     "StructuredMemory",
     "SQLiteStore",
     "ExtractionContext",

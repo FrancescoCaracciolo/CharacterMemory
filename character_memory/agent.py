@@ -51,6 +51,7 @@ from .memory.store import SQLiteStore
 from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
+from .memory.user_summary import UserSummaryMemory
 from .prompts import PromptConfig
 from .rag.hybrid import HybridSearch
 
@@ -59,7 +60,7 @@ _DIALOGUE_GLOB = "Dialogues"
 
 # Names of the two RAG memories populated from the character directory and of
 # the structured memories whose hybrid index is rebuilt from SQLite rows.
-_STRUCTURED_MEMORIES = ("user_facts", "user_directives", "episodic", "heartbeat")
+_STRUCTURED_MEMORIES = ("user_facts", "user_directives", "episodic", "heartbeat", "user_summary")
 
 # Anything generate_answer / build_context / render_prompt accepts as a
 # conversation target.
@@ -220,6 +221,10 @@ class CharacterAgent:
         self.memories["emotion"] = EmotionStatus(
             self.store, enabled=m.is_enabled("emotion"),
             baseline=m.emotion_baseline, user_dims=m.emotion_user_dims,
+        )
+        self.memories["user_summary"] = UserSummaryMemory(
+            self.store, hybrid(), enabled=m.is_enabled("user_summary"),
+            half_life=half, sticky_threshold=sticky,
         )
 
     def _wire_character(self) -> None:
@@ -575,7 +580,8 @@ class CharacterAgent:
         """Sweep one or all structured memories for duplicates and compact them.
 
         - `memory_name`: sweep just that memory; `None` sweeps every structured
-          memory (``user_facts``, ``user_directives``, ``episodic``, ``heartbeat``).
+          memory (``user_facts``, ``user_directives``, ``episodic``, ``heartbeat``,
+          ``user_summary``).
         - `user_id`: sweep a single user's rows only.
 
         Returns a ``{memory_name: DedupReport}`` mapping. Uses the agent's
