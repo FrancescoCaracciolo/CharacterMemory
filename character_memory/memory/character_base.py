@@ -9,11 +9,16 @@ For example wikis, conversations and base character information.
 from typing import Optional
 
 from ..rag.hybrid import HybridSearch
-from .base import Memory, MemoryItem
+from .base import Memory, MemoryItem, MemoryScope
 from ..chunking import Chunk
 
 class RAGMemory(Memory):
     """Memory whose recall is just a hybrid search over pre-built chunks."""
+
+    # RAG memories index the character's own material (wiki, example dialogues);
+    # they are not about any participant, so they recall once regardless of who
+    # is in the conversation.
+    scope = MemoryScope.CHARACTER
 
     def __init__(self, hybrid: HybridSearch, *, enabled: bool = True, _title: Optional[str] = None, name: Optional[str] = None) -> None:
         super().__init__(enabled=enabled, name=name)

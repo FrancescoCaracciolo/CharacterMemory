@@ -29,59 +29,85 @@ class Character:
                 return header
         return self._by_name[name].title
 
-    def _known_user_facts(self, user_id: str, limit: int = 8) -> list[str]:
-        """Top known user-fact texts for `user_id`, highest importance first.
+    def _known_user_facts(
+        self, user_id: str, limit: int = 8, participants: Optional[list[str]] = None
+    ) -> list[str]:
+        """Top known user-fact texts, highest importance first.
 
         Used to ground the extractor so it does not re-extract what is already
-        stored. Returns [] when user_facts is absent or empty for this user.
+        stored. Returns [] when user_facts is absent or empty. In a group chat
+        the facts of every participant are gathered (each capped at `limit`)
+        so the model avoids re-extracting for any of them.
         """
         mem = self._by_name.get("user_facts")
         if not isinstance(mem, StructuredMemory):
             return []
-        rows = mem.all_rows(user_id=user_id)
-        rows.sort(key=lambda r: float(r.get("importance", 0.0)), reverse=True)
+        users = participants if participants else [user_id]
         facts: list[str] = []
-        for r in rows[:limit]:
-            text = mem.row_text(r).strip()
-            if text:
-                facts.append(text)
+        for uid in users:
+            rows = mem.all_rows(user_id=uid)
+            rows.sort(key=lambda r: float(r.get("importance", 0.0)), reverse=True)
+            for r in rows[:limit]:
+                text = mem.row_text(r).strip()
+                if text:
+                    facts.append(text)
         return facts
 
-    def _extraction_context(self, user_id: str) -> ExtractionContext:
+    def _extraction_context(
+        self, user_id: str, participants: Optional[list[str]] = None
+    ) -> ExtractionContext:
         """Build the identity + grounding context for an extraction call."""
-        known = self._known_user_facts(user_id)
+        known = self._known_user_facts(user_id, participants=participants)
         p = self.prompts
         return ExtractionContext(
             character_name=self.character_name,
             user_name=user_id,
             persona=self.base_instruction.strip(),
             known_facts=known,
+            participants=list(participants) if participants else [],
             header=p.extraction_header if p is not None else ExtractionContext.header,
             sentence_rule=p.extraction_sentence_rule if p is not None else ExtractionContext.sentence_rule,
             known_facts_intro=p.extraction_known_facts_intro if p is not None else ExtractionContext.known_facts_intro,
             footer=p.extraction_footer if p is not None else ExtractionContext.footer,
+            multi_note=p.extraction_multi_note if p is not None else ExtractionContext.multi_note,
         )
 
-    def extract(self, turns: list[dict[str, str]], user_id: str = "default", llm: Optional[LLMClient] = None) -> Optional[dict]:
+    def extract(
+        self,
+        turns: list[dict[str, str]],
+        user_id: str = "default",
+        llm: Optional[LLMClient] = None,
+        participants: Optional[list[str]] = None,
+    ) -> Optional[dict]:
+        """Run extraction over `turns`.
+
+        ``user_id`` is the chat's default user (owner / current speaker).
+        ``participants`` lists the human speakers of a group chat; when it has
+        more than one entry extraction runs in multi-user mode (per-speaker
+        transcript labelling + a ``user_id`` enum on per-user fields, each item
+        attributed to the participant it is about). With one or no participant
+        the legacy single-user path runs unchanged.
+        """
         if llm is None:
             llm = self.llm
         if llm is None:
             raise ValueError("No LLM specified. Character.extract needs a LLM configured")
-        context = self._extraction_context(user_id)
+        parts = participants if participants else None
+        context = self._extraction_context(user_id, participants=parts)
         # Only enabled memories that opt into extraction.
-        participants = [
+        participating = [
             (mem, spec)
             for mem in self.memories
             if mem.enabled
             for spec in [mem.extraction_spec(context)]
             if spec is not None
         ]
-        if not participants:
+        if not participating:
             return None
-        schema, instruction = build_extraction([spec for _, spec in participants], context=context)
+        schema, instruction = build_extraction([spec for _, spec in participating], context=context)
         extracted = Extractor(llm).extract(turns, schema=schema, instruction=instruction, context=context)
         added: dict[str, list[MemoryItem]] = {}
-        for mem, spec in participants:
+        for mem, spec in participating:
             items = mem.apply_extraction(extracted.get(spec.field), user_id)
             if items:
                 added[mem.name] = items
@@ -90,24 +116,56 @@ class Character:
         extracted["__added__"] = added
         return extracted
 
-    def build_context(self, query: str, user_id: str = "default", limits: dict[str, int] = {}) -> dict[str, str]:
-        """Return `{memory_name: rendered_section}` for enabled, non-empty memories."""
+    def build_context(
+        self,
+        query: str,
+        user_id: str = "default",
+        limits: dict[str, int] = {},
+        participants: Optional[list[str]] = None,
+    ) -> dict[str, str]:
+        """Return `{memory_name: rendered_section}` for enabled, non-empty memories.
+
+        When ``participants`` has more than one entry each memory is rendered
+        through its participants-aware path (PER_USER memories recall + group
+        per speaker; CHARACTER memories recall once). A single participant (or
+        none) uses the legacy single-user rendering unchanged.
+        """
         order = self.prompts.section_order if self.prompts is not None else [m.name for m in self.memories]
         template = self.prompts.section_template if self.prompts is not None else "## {title}\n{body}"
+        multi = bool(participants and len(participants) > 1)
         sections: dict[str, str] = {}
         for name in order:
             mem = self._by_name.get(name)
             if mem is None or not mem.enabled:
                 continue
-            body = mem.build_section(query, user_id, limits.get(name, 0))
+            if multi:
+                body = mem.build_section_participants(query, participants, limits.get(name, 0))
+            else:
+                body = mem.build_section(query, user_id, limits.get(name, 0))
             if not body:
                 continue
-            sections[name] = template.format(title=self._header_for(name), body=body)
+            title = self._header_for_multi(name) if multi else self._header_for(name)
+            sections[name] = template.format(title=title, body=body)
         return sections
 
-    def render_prompt(self, query: str, user_id: str = "default", limits: dict[str, int] = {}) -> str:
+    def _header_for_multi(self, name: str) -> str:
+        """Section header for the multi-participant rendering (pluralised)."""
+        if self.prompts is not None:
+            header = getattr(self.prompts, f"{name}_header_multi", None)
+            if header:
+                return header
+        # Fall back to the singular header.
+        return self._header_for(name)
+
+    def render_prompt(
+        self,
+        query: str,
+        user_id: str = "default",
+        limits: dict[str, int] = {},
+        participants: Optional[list[str]] = None,
+    ) -> str:
         """Full system-style context block (system line + all sections)."""
-        sections = self.build_context(query, user_id, limits=limits)
+        sections = self.build_context(query, user_id, limits=limits, participants=participants)
         if self.prompts is None:
             parts = []
             if self.base_instruction:

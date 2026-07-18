@@ -365,6 +365,10 @@ function renderSidebar() {
   const items = state.memories.filter((m) => !filter || m.title.toLowerCase().includes(filter) || m.name.includes(filter));
   if (!items.length) { nav.appendChild(el("div", { class: "empty" }, "No memories.")); return; }
   for (const m of items) {
+    // Show how many distinct users a per-user memory knows about. More than
+    // one is the signature of a group chat's extracted memories.
+    const userCount = Array.isArray(m.users) ? m.users.length : 0;
+    const userChip = userCount > 1 ? chip(`${userCount} users`, "") : null;
     const btn = el("button", {
       class: "mem-item" + (m.name === state.memory ? " active" : "") + (m.enabled ? "" : " disabled"),
       onclick: () => selectMemory(m.name),
@@ -373,7 +377,7 @@ function renderSidebar() {
         el("span", { class: "mem-title", title: m.name }, m.title),
         el("span", { class: "mem-count" }, String(m.count)),
       ]),
-      el("div", { class: "mem-sub" }, [chip(m.kind), m.enabled ? null : chip("off")]),
+      el("div", { class: "mem-sub" }, [chip(m.kind), userChip, m.enabled ? null : chip("off")]),
     ]);
     nav.appendChild(btn);
   }

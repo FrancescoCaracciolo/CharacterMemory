@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from .base import MemoryItem
+from .base import MemoryItem, MemoryScope
 from .structured import StructuredMemory
 
 
@@ -16,6 +16,10 @@ class HeartbeatJournal(StructuredMemory):
 
     name = "heartbeat"
     table = "heartbeat"
+    # The journal is the character's own log; it already ignores `user_id` in
+    # recall. Scope it CHARACTER so a group chat recalls it once instead of per
+    # participant.
+    scope = MemoryScope.CHARACTER
     extra_columns = {
         "summary": "TEXT NOT NULL",
         "kind": "TEXT NOT NULL DEFAULT 'discovery'",

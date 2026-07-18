@@ -62,6 +62,7 @@ class UserFactMemory(StructuredMemory):
         user = context.user_name if context else "the user"
         return ExtractionSpec(
             field="facts",
+            per_user=True,
             schema={
                 "type": "array",
                 "items": {
@@ -91,8 +92,13 @@ class UserFactMemory(StructuredMemory):
             content = (f.get("content") or "").strip()
             if not content or self._has_text(user_id, content, "content"):
                 continue
+            # Multi-user: attribute to the participant the LLM named, else the
+            # caller's default user (the chat owner / current speaker).
+            uid = str(f.get("user_id") or user_id)
+            if uid != user_id and self._has_text(uid, content, "content"):
+                continue
             row_id = self.add_fact(
-                user_id,
+                uid,
                 content,
                 type=str(f.get("type", "general")),
                 importance=self._clip(f.get("importance", 0.5)),

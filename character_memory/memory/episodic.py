@@ -71,6 +71,7 @@ class EpisodicMemory(StructuredMemory):
         user = context.user_name if context else "the user"
         return ExtractionSpec(
             field="episodes",
+            per_user=True,
             schema={
                 "type": "array",
                 "items": {
@@ -98,8 +99,11 @@ class EpisodicMemory(StructuredMemory):
             if not summary:
                 continue
             emotional_shift = float(e.get("emotional_shift", 0.0))
+            # Multi-user: attribute to the participant the LLM named, else the
+            # caller's default user (the chat owner / current speaker).
+            uid = str(e.get("user_id") or user_id)
             row_id = self.add_episode(
-                user_id,
+                uid,
                 summary,
                 importance=self._clip(e.get("importance", 0.5)),
                 emotional_shift=emotional_shift,

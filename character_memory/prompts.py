@@ -36,6 +36,15 @@ class PromptConfig:
     heartbeat_header: str = "Recent discoveries / actions of yours"
     emotion_header: str = "Emotional state"
 
+    # Plural headers used when a section is rendered for a multi-participant
+    # (group) chat. When a `*_header_multi` is set, the renderer picks it over
+    # the singular header; otherwise it falls back to the singular one. Only
+    # the per-user sections need a distinct plural form.
+    user_facts_header_multi: str = "What you remember about these users"
+    user_directives_header_multi: str = "Standing instructions from these users"
+    episodic_header_multi: str = "Episodes you've shared with these users"
+    emotion_header_multi: str = "Emotional state (baseline + toward each user)"
+
     # Extraction LLM prompts (see character_memory.memory.extract). These render
     # the instruction built from the participating memories' ExtractionSpecs and
     # interpolate {character_name}, {user_name}, {persona_clause} as appropriate.
@@ -59,6 +68,15 @@ class PromptConfig:
         "Only include genuinely new, non-trivial items. Return [] where nothing "
         "fits, and omit fields entirely if they are not present in the schema.\n\n"
         "Recent conversation:"
+    )
+    # Appended in multi-user (group chat) extraction. Interpolates
+    # {participants}; instructs the model to stamp each per-user item with the
+    # participant it is about.
+    extraction_multi_note: str = (
+        "This conversation has several participants: {participants}. For each "
+        "per-user field, set the item's `user_id` to the participant the item is "
+        "about (one of the listed names). Only attribute an item to someone when "
+        "the conversation actually establishes it about them."
     )
 
     # Deduplication LLM prompts (see character_memory.memory.dedup).

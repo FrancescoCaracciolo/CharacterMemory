@@ -14,6 +14,13 @@ facts already stored (so the model does not re-extract them), enforces a
 full-sentence rule, and the transcript uses the real speaker names instead of
 generic ``User``/``Character`` labels. Omitting the context keeps the legacy
 behavior.
+
+For **group chats** (multiple participants), pass ``participants`` on the
+context. The extractor then labels each transcript turn with its real speaker,
+augments every ``per_user`` spec's item schema with a ``user_id`` enum of the
+participants, and adds an attribution rule; each per-user memory's
+``apply_extraction`` honours the per-item ``user_id``. Single-participant
+contexts (the default) are bit-for-bit identical to the legacy single-user path.
 """
 
 from dataclasses import dataclass, field
@@ -49,6 +56,16 @@ _DEFAULT_EXTRACTION_FOOTER = (
     "Recent conversation:"
 )
 
+# Extra rule appended in multi-user (group chat) extraction: per-user fields
+# must stamp each item with the participant it is about. Exposed on
+# `PromptConfig.extraction_multi_note` so it is overridable like every prompt.
+_DEFAULT_MULTI_NOTE = (
+    "This conversation has several participants: {participants}. For each "
+    "per-user field, set the item's `user_id` to the participant the item is "
+    "about (one of the listed names). Only attribute an item to someone when "
+    "the conversation actually establishes it about them."
+)
+
 # Legacy header/footer kept for the no-context path (backward compatibility).
 _INSTRUCTION_HEADER = (
     "You are a memory extractor for a role-play character. Analyze the recent "
@@ -66,17 +83,58 @@ class ExtractionContext:
     When this is passed to :func:`build_extraction` / :meth:`Extractor.extract`,
     the prompt is rendered with the real character/user names, the character's
     short persona, the user facts already stored, and a full-sentence rule.
+
+    ``participants`` lists the human speakers in a group chat. When it has more
+    than one entry the extraction runs in multi-user mode: the transcript is
+    labelled with each turn's real speaker, per-user fields are augmented with
+    a ``user_id`` enum, and an attribution note is added. Empty or single-entry
+    ``participants`` keeps the legacy single-user behaviour.
     """
 
     character_name: str = "Character"
     user_name: str = "User"
     persona: str = ""
     known_facts: list[str] = field(default_factory=list)
+    participants: list[str] = field(default_factory=list)
     # Prompt templates (override via PromptConfig); interpolated at build time.
     header: str = _DEFAULT_EXTRACTION_HEADER
     sentence_rule: str = _DEFAULT_SENTENCE_RULE
     known_facts_intro: str = _DEFAULT_KNOWN_FACTS_INTRO
     footer: str = _DEFAULT_EXTRACTION_FOOTER
+    multi_note: str = _DEFAULT_MULTI_NOTE
+
+    @property
+    def multi_user(self) -> bool:
+        """True when this extraction call should attribute items per speaker."""
+        return len(self.participants) > 1
+
+
+def _augment_per_user_schema(schema: dict[str, Any], participants: list[str]) -> dict[str, Any]:
+    """Stamp a per-user ``user_id`` enum onto every array-of-objects item schema.
+
+    Operates on a per-field schema fragment (the value stored under
+    ``ExtractionSpec.schema``). For array-of-objects fields it adds a
+    ``user_id`` property whose enum is the participants, and lists it as
+    required, so the LLM must attribute each extracted item. Non-array or
+    non-object-item schemas are returned unchanged (e.g. the multi-user emotion
+    spec already carries its own ``user_id``).
+    """
+    if not participants or schema.get("type") != "array":
+        return schema
+    items = schema.get("items")
+    if not isinstance(items, dict) or items.get("type") != "object":
+        return schema
+    new_items = {k: (dict(v) if isinstance(v, dict) else v) for k, v in items.items()}
+    props = dict(new_items.get("properties") or {})
+    props["user_id"] = {"type": "string", "enum": list(participants)}
+    new_items["properties"] = props
+    required = list(new_items.get("required") or [])
+    if "user_id" not in required:
+        required.append("user_id")
+    new_items["required"] = required
+    new_schema = dict(schema)
+    new_schema["items"] = new_items
+    return new_schema
 
 
 def _format_instruction(specs: list[ExtractionSpec], context: ExtractionContext) -> str:
@@ -97,6 +155,10 @@ def _format_instruction(specs: list[ExtractionSpec], context: ExtractionContext)
         bullets = "\n".join(f"- {f}" for f in context.known_facts)
         parts.append(f"{intro}\n{bullets}")
     parts.append("\n".join(s.instruction for s in specs))
+    if context.multi_user:
+        parts.append(
+            context.multi_note.format(participants=", ".join(context.participants))
+        )
     parts.append(context.footer)
     return "\n\n".join(parts)
 
@@ -115,8 +177,20 @@ def build_extraction(
     participants' real names, the character persona, the stored user facts, and
     a full-sentence rule (see :class:`ExtractionContext`). Without it the legacy
     generic header is used.
+
+    In multi-user mode (``context.multi_user``) each ``per_user`` spec's
+    array-of-objects schema is augmented with a ``user_id`` enum of the
+    participants (see :func:`_augment_per_user_schema`).
     """
-    properties = {s.field: s.schema for s in specs}
+    participants = context.participants if (context and context.multi_user) else []
+    properties = {
+        s.field: (
+            _augment_per_user_schema(s.schema, participants)
+            if s.per_user and participants
+            else s.schema
+        )
+        for s in specs
+    }
     schema: dict[str, Any] = {
         "type": "object",
         "properties": properties,
@@ -150,12 +224,15 @@ class Extractor:
     ) -> dict[str, Any]:
         """Run one structured extraction pass.
 
-        `turns` is a list of `{"role": "user"|"assistant", "content": ...}`.
+        `turns` is a list of `{"role": "user"|"assistant", "content": ...}` and
+        may carry an optional ``user_id`` (the speaker of a user turn, as
+        produced by :meth:`Chat.messages_with_speakers`).
         `schema`/`instruction` are built by :func:`build_extraction` from the
         participating memories' specs.
 
         When ``context`` is given, the transcript labels speakers with the real
-        character/user names instead of the generic ``User``/``Character``.
+        character/user names instead of the generic ``User``/``Character``. In
+        multi-user mode each user turn is labelled with its own speaker.
         """
         if context is not None:
             user_name = context.user_name or "User"
@@ -163,11 +240,20 @@ class Extractor:
         else:
             user_name = "User"
             char_name = "Character"
-        transcript = "\n\n".join(
-            f"{user_name if t['role'] == 'user' else char_name}: {t['content']}"
-            for t in turns
-            if t.get("content")
-        )
+        multi = bool(context and context.multi_user)
+        lines: list[str] = []
+        for t in turns:
+            content = t.get("content")
+            if not content:
+                continue
+            if t.get("role") == "user":
+                # In a group chat prefer the turn's real speaker; otherwise the
+                # single user name.
+                speaker = (t.get("user_id") or user_name) if multi else user_name
+                lines.append(f"{speaker}: {content}")
+            else:
+                lines.append(f"{char_name}: {content}")
+        transcript = "\n\n".join(lines)
         fields = list(schema.get("properties", {}).keys())
         empty = {f: ([] if schema["properties"][f].get("type") == "array" else {}) for f in fields}
         if not transcript.strip():

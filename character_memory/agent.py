@@ -334,23 +334,37 @@ class CharacterAgent:
 
     def _resolve_target(
         self, target: Target, user_id: str
-    ) -> tuple[str, str, list[dict[str, str]]]:
-        """Return (query, user_id, prior_messages) for a target.
+    ) -> tuple[str, str, list[dict[str, str]], list[str]]:
+        """Return (query, user_id, prior_messages, participants) for a target.
 
-        - `Chat`                 -> (last user msg or "", chat.user_id, history)
+        - `Chat`                 -> (last user msg or "", chat.user_id, history, chat.participants())
         - chat id `str`          -> same, after load_chat
-        - raw query `str`        -> (target, user_id, [])
-        - `list[dict]` messages  -> (last user content or "", user_id, target)
+        - raw query `str`        -> (target, user_id, [], [user_id])
+        - `list[dict]` messages  -> (last user content or "", user_id, target, [user_id])
+
+        Participants come from a persisted `Chat` (every human speaker in it).
+        Raw query / message-list targets have no stored speakers, so they are
+        treated as single-user with ``[user_id]``.
         """
         if isinstance(target, Chat):
             chat = target
-            return (chat.last_user_message() or "", chat.user_id, chat.messages())
+            return (
+                chat.last_user_message() or "",
+                chat.user_id,
+                chat.messages(),
+                chat.participants(),
+            )
         if isinstance(target, str):
             chat = self._as_chat(target)
             if chat is not None:
-                return (chat.last_user_message() or "", chat.user_id, chat.messages())
+                return (
+                    chat.last_user_message() or "",
+                    chat.user_id,
+                    chat.messages(),
+                    chat.participants(),
+                )
             # Bare query string, not a known chat id.
-            return (target, user_id, [])
+            return (target, user_id, [], [user_id])
         # Message list.
         msgs = list(target)
         last_user = ""
@@ -358,7 +372,7 @@ class CharacterAgent:
             if m.get("role") == "user" and m.get("content"):
                 last_user = m["content"]
                 break
-        return (last_user, user_id, msgs)
+        return (last_user, user_id, msgs, [user_id])
 
     # Prompt
     def build_context(
@@ -367,15 +381,19 @@ class CharacterAgent:
         """Return `{memory_name: rendered_section}` for the target."""
         self._require_loaded()
         assert self.character is not None
-        query, uid, _ = self._resolve_target(target, user_id)
-        return self.character.build_context(query, uid, limits=self._limits)
+        query, uid, _, participants = self._resolve_target(target, user_id)
+        return self.character.build_context(
+            query, uid, limits=self._limits, participants=participants
+        )
 
     def render_prompt(self, target: Target, *, user_id: str = "default") -> str:
         """Full system-style context block (system line + all sections)."""
         self._require_loaded()
         assert self.character is not None
-        query, uid, _ = self._resolve_target(target, user_id)
-        return self.character.render_prompt(query, uid, limits=self._limits)
+        query, uid, _, participants = self._resolve_target(target, user_id)
+        return self.character.render_prompt(
+            query, uid, limits=self._limits, participants=participants
+        )
 
     # Chat management
     def create_chat(self, user: str, *, title: str = "") -> Chat:
@@ -398,10 +416,16 @@ class CharacterAgent:
 
     # Generation
     def _build_messages(
-        self, query: str, user_id: str, prior: list[dict[str, str]]
+        self,
+        query: str,
+        user_id: str,
+        prior: list[dict[str, str]],
+        participants: Optional[list[str]] = None,
     ) -> list[dict[str, str]]:
         assert self.character is not None
-        system = self.character.render_prompt(query, user_id, limits=self._limits)
+        system = self.character.render_prompt(
+            query, user_id, limits=self._limits, participants=participants
+        )
         return [{"role": "system", "content": system}, *prior]
 
     def _maybe_auto_extract(self, chat: Chat) -> None:
@@ -438,8 +462,8 @@ class CharacterAgent:
         """
         self._require_loaded()
         assert self.llm is not None
-        query, uid, prior = self._resolve_target(target, user_id)
-        messages = self._build_messages(query, uid, prior)
+        query, uid, prior, participants = self._resolve_target(target, user_id)
+        messages = self._build_messages(query, uid, prior, participants=participants)
 
         chat: Optional[Chat] = None
         if isinstance(target, Chat):
@@ -476,15 +500,33 @@ class CharacterAgent:
 
     # Extraction
     def _extract_messages(
-        self, rows: list[dict[str, Any]], user_id: str
+        self,
+        rows: list[dict[str, Any]],
+        user_id: str,
+        participants: Optional[list[str]] = None,
     ) -> None:
-        """Run extraction over a batch of message rows for one user."""
+        """Run extraction over a batch of message rows.
+
+        ``user_id`` is the chat's default user. ``participants`` (when given,
+        more than one) drives multi-user extraction: each turn is labelled with
+        its real speaker and per-user items are attributed per participant.
+        Speaker is read from each row's ``user_id`` (NULL ⇒ the chat owner).
+        """
         assert self.character is not None
         if not rows:
             return
-        turns = [{"role": r["role"], "content": r["content"]} for r in rows]
+        turns = [
+            {
+                "role": r["role"],
+                "content": r["content"],
+                "user_id": r.get("user_id"),
+            }
+            for r in rows
+        ]
         ids = [int(r["id"]) for r in rows]
-        result = self.character.extract(turns, user_id=user_id)
+        result = self.character.extract(
+            turns, user_id=user_id, participants=participants
+        )
         if result is not None:
             self.persist_structured()
             # Post-extraction dedup: compact the freshly-added items against
@@ -507,7 +549,9 @@ class CharacterAgent:
         rows = chat.unextracted()
         if not rows:
             return
-        self._extract_messages(rows[-window:], chat.user_id)
+        self._extract_messages(
+            rows[-window:], chat.user_id, participants=chat.participants()
+        )
 
     def _dedup_added(self, added: dict[str, list]) -> None:
         """Post-extraction step: compact freshly-added items per memory.
@@ -557,7 +601,8 @@ class CharacterAgent:
 
         - `target` a `Chat` / chat id: extract that chat only.
         - `target` None: extract every un-extracted message across all chats,
-          grouped by user.
+          one batch per chat so a group chat extracts with its real
+          participants (per-speaker attribution).
         Idempotent: processed messages are flagged `extracted=1`.
         """
         self._require_loaded()
@@ -568,8 +613,9 @@ class CharacterAgent:
                 self._extract_chat(chat)
             return
 
-        # All chats: group un-extracted rows by user_id so each batch feeds the
-        # right per-user memories.
+        # All chats: batch per chat (not per user) so a group chat keeps its
+        # participant set for multi-user extraction. A 1:1 chat behaves exactly
+        # as before — its participants list is the single owner.
         rows = self._chats.all_unextracted()
         if not rows:
             return
@@ -578,12 +624,18 @@ class CharacterAgent:
             self.config.memory.extract_interval if self.config is not None else 5,
         )
         window = max(interval * 2, 4)
-        by_user: dict[str, list[dict[str, Any]]] = {}
+        by_chat: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
-            uid = self._chats.chat_user(r["chat_id"]) or "default"
-            by_user.setdefault(uid, []).append(r)
-        for uid, user_rows in by_user.items():
-            self._extract_messages(user_rows[-window:], uid)
+            by_chat.setdefault(r["chat_id"], []).append(r)
+        for chat_id, chat_rows in by_chat.items():
+            chat = self._chats.load_chat(chat_id)
+            if chat is None:
+                continue
+            self._extract_messages(
+                chat_rows[-window:],
+                chat.user_id,
+                participants=chat.participants(),
+            )
 
     def close(self) -> None:
         if self.store is not None:

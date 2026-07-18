@@ -3,7 +3,7 @@
 import json
 from typing import TYPE_CHECKING, Any, Optional
 
-from .base import ExtractionSpec, Memory, MemoryItem
+from .base import ExtractionSpec, Memory, MemoryItem, MemoryScope
 from ..chunking import Chunk
 from .store import SQLiteStore
 
@@ -78,6 +78,61 @@ class EmotionStatus(Memory):
         parts += [f"{k}(toward {user_id})={v:.2f}" for k, v in state.items()]
         return [MemoryItem(text=p, score=1.0, kind=self.name) for p in parts]
 
+    # Multi-participant recall ------------------------------------------------
+    # The baseline is user-independent, so in a group chat we surface it once
+    # and then append each participant's per-user dims. This is the only
+    # PER_USER memory whose recall needs special handling, because the baseline
+    # would otherwise be duplicated per participant.
+    def recall_participants(
+        self,
+        query: str,
+        participants: list[str],
+        limit: int,
+        state_changing: bool = True,
+    ) -> list[MemoryItem]:
+        if not participants:
+            return []
+        if len(participants) == 1:
+            return self.recall(query, participants[0], limit, state_changing=state_changing)
+        items: list[MemoryItem] = []
+        # Baseline once.
+        for k, v in self.baseline.items():
+            items.append(
+                MemoryItem(text=f"{k}={v:.2f}", score=1.0, kind=self.name,
+                           metadata={"emotion": "baseline"})
+            )
+        # Each participant's per-user dims, tagged with the user for grouping.
+        for uid in participants:
+            state = self.get_user_state(uid)
+            for k, v in state.items():
+                items.append(
+                    MemoryItem(
+                        text=f"{k}={v:.2f}", score=1.0, kind=self.name,
+                        metadata={"user_id": uid, "emotion": "user"},
+                    )
+                )
+        return items
+
+    def format_grouped(self, items: list[MemoryItem], participants: list[str]) -> str:
+        """Baseline once, then a per-participant block of their dims."""
+        baseline: list[MemoryItem] = []
+        by_user: dict[str, list[MemoryItem]] = {}
+        for it in items:
+            uid = it.metadata.get("user_id")
+            if isinstance(uid, str) and uid:
+                by_user.setdefault(uid, []).append(it)
+            else:
+                baseline.append(it)
+        blocks: list[str] = []
+        if baseline:
+            blocks.append("Baseline:\n" + "\n".join(f"- {it.text}" for it in baseline))
+        order = [u for u in participants if u in by_user]
+        order += [u for u in by_user if u not in order]
+        for uid in order:
+            body = "\n".join(f"- {it.text}" for it in by_user[uid])
+            blocks.append(f"Toward {uid}:\n{body}")
+        return "\n\n".join(blocks)
+
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
         """Every stored per-user emotion state, one item per user.
 
@@ -107,6 +162,38 @@ class EmotionStatus(Memory):
         dims = ", ".join(self.user_dims) or "affection, valence, trust"
         char = context.character_name if context else "the character"
         user = context.user_name if context else "the user"
+        participants = getattr(context, "participants", None) or []
+        if participants and len(participants) > 1:
+            # Group chat: one signed-delta object per participant. The
+            # ``user_id`` enum is injected by the extractor builder.
+            return ExtractionSpec(
+                field="emotion_deltas",
+                per_user=True,
+                schema={
+                    "type": "array",
+                    "description": (
+                        f"Signed adjustments to {char}'s per-user emotion dims, "
+                        f"one entry per participant. Allowed dims: {dims}."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "user_id": {"type": "string"},
+                            "deltas": {
+                                "type": "object",
+                                "additionalProperties": {"type": "number"},
+                            },
+                        },
+                        "required": ["user_id", "deltas"],
+                    },
+                },
+                instruction=(
+                    f"- emotion_deltas: small signed adjustments to {char}'s feelings "
+                    f"toward each of the participants ({', '.join(participants)}), based "
+                    f"on what just happened. One entry per participant the exchange was "
+                    f"about; omit participants with no shift. Allowed dims: {dims}."
+                ),
+            )
         return ExtractionSpec(
             field="emotion_deltas",
             schema={
@@ -121,6 +208,19 @@ class EmotionStatus(Memory):
         )
 
     def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
-        if value:
+        if not value:
+            return []
+        # Multi-user: a list of {user_id, deltas}. Apply each to its own user.
+        if isinstance(value, list):
+            for entry in value:
+                if not isinstance(entry, dict):
+                    continue
+                uid = str(entry.get("user_id") or user_id)
+                deltas = entry.get("deltas")
+                if isinstance(deltas, dict):
+                    self.update(uid, deltas)
+            return []
+        # Single-user: a {dim: delta} object applied to the caller's user.
+        if isinstance(value, dict):
             self.update(user_id, value)
         return []

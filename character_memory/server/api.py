@@ -13,13 +13,20 @@ or with uvicorn directly::
 The flow it implements is the typical "thin client" pattern:
 
 1. ``POST /context`` — given a character name, a user id, a user message and
-   an optional ``chat_id``, load (or create) the chat, persist the user turn,
-   and return the assembled memory context plus the (possibly new) chat id.
-   The client uses that context to drive its own LLM call.
+   an optional ``chat_id``, load (or create) the chat, persist the user turn
+   (attributed to that speaker), and return the assembled memory context plus
+   the (possibly new) chat id. The client uses that context to drive its own
+   LLM call.
 
 2. ``POST /save``  — the client comes back with the assistant answer it
    generated; this endpoint persists the assistant turn and runs memory
    extraction so the character learns from the exchange.
+
+The ``user`` field is the **current speaker**. A chat can host several
+speakers (a group chat): any caller holding the chat id may post as any
+``user``, each turn is attributed to its speaker, and memories are extracted
+per participant. A 1:1 chat behaves exactly as before — the ``user`` is the
+single participant.
 
 Characters are discovered from the ``assets/`` directory at startup: every
 subdirectory of ``assets/`` (e.g. ``assets/Kurisu``) becomes an available
@@ -100,7 +107,7 @@ def _get_agent(character: str) -> CharacterAgent:
 # --------------------------------------------------------------------------- #
 class ContextRequest(BaseModel):
     character: str = Field(..., description="Character name (a subfolder of assets/).")
-    user: str = Field(..., description="User id this chat belongs to.")
+    user: str = Field(..., description="User id of the current speaker for this turn.")
     message: str = Field(..., description="The user's latest message.")
     chat_id: Optional[str] = Field(
         default=None,
@@ -150,8 +157,14 @@ def list_characters() -> dict[str, list[str]]:
 
 @app.post("/context", response_model=ContextResponse)
 def context(req: ContextRequest) -> ContextResponse:
-    """Resolve the chat (creating it if needed), store the user turn, and
-    return the assembled memory context for the character + user."""
+    """Resolve the chat (creating it if needed), store the user turn as spoken
+    by `req.user`, and return the assembled memory context for the character +
+    conversation participants.
+
+    A chat id is an unguessable room key: any caller holding it may post as
+    any speaker, which is what enables group chats. The chat owner is whoever
+    created it; subsequent speakers are recorded via the per-turn `user_id`.
+    """
     agent = _get_agent(req.character)
 
     chat = None
@@ -162,16 +175,12 @@ def context(req: ContextRequest) -> ContextResponse:
                 status_code=404,
                 detail=f"chat_id {req.chat_id!r} does not exist for {req.character!r}.",
             )
-        if chat.user_id != req.user:
-            raise HTTPException(
-                status_code=403,
-                detail=f"chat {chat.id!r} belongs to user {chat.user_id!r}, not {req.user!r}.",
-            )
     if chat is None:
         chat = agent.create_chat(req.user, title=req.message[:60])
 
-    # Persist the user turn so it shows up in the prompt history.
-    chat.add_message("user", req.message)
+    # Persist the user turn attributed to the current speaker. For a group
+    # chat this is what makes each participant's messages attributable.
+    chat.add_message("user", req.message, user_id=req.user)
 
     sections = agent.build_context(chat)
     return ContextResponse(chat_id=chat.id, context=sections)

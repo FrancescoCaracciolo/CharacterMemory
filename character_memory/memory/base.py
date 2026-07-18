@@ -7,11 +7,36 @@ them.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from ..chunking import Chunk
 
 if TYPE_CHECKING:  # avoid a circular import at runtime (extract.py imports base)
     from .extract import ExtractionContext
+
+
+class MemoryScope(str, Enum):
+    """How a memory relates to the participants of a conversation.
+
+    Memories stay single-user at their core (:meth:`Memory.recall` always takes
+    one ``user_id``). The *scope* is a declaration each memory makes about
+    itself; the orchestrator uses it to decide how to fan recall out across a
+    multi-participant (group) chat:
+
+    * ``PER_USER`` (default): recall once per participant and group the results
+      by speaker. Used by facts / directives / episodic / emotion — anything
+      that stores information about a specific person.
+    * ``CHARACTER``: recall once and ignore participants entirely. Used by
+      memories that are about the character, not the user (the wiki, example
+      dialogues, the heartbeat journal).
+
+    Keeping this as a per-memory declaration (rather than hard-coding it in the
+    agent) lets each module describe its own behaviour, so new memories opt in
+    or out of multi-user handling without touching the orchestrator.
+    """
+
+    PER_USER = "per_user"
+    CHARACTER = "character"
 
 @dataclass
 class MemoryItem:
@@ -39,17 +64,31 @@ class ExtractionSpec:
       under `properties.<field>`).
     - `instruction`: the human-readable bullet describing this field to the
       LLM (what to extract, value ranges, …).
+    - `per_user`: when True, the memory's items are attributed to specific
+      participants in a group chat. In multi-user mode the extractor augments
+      the item schema with a ``user_id`` enum (the participants) and the LLM is
+      asked to stamp each item with the participant it is about; in single-user
+      mode this flag is a no-op (the chat's one user is used). Per-user
+      memories set it True; character-scoped memories leave it False.
     """
 
     field: str
     schema: dict[str, Any]
     instruction: str
+    per_user: bool = False
 
 
 class Memory(ABC):
     """Base class for all memory systems."""
 
     name: str = "memory"
+
+    #: How this memory relates to conversation participants. See
+    #: :class:`MemoryScope`. Per-user memories keep the default (``PER_USER``);
+    #: character-scoped memories (wiki, example dialogues, heartbeat) override
+    #: it to ``CHARACTER``. The orchestrator reads this to decide how to fan
+    #: recall out across a multi-participant chat.
+    scope: MemoryScope = MemoryScope.PER_USER
 
     def __init__(self, *, enabled: bool = True, name: Optional[str] = None) -> None:
         self.enabled = enabled
@@ -105,6 +144,111 @@ class Memory(ABC):
             return None
         return self.format(items)
 
+    # Multi-participant (group chat) handling --------------------------------
+    # These are orchestration conveniences layered on top of the single-user
+    # :meth:`recall`. A memory's :attr:`scope` decides how they fan recall out:
+    # PER_USER recalls once per participant, CHARACTER recalls once. Each method
+    # falls back to the single-user path when there is just one participant, so
+    # a 1:1 chat is bit-for-bit identical to the legacy rendering.
+    def recall_participants(
+        self,
+        query: str,
+        participants: list[str],
+        limit: int,
+        state_changing: bool = True,
+    ) -> list[MemoryItem]:
+        """Recall items for the conversation's participants.
+
+        * ``PER_USER`` scope: recall once per participant (each gets up to
+          ``limit`` items); the speaker is carried in each item's metadata.
+        * ``CHARACTER`` scope: recall once (the memory is not about any one
+          participant); the first participant is passed to :meth:`recall` as a
+          dummy ``user_id`` and ignored by the implementation.
+
+        The single participant is the fast path: a plain ``recall`` call.
+        """
+        if not participants:
+            return []
+        if len(participants) == 1:
+            return self.recall(
+                query, participants[0], limit, state_changing=state_changing
+            )
+        if self.scope is MemoryScope.CHARACTER:
+            return self.recall(
+                query, participants[0], limit, state_changing=state_changing
+            )
+        items: list[MemoryItem] = []
+        for uid in participants:
+            items.extend(
+                self.recall(query, uid, limit, state_changing=state_changing)
+            )
+        return items
+
+    def format_grouped(
+        self, items: list[MemoryItem], participants: list[str]
+    ) -> str:
+        """Render recalled `items` grouped by participant.
+
+        Used by PER_USER memories in a group chat. Each item carries the
+        speaker it belongs to under ``metadata['user_id']``. Items with no
+        speaker (or an unknown one) are rendered under a generic block. The
+        default implementation renders ``About {name}:\n- ...`` per
+        participant; EmotionStatus overrides it to fold the baseline in once.
+        """
+        by_user: dict[str, list[MemoryItem]] = {}
+        unattributed: list[MemoryItem] = []
+        for it in items:
+            uid = it.metadata.get("user_id")
+            if isinstance(uid, str) and uid:
+                by_user.setdefault(uid, []).append(it)
+            else:
+                unattributed.append(it)
+        blocks: list[str] = []
+        # Render known participants first, in the order they were given, so the
+        # layout is stable across turns; any leftover speakers trail after.
+        order = [u for u in participants if u in by_user]
+        order += [u for u in by_user if u not in order]
+        for uid in order:
+            body = "\n".join(f"- {it.text}" for it in by_user[uid])
+            blocks.append(f"About {uid}:\n{body}")
+        if unattributed:
+            body = "\n".join(f"- {it.text}" for it in unattributed)
+            blocks.append(body)
+        return "\n\n".join(blocks)
+
+    def build_section_participants(
+        self,
+        query: str,
+        participants: list[str],
+        limit: int,
+        state_changing: bool = True,
+    ) -> Optional[str]:
+        """Recall + format for a multi-participant conversation.
+
+        For a single participant this delegates to :meth:`build_section`
+        (identical to the legacy single-user path). For several participants it
+        recalls for everyone and renders grouped or flat depending on scope:
+        CHARACTER memories are formatted with :meth:`format` (their items are
+        not per-user); PER_USER memories are formatted with
+        :meth:`format_grouped`.
+        """
+        if not participants:
+            return None
+        if len(participants) == 1:
+            return self.build_section(
+                query, participants[0], limit, state_changing=state_changing
+            )
+        if not self.enabled:
+            return None
+        items = self.recall_participants(
+            query, participants, limit, state_changing=state_changing
+        )
+        if not items:
+            return None
+        if self.scope is MemoryScope.CHARACTER:
+            return self.format(items)
+        return self.format_grouped(items, participants)
+
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
         """Return every memory stored in this memory's backend.
 
@@ -138,5 +282,10 @@ class Memory(ABC):
         (a list, a dict, … depending on the schema). Returns the items that
         were actually added to the memory, so callers (e.g. a deduplicator)
         can act on the freshly-written rows. No-op implementations return `[]`.
+
+        In multi-user (group chat) extraction each per-user item may carry its
+        own ``user_id``; per-user memories honour ``item['user_id']`` and fall
+        back to the caller's ``user_id`` when it is absent. ``user_id`` here is
+        the chat's default (the owner / current speaker).
         """
         return []

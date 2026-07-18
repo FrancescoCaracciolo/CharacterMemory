@@ -78,6 +78,12 @@ class SQLiteStore:
             self._conn.commit()
         return [dict(r) for r in rows]
 
+    def columns(self, table: str) -> list[str]:
+        """Column names of `table` (empty if the table does not exist)."""
+        with self._lock:
+            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [r["name"] for r in rows]
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
