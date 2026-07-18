@@ -35,9 +35,15 @@ class MarkdownByHeaderChunker(Chunker):
 
     name = "header"
 
-    def __init__(self, max_tokens: int = 512, header_level: int = 2) -> None:
+    def __init__(
+        self, max_tokens: int = 512, header_level: int = 2, min_tokens: int = 64
+    ) -> None:
         self.max_tokens = max_tokens
         self.header_level = header_level
+        # Chunks below `min_tokens` are merged into a neighbour instead of being
+        # emitted as near-empty fragments (e.g. a 540-token section leaving a
+        # ~28-token tail after the 512-token budget split).
+        self.min_tokens = max(0, int(min_tokens))
         self._count = _token_counter()
 
     def _sections(self, text: str) -> list[tuple[str, str]]:
@@ -86,7 +92,37 @@ class MarkdownByHeaderChunker(Chunker):
                     buf = prefix + para
         if buf and buf.strip():
             chunks.append(Chunk(text=buf, source=source, metadata={"header": title}))
-        return chunks
+        return self._merge_tiny(chunks, source, title)
+
+    def _merge_tiny(
+        self, chunks: list[Chunk], source: str, title: str
+    ) -> list[Chunk]:
+        """Fold near-empty chunks into a neighbour so they are not indexed alone.
+
+        Any chunk below `min_tokens` (tail, middle or leading) is merged into the
+        previous chunk; a leading tiny chunk merges into its follower. Disabled when
+        `min_tokens <= 0`. Merged text is separated by a blank line and keeps the
+        section's `title` metadata.
+        """
+        if len(chunks) < 2 or self.min_tokens <= 0:
+            return chunks
+
+        def _join(a: Chunk, b: Chunk) -> Chunk:
+            return Chunk(
+                text=(a.text + "\n\n" + b.text).strip(),
+                source=source,
+                metadata={"header": title},
+            )
+
+        out: list[Chunk] = [chunks[0]]
+        for c in chunks[1:]:
+            if self._count(c.text) < self.min_tokens:
+                out[-1] = _join(out[-1], c)
+            else:
+                out.append(c)
+        if len(out) >= 2 and self._count(out[0].text) < self.min_tokens:
+            out = [_join(out[0], out[1]), *out[2:]]
+        return out
 
     def _hard_split(self, prefix: str, para: str, source: str, title: str) -> list[Chunk]:
         words = para.split()

@@ -250,7 +250,11 @@ class CharacterAgent:
         c = self._chunking_config()
         info_dir = os.path.join(self.character_dir, _INFO_GLOB)
         info_chunks = (
-            get_chunker(c.info_chunker, max_tokens=c.header_max_tokens).chunk_directory(info_dir)
+            get_chunker(
+                c.info_chunker,
+                max_tokens=c.header_max_tokens,
+                min_tokens=c.header_min_tokens,
+            ).chunk_directory(info_dir)
             if os.path.isdir(info_dir) else []
         )
         dlg_dir = os.path.join(self.character_dir, _DIALOGUE_GLOB)

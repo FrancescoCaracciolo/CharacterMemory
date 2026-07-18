@@ -64,6 +64,7 @@ class ChunkingConfig:
     info_chunker: str = "header"          # name in the chunker registry
     dialogue_chunker: str = "dialogue"
     header_max_tokens: int = 512
+    header_min_tokens: int = 64  # fragments below this are merged, not emitted
     dialogue_turns_per_chunk: int = 6
     dialogue_context_width: int = 3       # preceding turns carried as context
 
