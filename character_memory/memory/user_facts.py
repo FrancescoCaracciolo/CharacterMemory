@@ -1,9 +1,13 @@
 """User facts: structured, multi-user memory with confidence/importance + decay."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from ..config import ContradictionPolicy
 from .base import ExtractionSpec, MemoryItem
 from .structured import StructuredMemory
+
+if TYPE_CHECKING:  # avoid circular import at runtime
+    from .extract import ExtractionContext
 
 
 class UserFactMemory(StructuredMemory):
@@ -47,8 +51,15 @@ class UserFactMemory(StructuredMemory):
         text = f"{row.get('content', '')} (type: {row.get('type', 'general')}, confidence: {row.get('confidence', 0):.2f})"
         return MemoryItem(text=text, score=score, kind=self.name, metadata=dict(row))
 
+    def contradiction_policy(self) -> ContradictionPolicy:
+        # Stable facts (occupation, preferences, …) contradict when they assert
+        # incompatible current truths — "doctor" vs "engineer". Timestamps let
+        # the judge weigh recency, but the default policy opts into the gate.
+        return ContradictionPolicy(enabled=True)
+
     # Extraction
-    def extraction_spec(self) -> ExtractionSpec:
+    def extraction_spec(self, context: "ExtractionContext | None" = None) -> ExtractionSpec:
+        user = context.user_name if context else "the user"
         return ExtractionSpec(
             field="facts",
             schema={
@@ -65,10 +76,12 @@ class UserFactMemory(StructuredMemory):
                 },
             },
             instruction=(
-                "- facts: stable facts about the user (occupation, preferences, "
-                "relationships, goals) or general facts the user stated. importance "
-                "0-1 (how much it should shape the character's behaviour), "
-                "confidence 0-1."
+                f"- facts: stable facts about {user} (occupation, preferences, "
+                f"relationships, goals) or general facts {user} stated. Each "
+                f"`content` must be one self-contained full sentence about {user} "
+                f"(e.g. \"{user} has an exam on the 17th of July\"). importance 0-1 "
+                f"(how much it should shape the character's behaviour), confidence "
+                f"0-1."
             ),
         )
 

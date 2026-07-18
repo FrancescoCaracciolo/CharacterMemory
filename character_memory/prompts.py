@@ -36,6 +36,31 @@ class PromptConfig:
     heartbeat_header: str = "Recent discoveries / actions of yours"
     emotion_header: str = "Emotional state"
 
+    # Extraction LLM prompts (see character_memory.memory.extract). These render
+    # the instruction built from the participating memories' ExtractionSpecs and
+    # interpolate {character_name}, {user_name}, {persona_clause} as appropriate.
+    extraction_header: str = (
+        "You are the memory extractor for {character_name}, a role-play character"
+        "{persona_clause}. Analyze the recent conversation and extract durable, "
+        "reusable information about {user_name} and about events {character_name} "
+        "experienced.\n"
+    )
+    extraction_sentence_rule: str = (
+        "Each extracted item must be a self-contained full sentence that uses the "
+        "real names ({character_name} for the character, {user_name} for the user). "
+        "For example, write \"{user_name} has an exam on the 17th of July\" — not "
+        "\"exam on 17th\" or \"the user mentioned an exam\"."
+    )
+    extraction_known_facts_intro: str = (
+        "What you already know about {user_name} (do not re-extract these; only add "
+        "genuinely new information):"
+    )
+    extraction_footer: str = (
+        "Only include genuinely new, non-trivial items. Return [] where nothing "
+        "fits, and omit fields entirely if they are not present in the schema.\n\n"
+        "Recent conversation:"
+    )
+
     # Deduplication LLM prompts (see character_memory.memory.dedup).
     dedup_judge: str = (
         "You are a duplicate detector for a character memory store. You will be "
@@ -52,6 +77,17 @@ class PromptConfig:
         "both, removes redundancy, and keeps the same tone and tense. Do not invent "
         "new information. "
         'Respond ONLY with a single JSON object: {"text": "<the merged entry>."}'
+    )
+
+    dedup_contradict: str = (
+        "You are checking whether two memory entries about the same subject "
+        "CONTRADICT each other — they cannot both be true at the same time. "
+        "Each entry is shown with the time it was recorded. USE THE TIMESTAMPS: "
+        "two entries that describe different points in time (e.g. the user's "
+        "mood on Monday vs Tuesday) are NOT contradictions, they are a change "
+        "over time. A contradiction is when both assert incompatible facts about "
+        "the same point in time (e.g. 'X is a doctor' vs 'X is an engineer'). "
+        'Respond ONLY with: {"contradicts": true} or {"contradicts": false}.'
     )
 
     # Order in which memory sections appear in the prompt.

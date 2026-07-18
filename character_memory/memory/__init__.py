@@ -3,7 +3,7 @@ from .character_base import CharacterInfoMemory, DialogueStyleMemory, RAGMemory
 from .dedup import DedupReport, Deduplicator
 from .emotion import EmotionStatus
 from .episodic import EpisodicMemory
-from .extract import Extractor
+from .extract import ExtractionContext, Extractor
 from .heartbeat import HeartbeatJournal
 from .store import SQLiteStore
 from .structured import StructuredMemory
@@ -23,6 +23,7 @@ __all__ = [
     "HeartbeatJournal",
     "StructuredMemory",
     "SQLiteStore",
+    "ExtractionContext",
     "Extractor",
     "Deduplicator",
     "DedupReport",

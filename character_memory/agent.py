@@ -76,11 +76,17 @@ class CharacterAgent:
         name: Optional[str] = None,
         save_directory: Optional[str] = None,
         prompt_config: Optional[PromptConfig] = None,
+        persona: str = "",
     ) -> None:
         self.character_dir = directory
         self.character_name = name or os.path.basename(os.path.normpath(directory))
         self.save_directory = save_directory or os.path.join(directory, ".cm_data")
         self.prompts = prompt_config or PromptConfig()
+        # Short character blurb surfaced to the extractor (and the answer prompt)
+        # so the model knows who the character is. Auto-summarizing the
+        # Information/*.md into a blurb is intentionally out of scope; callers
+        # pass this in if they want the persona clause populated.
+        self.persona = persona
 
         # Not wired until load_* is called.
         self.config: Optional[CharacterMemoryConfig] = None
@@ -223,6 +229,7 @@ class CharacterAgent:
         }
         self.character = Character(
             character_name=self.character_name,
+            base_instruction=self.persona,
             memories=list(self.memories.values()),
             llm=self.llm,
             prompts=self.prompts,

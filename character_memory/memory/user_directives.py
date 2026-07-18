@@ -1,10 +1,13 @@
 """User directives: per-user standing instructions with importance + keywords."""
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .base import ExtractionSpec, MemoryItem
 from .structured import StructuredMemory
+
+if TYPE_CHECKING:  # avoid circular import at runtime
+    from .extract import ExtractionContext
 
 
 class UserDirectiveMemory(StructuredMemory):
@@ -77,7 +80,9 @@ class UserDirectiveMemory(StructuredMemory):
         return MemoryItem(text=row.get("content", ""), score=score, kind=self.name, metadata=dict(row))
 
     # Extraction ----------------------------------------------------------
-    def extraction_spec(self) -> ExtractionSpec:
+    def extraction_spec(self, context: "ExtractionContext | None" = None) -> ExtractionSpec:
+        user = context.user_name if context else "the user"
+        char = context.character_name if context else "the character"
         return ExtractionSpec(
             field="directives",
             schema={
@@ -93,9 +98,10 @@ class UserDirectiveMemory(StructuredMemory):
                 },
             },
             instruction=(
-                "- directives: standing instructions the user gave (e.g. 'always "
-                "answer formally'). importance 0-1. keywords: terms that should "
-                "trigger retrieval."
+                f"- directives: standing instructions {user} asked {char} to follow "
+                f"(e.g. \"{user} wants {char} to always answer formally\"). Each "
+                f"`content` must be one self-contained full sentence. importance 0-1. "
+                f"keywords: terms that should trigger retrieval."
             ),
         )
 

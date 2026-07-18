@@ -1,11 +1,14 @@
 """Emotion status: a user-independent baseline plus configurable per-user dims."""
 
 import json
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .base import ExtractionSpec, Memory, MemoryItem
 from ..chunking import Chunk
 from .store import SQLiteStore
+
+if TYPE_CHECKING:  # avoid circular import at runtime
+    from .extract import ExtractionContext
 
 
 class EmotionStatus(Memory):
@@ -100,8 +103,10 @@ class EmotionStatus(Memory):
         return None
 
     # Extraction ----------------------------------------------------------
-    def extraction_spec(self) -> ExtractionSpec:
+    def extraction_spec(self, context: "ExtractionContext | None" = None) -> ExtractionSpec:
         dims = ", ".join(self.user_dims) or "affection, valence, trust"
+        char = context.character_name if context else "the character"
+        user = context.user_name if context else "the user"
         return ExtractionSpec(
             field="emotion_deltas",
             schema={
@@ -110,8 +115,8 @@ class EmotionStatus(Memory):
                 "additionalProperties": {"type": "number"},
             },
             instruction=(
-                f"- emotion_deltas: small signed adjustments to the character's "
-                f"feelings toward this user. Allowed dims: {dims}."
+                f"- emotion_deltas: small signed adjustments to {char}'s feelings "
+                f"toward {user}, based on what just happened. Allowed dims: {dims}."
             ),
         )
 

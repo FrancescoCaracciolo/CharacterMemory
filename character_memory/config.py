@@ -101,6 +101,31 @@ class DedupConfig:
 
 
 @dataclass
+class ContradictionPolicy:
+    """Per-memory policy for resolving contradicting facts.
+
+    Returned by :meth:`StructuredMemory.contradiction_policy`. When enabled,
+    the Deduplicator runs an extra gate — after dedup finds no duplicate —
+    that surfaces semantically close rows which *clash* and overwrites the
+    older row's text with the newer one's. Disabled by default; stable-fact
+    memories override it.
+
+    - `enabled`: master switch for this memory.
+    - `similarity_threshold`: cosine bar below the dedup threshold; catches
+      pairs that clash but are not restatements (e.g. "doctor" vs "engineer").
+    - `candidate_pool`: wider net than dedup's own pool, since contradictions
+      sit at lower similarity.
+    - `show_timestamps`: pass each row's `created_at` to the contradiction
+      judge so it can tell a genuine clash from a change over time.
+    """
+
+    enabled: bool = False
+    similarity_threshold: float = 0.70
+    candidate_pool: int = 20
+    show_timestamps: bool = True
+
+
+@dataclass
 class MemoryConfig:
     """Per-memory toggles and retrieval knobs.
 

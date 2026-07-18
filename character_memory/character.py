@@ -3,8 +3,9 @@
 from typing import Optional
 from character_memory.llm.base import LLMClient
 from character_memory.prompts import PromptConfig
-from .memory.extract import Extractor, build_extraction
+from .memory.extract import Extractor, ExtractionContext, build_extraction
 from .memory.base import Memory, MemoryItem
+from .memory.structured import StructuredMemory
 
 
 class Character:
@@ -28,23 +29,57 @@ class Character:
                 return header
         return self._by_name[name].title
 
+    def _known_user_facts(self, user_id: str, limit: int = 8) -> list[str]:
+        """Top known user-fact texts for `user_id`, highest importance first.
+
+        Used to ground the extractor so it does not re-extract what is already
+        stored. Returns [] when user_facts is absent or empty for this user.
+        """
+        mem = self._by_name.get("user_facts")
+        if not isinstance(mem, StructuredMemory):
+            return []
+        rows = mem.all_rows(user_id=user_id)
+        rows.sort(key=lambda r: float(r.get("importance", 0.0)), reverse=True)
+        facts: list[str] = []
+        for r in rows[:limit]:
+            text = mem.row_text(r).strip()
+            if text:
+                facts.append(text)
+        return facts
+
+    def _extraction_context(self, user_id: str) -> ExtractionContext:
+        """Build the identity + grounding context for an extraction call."""
+        known = self._known_user_facts(user_id)
+        p = self.prompts
+        return ExtractionContext(
+            character_name=self.character_name,
+            user_name=user_id,
+            persona=self.base_instruction.strip(),
+            known_facts=known,
+            header=p.extraction_header if p is not None else ExtractionContext.header,
+            sentence_rule=p.extraction_sentence_rule if p is not None else ExtractionContext.sentence_rule,
+            known_facts_intro=p.extraction_known_facts_intro if p is not None else ExtractionContext.known_facts_intro,
+            footer=p.extraction_footer if p is not None else ExtractionContext.footer,
+        )
+
     def extract(self, turns: list[dict[str, str]], user_id: str = "default", llm: Optional[LLMClient] = None) -> Optional[dict]:
         if llm is None:
             llm = self.llm
         if llm is None:
             raise ValueError("No LLM specified. Character.extract needs a LLM configured")
+        context = self._extraction_context(user_id)
         # Only enabled memories that opt into extraction.
         participants = [
             (mem, spec)
             for mem in self.memories
             if mem.enabled
-            for spec in [mem.extraction_spec()]
+            for spec in [mem.extraction_spec(context)]
             if spec is not None
         ]
         if not participants:
             return None
-        schema, instruction = build_extraction([spec for _, spec in participants])
-        extracted = Extractor(llm).extract(turns, schema=schema, instruction=instruction)
+        schema, instruction = build_extraction([spec for _, spec in participants], context=context)
+        extracted = Extractor(llm).extract(turns, schema=schema, instruction=instruction, context=context)
         added: dict[str, list[MemoryItem]] = {}
         for mem, spec in participants:
             items = mem.apply_extraction(extracted.get(spec.field), user_id)

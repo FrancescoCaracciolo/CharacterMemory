@@ -11,20 +11,30 @@ in escalating order: exact match → similarity → LLM judge. If ``consolidate`
 is on, a confirmed duplicate is rewritten into a single merged entry instead of
 the newer one being dropped.
 
-The four behaviours are toggled by :class:`~character_memory.config.DedupConfig`
-flags; no LLM is required unless ``llm_judge`` or ``consolidate`` are on (those
-stages degrade to no-ops when no ``LLMClient`` was supplied).
+Contradiction resolution is an additional gate driven by each memory's
+:class:`~character_memory.config.ContradictionPolicy`. When dedup finds no
+duplicate for a candidate, the same ranked candidates are re-checked against a
+*lower* similarity bar: if two entries clash (assert incompatible facts about
+the same point in time), the older row's text is overwritten with the newer
+row's and the newer row is dropped. Memories decide their own policy via
+:meth:`StructuredMemory.contradiction_policy`; the default is disabled.
+
+The dedup behaviours are toggled by :class:`~character_memory.config.DedupConfig`
+flags; no LLM is required unless ``llm_judge``, ``consolidate`` or a memory's
+contradiction policy are on (those stages degrade to no-ops when no
+``LLMClient`` was supplied).
 """
 
 from __future__ import annotations
 
+import time
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
 
-from ..config import DedupConfig
+from ..config import ContradictionPolicy, DedupConfig
 from ..llm.base import LLMClient
 from ..llm.embedding_base import EmbeddingProvider
 from ..prompts import PromptConfig
@@ -45,9 +55,23 @@ _CONSOLIDATE_SCHEMA = {
     "required": ["text"],
 }
 
+_CONTRADICT_SCHEMA = {
+    "type": "object",
+    "properties": {"contradicts": {"type": "boolean"}},
+    "required": ["contradicts"],
+}
+
 
 def _normalize(text: str) -> str:
     return (text or "").strip().lower()
+
+
+def _fmt_ts(ts: Any) -> str:
+    """Render a `created_at` epoch float as a short readable stamp."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except (TypeError, ValueError, OverflowError):
+        return "unknown time"
 
 
 @dataclass
@@ -57,6 +81,7 @@ class DedupReport:
     checked: int = 0          # items/rows considered
     skipped: int = 0          # duplicates dropped (no consolidation)
     merged: int = 0           # pairs consolidated into one
+    resolved: int = 0         # contradictions: older text overwritten by newer
     removed_ids: list[int] = field(default_factory=list)
     updated_ids: list[int] = field(default_factory=list)
 
@@ -88,6 +113,7 @@ class Deduplicator:
         prompts = prompts or PromptConfig()
         self.judge_prompt = prompts.dedup_judge
         self.consolidate_prompt = prompts.dedup_consolidate
+        self.contradict_prompt = prompts.dedup_contradict
         self._warned_no_llm = False
 
     # ------------------------------------------------------------------ utils
@@ -120,16 +146,20 @@ class Deduplicator:
         user_id: str,
         rows: list[dict[str, Any]],
         exclude_ids: Optional[set[int]] = None,
+        pool: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         """Narrow candidate rows via the memory's RAG index (no full re-embed).
 
         ``exclude_ids`` (if given) are removed from the hits — used by
         :meth:`dedup_items` to avoid an item matching itself in the index.
+        ``pool`` overrides ``DedupConfig.candidate_pool``; contradiction
+        resolution asks for a wider net than plain dedup.
         """
         rows_by_id = {int(r["id"]): r for r in rows}
         exclude = exclude_ids or set()
+        base_pool = pool if pool is not None else self.config.candidate_pool
         # Over-fetch so exclusion of a few top hits still yields candidates.
-        k = min(self.config.candidate_pool + len(exclude), len(rows_by_id))
+        k = min(base_pool + len(exclude), len(rows_by_id))
         if k <= 0:
             return []
         try:
@@ -173,6 +203,36 @@ class Deduplicator:
             return merged or None
         except Exception:
             return None
+
+    def _contradicts(
+        self,
+        text_a: str,
+        text_b: str,
+        ts_a: Any = None,
+        ts_b: Any = None,
+        show_ts: bool = True,
+    ) -> bool:
+        """LLM gate: True if the two entries cannot both be true at once.
+
+        Timestamps are included when ``show_ts`` is set so the judge can tell a
+        genuine clash from a change over time.
+        """
+        if show_ts:
+            body = (
+                f"Entry A (recorded {_fmt_ts(ts_a)}):\n{text_a}\n\n"
+                f"Entry B (recorded {_fmt_ts(ts_b)}):\n{text_b}"
+            )
+        else:
+            body = f"Entry A:\n{text_a}\n\nEntry B:\n{text_b}"
+        messages = [
+            {"role": "system", "content": self.contradict_prompt},
+            {"role": "user", "content": body},
+        ]
+        try:
+            result = self.llm.chat_structured(messages, _CONTRADICT_SCHEMA)  # type: ignore[union-attr]
+            return bool(result.get("contradicts", False))
+        except Exception:
+            return False
 
     def _merge_rows(
         self,
@@ -219,17 +279,32 @@ class Deduplicator:
         user_id: str,
         existing_rows: list[dict[str, Any]],
         exclude_ids: Optional[set[int]] = None,
-    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        policy: Optional[ContradictionPolicy] = None,
+        current_ts: Any = None,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str]]:
         """Run the escalating gates against ``existing_rows``.
 
-        Returns ``(dup_row, merged_text)``: ``dup_row`` is the existing row this
-        ``text`` duplicates (or None), and ``merged_text`` is the consolidated
-        text when consolidation produced one (otherwise None). ``exclude_ids``
-        is forwarded to candidate retrieval so an item never matches itself.
+        Returns ``(row, merged_text, reason)``:
+
+        * ``row`` — the existing row this ``text`` should fold into (or None).
+        * ``merged_text`` — the text to write back onto ``row`` (or None to
+          leave ``row``'s text untouched). For a duplicate consolidation it is
+          the LLM-merged sentence; for a contradiction it is the newer text
+          (``text``) verbatim.
+        * ``reason`` — ``"dup"`` (duplicate, ``row`` survives, ``text``'s row
+          is dropped), ``"contradict"`` (same survivor/loser direction, but
+          ``row``'s text is overwritten with the newer ``text``), or None.
+
+        ``exclude_ids`` is forwarded to candidate retrieval so an item never
+        matches itself. ``policy`` enables the contradiction gate and is taken
+        from :meth:`StructuredMemory.contradiction_policy` by the caller.
+        ``current_ts`` is the ``created_at`` of the row ``text`` came from, so
+        the contradiction judge can weigh the timestamps.
         """
         cfg = self.config
         text_col = memory.text_column
         exclude = exclude_ids or set()
+        contradict_on = bool(policy and policy.enabled)
 
         # Gate 1: exact match (cheapest).
         if cfg.exact:
@@ -238,12 +313,20 @@ class Deduplicator:
                 if int(r["id"]) in exclude:
                     continue
                 if _normalize(str(r.get(text_col, ""))) == norm:
-                    return r, None
+                    return r, None, "dup"
 
-        # Gate 2: similarity — narrow via RAG, then direct cosine re-rank.
-        if cfg.similarity_threshold is not None and existing_rows:
+        # Similarity retrieval shared by dedup + contradiction. Contradictions
+        # sit at lower cosine, so widen the pool when that gate is on.
+        sim_on = cfg.similarity_threshold is not None
+        contra_on = contradict_on and policy.similarity_threshold is not None  # type: ignore[union-attr]
+        if (sim_on or contra_on) and existing_rows:
+            pool = (
+                max(self.config.candidate_pool, policy.candidate_pool)  # type: ignore[union-attr]
+                if contra_on
+                else None
+            )
             candidates = self._retrieve_candidates(
-                memory, text, user_id, existing_rows, exclude_ids=exclude_ids
+                memory, text, user_id, existing_rows, exclude_ids=exclude_ids, pool=pool
             )
             if candidates:
                 cand_texts = [str(r.get(text_col, "")) for r in candidates]
@@ -252,22 +335,57 @@ class Deduplicator:
                 sims = vecs[1:] @ cand_vec
                 best_j = int(np.argmax(sims))
                 best_sim = float(sims[best_j])
-                if best_sim >= cfg.similarity_threshold:
-                    dup_row = candidates[best_j]
-                    dup_text = cand_texts[best_j]
-                    # Gate 3: LLM judge (optional confirmation).
+                dup_row = candidates[best_j]
+                dup_text = cand_texts[best_j]
+                dup_ts = dup_row.get("created_at")
+
+                # --- Dedup gate (high bar) ---
+                is_dup = False
+                if sim_on and best_sim >= cfg.similarity_threshold:  # type: ignore[operator]
+                    # Gate 3: LLM judge (optional confirmation). When off, the
+                    # candidate is a tentative duplicate — disambiguated below.
                     if cfg.llm_judge and self._llm_available("llm_judge"):
-                        if not self._judge(text, dup_text):
-                            return None, None
+                        is_dup = self._judge(text, dup_text)
+                    else:
+                        is_dup = True
+
+                # A tentative duplicate may actually be a contradiction
+                # ("doctor" vs "engineer" are close but clash). When the policy
+                # is on, ask the contradiction gate before calling it a dup.
+                if is_dup and contra_on and self._llm_available("contradict"):
+                    if self._contradicts(
+                        dup_text, text, dup_ts, current_ts,
+                        policy.show_timestamps,  # type: ignore[union-attr]
+                    ):
+                        return dup_row, text, "contradict"
+
+                if is_dup:
                     # Confirmed duplicate — consolidate or just flag it.
                     if cfg.consolidate and self._llm_available("consolidate"):
                         merged_text = self._consolidate(dup_text, text)
                         if merged_text:
-                            return dup_row, merged_text
-                    return dup_row, None
-        return None, None
+                            return dup_row, merged_text, "dup"
+                    return dup_row, None, "dup"
 
-    # ----------------------------------------------------------- public API
+                # --- Contradiction gate (lower bar, same best candidate) ---
+                # Reached when dedup found nothing: below the dedup threshold,
+                # or the LLM judge explicitly said "not same". Here a close but
+                # distinct pair may still be a contradiction.
+                if (
+                    contra_on
+                    and best_sim >= policy.similarity_threshold  # type: ignore[union-attr]
+                    and self._llm_available("contradict")
+                ):
+                    if self._contradicts(
+                        dup_text, text, dup_ts, current_ts,
+                        policy.show_timestamps,  # type: ignore[union-attr]
+                    ):
+                        # Newer text (``text``) wins; ``dup_row`` is rewritten,
+                        # the row ``text`` came from will be dropped by caller.
+                        return dup_row, text, "contradict"
+        return None, None, None
+
+    # Public API
 
     def dedup_items(
         self,
@@ -290,6 +408,7 @@ class Deduplicator:
             int(r["id"]): r for r in memory.all_rows()
         }
         text_col = memory.text_column
+        policy = memory.contradiction_policy()
 
         for item in items:
             row = item.metadata
@@ -306,20 +425,27 @@ class Deduplicator:
             # Compare against all surviving rows; exclude_ids keeps the RAG
             # search from matching this item against itself in the index.
             all_rows = list(rows_by_id.values())
-            dup_row, merged_text = self._find_duplicate(
-                memory, text, user_id, all_rows, exclude_ids={row_id}
+            dup_row, merged_text, reason = self._find_duplicate(
+                memory, text, user_id, all_rows,
+                exclude_ids={row_id},
+                policy=policy,
+                current_ts=current.get("created_at"),
             )
             if dup_row is None:
                 continue
             dup_id = int(dup_row["id"])
             if merged_text is not None:
-                # Consolidate: merge row -> dup_row, delete row.
+                # Rewrite dup_row with merged_text (consolidation) or the newer
+                # text (contradiction); in both cases drop the item's row.
                 merged = self._merge_rows(dup_row, current, text_col, merged_text)
                 memory.update_row(merged)
                 memory.delete_row(row_id)
                 rows_by_id[dup_id] = merged
                 del rows_by_id[row_id]
-                report.merged += 1
+                if reason == "contradict":
+                    report.resolved += 1
+                else:
+                    report.merged += 1
                 report.updated_ids.append(dup_id)
                 report.removed_ids.append(row_id)
             else:
@@ -372,6 +498,8 @@ class Deduplicator:
     ) -> None:
         cfg = self.config
         text_col = memory.text_column
+        policy = memory.contradiction_policy()
+        contra_on = bool(policy.enabled and policy.similarity_threshold is not None)
         rows = memory.all_rows(user_id)
         if len(rows) < 2:
             return
@@ -389,6 +517,7 @@ class Deduplicator:
             text = texts[i]
             vec = vecs[i]
             dup_row: Optional[dict[str, Any]] = None
+            contra_row: Optional[dict[str, Any]] = None
 
             # Gate 1: exact against current survivors.
             if cfg.exact:
@@ -398,45 +527,92 @@ class Deduplicator:
                         dup_row = s_row
                         break
 
-            # Gate 2: similarity against current survivors.
-            if dup_row is None and cfg.similarity_threshold is not None:
+            # Cosine against current survivors — shared by dedup + contradiction.
+            best_j: Optional[int] = None
+            best_sim: float = 0.0
+            if dup_row is None and (cfg.similarity_threshold is not None or contra_on):
                 surv_mat = np.array([v for _, v in survivors])
                 sims = surv_mat @ vec
                 best_j = int(np.argmax(sims))
                 best_sim = float(sims[best_j])
-                if best_sim >= cfg.similarity_threshold:
-                    s_row = survivors[best_j][0]
-                    # Gate 3: LLM judge.
-                    if cfg.llm_judge and self._llm_available("llm_judge"):
-                        if not self._judge(text, str(s_row.get(text_col, ""))):
-                            survivors.append((row, vec))
-                            continue
-                    dup_row = s_row
+                s_row = survivors[best_j][0]
+                s_text = str(s_row.get(text_col, ""))
 
-            if dup_row is None:
-                survivors.append((row, vec))
+                # Gate 2: dedup similarity + Gate 3 (LLM judge). When the judge
+                # is off, the candidate is a tentative duplicate and is
+                # disambiguated against the contradiction gate below.
+                is_dup = False
+                if cfg.similarity_threshold is not None and best_sim >= cfg.similarity_threshold:
+                    if cfg.llm_judge and self._llm_available("llm_judge"):
+                        is_dup = self._judge(text, s_text)
+                    else:
+                        is_dup = True
+
+                # A tentative duplicate may actually be a contradiction.
+                if is_dup and contra_on and self._llm_available("contradict"):
+                    if self._contradicts(
+                        s_text, text,
+                        s_row.get("created_at"), row.get("created_at"),
+                        policy.show_timestamps,
+                    ):
+                        contra_row = s_row
+                        is_dup = False
+
+                if is_dup:
+                    dup_row = s_row
+                elif contra_row is None and contra_on and best_sim >= policy.similarity_threshold \
+                        and self._llm_available("contradict"):
+                    # Below dedup bar (or judge said not-same): maybe a
+                    # contradiction at the lower bar.
+                    if self._contradicts(
+                        s_text, text,
+                        s_row.get("created_at"), row.get("created_at"),
+                        policy.show_timestamps,
+                    ):
+                        contra_row = s_row
+
+            if dup_row is not None:
+                # Confirmed duplicate of dup_row (a survivor).
+                loser_id = int(row["id"])
+                dup_id = int(dup_row["id"])
+                if cfg.consolidate and self._llm_available("consolidate"):
+                    merged_text = self._consolidate(str(dup_row.get(text_col, "")), text)
+                    if merged_text:
+                        merged_row = self._merge_rows(dup_row, row, text_col, merged_text)
+                        memory.update_row(merged_row)
+                        memory.delete_row(loser_id)
+                        # Re-embed the survivor so later rows compare to the merged text.
+                        new_vec = self._embed_normalized([merged_text])[0]
+                        survivors = [
+                            (merged_row, new_vec) if s is dup_row else s
+                            for s in survivors
+                        ]
+                        report.merged += 1
+                        report.updated_ids.append(dup_id)
+                        report.removed_ids.append(loser_id)
+                        continue
+                # No consolidation (or it failed) — drop the loser.
+                memory.delete_row(loser_id)
+                report.skipped += 1
+                report.removed_ids.append(loser_id)
                 continue
 
-            # Confirmed duplicate of dup_row (a survivor).
-            loser_id = int(row["id"])
-            dup_id = int(dup_row["id"])
-            if cfg.consolidate and self._llm_available("consolidate"):
-                merged_text = self._consolidate(str(dup_row.get(text_col, "")), text)
-                if merged_text:
-                    merged_row = self._merge_rows(dup_row, row, text_col, merged_text)
-                    memory.update_row(merged_row)
-                    memory.delete_row(loser_id)
-                    # Re-embed the survivor so later rows compare to the merged text.
-                    new_vec = self._embed_normalized([merged_text])[0]
-                    survivors = [
-                        (merged_row, new_vec) if s is dup_row else s
-                        for s in survivors
-                    ]
-                    report.merged += 1
-                    report.updated_ids.append(dup_id)
-                    report.removed_ids.append(loser_id)
-                    continue
-            # No consolidation (or it failed) — drop the loser.
-            memory.delete_row(loser_id)
-            report.skipped += 1
-            report.removed_ids.append(loser_id)
+            if contra_row is not None:
+                # Contradiction: overwrite the older survivor's text with the
+                # newer row's text, then drop the newer row.
+                loser_id = int(row["id"])
+                contra_id = int(contra_row["id"])
+                merged_row = self._merge_rows(contra_row, row, text_col, text)
+                memory.update_row(merged_row)
+                memory.delete_row(loser_id)
+                new_vec = self._embed_normalized([text])[0]
+                survivors = [
+                    (merged_row, new_vec) if s is contra_row else s
+                    for s in survivors
+                ]
+                report.resolved += 1
+                report.updated_ids.append(contra_id)
+                report.removed_ids.append(loser_id)
+                continue
+
+            survivors.append((row, vec))

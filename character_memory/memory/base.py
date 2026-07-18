@@ -7,8 +7,11 @@ them.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from ..chunking import Chunk
+
+if TYPE_CHECKING:  # avoid a circular import at runtime (extract.py imports base)
+    from .extract import ExtractionContext
 
 @dataclass
 class MemoryItem:
@@ -112,12 +115,19 @@ class Memory(ABC):
         return []
 
     # Extraction
-    def extraction_spec(self) -> Optional[ExtractionSpec]:
+    def extraction_spec(
+        self, context: Optional["ExtractionContext"] = None
+    ) -> Optional[ExtractionSpec]:
         """What this memory wants extracted from the conversation, or `None`.
 
         Returning `None` (the default) opts the memory out of extraction
         entirely. The agent only consults *enabled* memories, so a disabled
-        memory is never asked to extract
+        memory is never asked to extract.
+
+        ``context`` (when provided) carries the character/user names and known
+        facts so a memory can phrase its instruction bullet in the character's
+        point of view and reinforce the full-sentence rule. It is optional and
+        ignored by memories that don't need it.
         """
         return None
 

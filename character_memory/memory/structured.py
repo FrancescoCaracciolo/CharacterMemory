@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable, Optional
 
 from ..chunking.base import Chunk
+from ..config import ContradictionPolicy
 from ..rag.hybrid import HybridSearch
 from .base import Memory, MemoryItem
 from .decay import age_seconds, decay_score
@@ -201,3 +202,13 @@ class StructuredMemory(Memory):
     def delete_row(self, row_id: int) -> None:
         """Delete a row by id. Does not touch the index."""
         self.store.delete(self.table, {"id": row_id})
+
+    # Contradiction resolution policy — see character_memory.memory.dedup.
+    def contradiction_policy(self) -> ContradictionPolicy:
+        """How this memory wants contradicting facts resolved by the deduplicator.
+
+        Default is disabled. Stable-fact memories override this to enable it
+        and tune the similarity bar / candidate pool. The deduplicator calls
+        this itself; callers normally don't.
+        """
+        return ContradictionPolicy()
