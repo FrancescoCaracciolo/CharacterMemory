@@ -307,18 +307,32 @@ class EmotionAdapter(MemoryAdapter):
 
     def _record(self, row: dict) -> MemoryRecord:
         try:
-            state = json.loads(row.get("state") or "{}")
+            blob = json.loads(row.get("state") or "{}")
         except (TypeError, ValueError):
-            state = {}
-        state = {k: float(v) for k, v in state.items()}
+            blob = {}
+        # The blob holds numeric dims plus a string `comment` (relationship
+        # descriptor). Split them so the dims render as bars and the comment
+        # surfaces as text.
+        comment = ""
+        state: dict[str, float] = {}
+        for k, v in blob.items():
+            if k == "comment":
+                comment = str(v or "")
+            else:
+                try:
+                    state[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
         text = ", ".join(f"{k}={v:.2f}" for k, v in state.items())
+        if comment:
+            text = (text + " | " if text else "") + f"relationship: {comment}"
         return MemoryRecord(
             id=row.get("user_id"),
             user_id=row.get("user_id"),
             text=text,
             score=None,
-            fields={"state": state},
-            meta={},
+            fields={"state": state, "comment": comment},
+            meta={"comment": comment} if comment else {},
         )
 
     def page(

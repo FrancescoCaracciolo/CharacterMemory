@@ -228,11 +228,13 @@ function renderDialogue(rec) {
 function renderEmotion(rec) {
   const state = (rec.fields && rec.fields.state) || {};
   const dims = Object.entries(state);
+  const comment = (rec.fields && rec.fields.comment) || (rec.meta && rec.meta.comment) || "";
   const body = el("div", {}, dims.length
     ? dims.map(([k, v]) => signedBar(k, v))
     : [el("div", { class: "text" }, "no dimensions")]);
   const card = wrapCard([body], rec);
   addTag(card, chip("user", "kind-chip"));
+  if (comment) addTag(card, chip(comment, ""));
   return card;
 }
 
