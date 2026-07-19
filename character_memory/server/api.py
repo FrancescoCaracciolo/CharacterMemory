@@ -55,7 +55,13 @@ from character_memory import (
 # Read-side memory browser: normalises each memory backend into paged,
 # searchable records and powers the GUI served at /gui.
 from .adapters import overview as memory_overview
+from .adapters import read_graph as read_graph_view
 from .adapters import read_memory as read_memory_page
+
+# MCP (Model Context Protocol) endpoint: JSON-RPC 2.0 over the Streamable
+# HTTP transport, JSON-only. Mounted at /mcp with ``?character=<name>``
+# binding every call to one CharacterAgent from the AGENTS dict below.
+from .mcp import build_router as build_mcp_router
 
 # Default to the current working directory: once installed the package has no
 # notion of a "repo root", so the server operates relative to the cwd it is
@@ -70,21 +76,36 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 # Character registry: build one CharacterAgent per subfolder of `assets/`.
 # --------------------------------------------------------------------------- #
 def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
-    """Build a `CharacterAgent` for each character directory under `assets_dir`."""
+    """Build a `CharacterAgent` for each character directory under `assets_dir`.
+
+    A character opts into the knowledge-graph retriever either by shipping a
+    `.knowledge_graph` marker file in its directory or by being explicitly
+    listed in `CM_KG_CHARACTERS` (a comma-separated env var). Kurisu ships
+    with the marker so the KG is on by default for her.
+    """
     agents: dict[str, CharacterAgent] = {}
+    if not os.path.isdir(assets_dir):
+        return agents
+    kg_chars = {
+        c.strip() for c in os.environ.get("CM_KG_CHARACTERS", "").split(",") if c.strip()
+    }
     if not os.path.isdir(assets_dir):
         return agents
     for name in sorted(os.listdir(assets_dir)):
         char_dir = os.path.join(assets_dir, name)
         if not os.path.isdir(char_dir):
             continue
+        memory_config = MemoryConfig()
+        marker = os.path.join(char_dir, ".knowledge_graph")
+        if name in kg_chars or os.path.isfile(marker):
+            memory_config.enabled_knowledge_graph = True
         agent = CharacterAgent(
             directory=char_dir,
             name=name,
             save_directory=os.path.join(SAVE_ROOT, name),
             prompt_config=PromptConfig(),
         )
-        agent.load_from_config(LLMConfig(), EmbeddingConfig(), MemoryConfig())
+        agent.load_from_config(LLMConfig(), EmbeddingConfig(), memory_config)
         agent.build()  # load-or-build (idempotent)
         agents[name] = agent
     return agents
@@ -137,6 +158,13 @@ class SaveResponse(BaseModel):
 # App + handlers.
 # --------------------------------------------------------------------------- #
 app = FastAPI(title="CharacterMemory server")
+
+# Mount the MCP (Model Context Protocol) JSON-RPC 2.0 endpoint. Reads reuse
+# ``adapters.read_memory`` (semantic search + lexical fallback + pagination)
+# so quality matches the GUI; writes commit to SQLite, rebuild the affected
+# memory's hybrid index, and ``persist_structured()`` so the change survives
+# a server restart. ``build_mcp_router`` is implemented in :file:`.mcp`.
+app.include_router(build_mcp_router(AGENTS))
 
 
 @app.on_event("shutdown")
@@ -263,6 +291,43 @@ def read_memories(
                 f"Available: {sorted(agent.memories)}."
             ),
         )
+
+
+@app.get("/api/graph/{character}")
+def read_graph(
+    character: str,
+    q: Optional[str] = Query(None, description="Query (drives activation; empty = whole graph)."),
+    user: Optional[str] = Query(None, description="Bias the user's own PersonNode."),
+    limit: int = Query(50, ge=1, le=6000, description="Max nodes to return by activation."),
+    hops: int = Query(1, ge=0, le=2, description="Subgraph expansion hops around top nodes."),
+    include_co_occurrence: bool = Query(False, description="Include co_occurrence edges (default on in full mode)."),
+    full: bool = Query(False, description="Return the whole graph (retrieved nodes flagged)."),
+    retrieve_k: int = Query(30, ge=1, le=500, description="Top-k nodes flagged 'retrieved' when full."),
+) -> dict:
+    """Return the activation-weighted knowledge-graph for the viz.
+
+    `full=False` (default) returns the activation-weighted subgraph; `full=True`
+    returns the entire graph with a `retrieved` flag per node so the GUI can
+    light up the retrieved nodes and gray out the rest. Node radius / opacity /
+    color encode `activation`; edges carry their `weight`. Requires the
+    `knowledge_graph` memory to be enabled for this character.
+    """
+    agent = _get_agent(character)
+    if "knowledge_graph" not in agent.memories:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Character {character!r} does not have the knowledge_graph "
+                f"memory enabled."
+            ),
+        )
+    try:
+        return read_graph_view(
+            agent, q=q, user=user, limit=limit, hops_subgraph=hops,
+            include_co_occurrence=include_co_occurrence, full=full, retrieve_k=retrieve_k,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="knowledge_graph memory not built.")
 
 
 def main() -> None:  # pragma: no cover - manual run helper / console script

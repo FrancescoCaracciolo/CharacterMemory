@@ -368,3 +368,178 @@ character's resting-state vector.
 > Search over the structured/RAG memories ranks up to 200 hits and paginates
 > within that window; the embedding server must be reachable for semantic
 > search (lexical fallback otherwise).
+
+---
+
+## MCP endpoint
+
+The same FastAPI app exposes an [MCP (Model Context Protocol)](https://modelcontextprotocol.io)
+endpoint at `POST /mcp?character=<name>` that lets MCP clients
+(Claude Desktop, MCP Inspector, the Python `mcp` client, …) **read and
+edit** a character's memories. It speaks JSON-RPC 2.0 — the JSON-mode
+subset of MCP's Streamable HTTP transport. No new dependency: the
+protocol surface we need (`initialize`, `tools/list`, `tools/call`,
+`ping`, `notifications/initialized`) is implemented directly on top of
+FastAPI in [`mcp.py`](./mcp.py).
+
+### `POST /mcp?character=<name>`
+
+The query parameter `character` (required) names the `CharacterAgent`
+every tool call operates against — it must match a folder scanned by
+`CM_ASSETS_DIR` at startup (`GET /` lists them).
+
+The body is a JSON-RPC 2.0 envelope (single object, or an array for
+batches). Every successful / failed tool call returns a regular JSON
+envelope; the route never returns FastAPI's `{"detail": …}` shape
+even on URL-level errors so MCP clients can parse it.
+
+**Envelopes** (single):
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+    "name": "search_memory",
+    "arguments": { "memory": "user_facts", "query": "coffee", "limit": 5 }
+}}
+```
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "result": {
+    "content": [{ "type": "text", "text": "{\"memory\":\"user_facts\",...}" }],
+    "isError": false
+}}
+```
+
+Errors come back either as a **JSON-RPC error envelope** (protocol
+problems: `code` is one of `-32700 / -32600 / -32601 / -32602 / -32603`)
+or as a **tools/call result with `isError: true`** (tool-level failure:
+missing row, wrong memory type, bad timestamp, …).
+
+### Tools
+
+`tools/list` returns the schemas; each tool is precisely typed with a
+JSON-schema so LLM introspection surfaces real choices (the `memory`
+field is an enum of the loaded agent's memories). New tools are added in
+`mcp.py` by one `_register(…)` call — methods + schemas + handlers
+register themselves at module import.
+
+| Tool                    | Writes to         | Notes                                                                       |
+|-------------------------|-------------------|------------------------------------------------------------------------------|
+| `list_memories`         | _character_       | Sidebar overview: every memory with title, kind, count, known users.        |
+| `search_memory`         | _read-only_       | Optional `query`, `user_id`, ISO-8601 `date_from` / `date_to`, `limit`.     |
+| `add_fact`              | `user_facts`      | `user_id`, `content`, `type`, `importance`, `confidence`.                  |
+| `update_fact`           | `user_facts`      | `id`, plus any subset of fields to overwrite.                                |
+| `delete_fact`           | `user_facts`      | `id`.                                                                       |
+| `add_directive`         | `user_directives` | `user_id`, `content`, `importance`, `keywords`.                            |
+| `update_directive`      | `user_directives` | `id`, plus any subset.                                                       |
+| `delete_directive`      | `user_directives` | `id`.                                                                       |
+| `add_episode`           | `episodic`        | `user_id`, `summary`, `importance`, `emotional_shift` ∈ [-1, 1].            |
+| `update_episode`        | `episodic`        | `id`, plus any subset.                                                       |
+| `delete_episode`        | `episodic`        | `id`.                                                                       |
+| `add_heartbeat`         | `heartbeat`       | `summary`, `kind` (`discovery` \| `action`), `importance`.                  |
+| `update_heartbeat`      | `heartbeat`       | `id`, plus any subset.                                                       |
+| `delete_heartbeat`      | `heartbeat`       | `id`.                                                                       |
+| `set_user_summary`      | `user_summary`    | `user_id`, `summary`, optional `name`, `aliases`, `importance`.              |
+| `set_user_emotion`      | `emotion`         | `user_id`, optional `deltas` object + optional `comment` string.             |
+| `get_user_emotion`      | `emotion`         | `user_id`. Returns baseline + per-user dims + relationship comment.         |
+| `add_character_info`    | `character_info`  | `text`, optional `source`. Session-scoped — see caveat below.               |
+| `add_dialogue`          | `dialogue_style`  | Same caveat as `add_character_info`.                                         |
+
+`search_memory` is the only tool with a `date_from` / `date_to` filter.
+It is honoured on memories whose rows carry `created_at`
+(`user_facts`, `user_directives`, `episodic`, `heartbeat`,
+`user_summary`) and silently ignored on the others
+(`character_info`, `dialogue_style`, `emotion`). Bad ISO 8601 input
+returns `isError: true`; an inverted range
+(`date_from > date_to`) returns `isError: true` rather than an empty
+result.
+
+### Write pluming
+
+Every write tool commits through the memory's own primitive
+(`Add.Fact`, `episode`, `Directive`, heartbeat `entry`,
+`summary.add_or_update`, …) then calls `StructuredMemory.rebuild_index`
+so the hybrid retriever ranks against the new text, and
+`agent.persist_structured()` so the change survives a server restart.
+Skipped when the embedder is down (a warning is emitted) or when the
+memory rebuilds itself (`user_summary.add_or_update`).
+
+The `add_character_info` / `add_dialogue` tools append to the in-RAM
+hybrid index directly. **Caveat**: these RAG memories are normally
+rebuilt from `<character>/Information/*.md` and
+`<character>/Dialogues/*.md` on agent startup, so anything appended via
+MCP is session-scoped — persistent edits belong in those files on
+disk.
+
+### Errors
+
+| Status | When                                                                   |
+|--------|-------------------------------------------------------------------------|
+| `400`  | Missing `?character=` query parameter.                                  |
+| `404`  | Unknown character (one not in the loaded `AGENTS` dict).               |
+| `405`  | `GET /mcp` — JSON-mode only; the SSE channel is not implemented.       |
+| `400`  | Body is not valid JSON.                                                |
+| `422`  | Body parses but the JSON-RPC envelope is malformed.                    |
+
+JSON-RPC-level errors (`method not found`, `invalid params`, …) are
+returned in the response body as `{"jsonrpc":"2.0","id":...,"error":...}`
+with the standard codes (`-32601`, `-32602`, …). Tool-level failures
+(missing row, cross-table guard, bad date) are returned as `tools/call`
+results with `isError: true` — see [`mcp.py`](./mcp.py) for the exact
+envelope.
+
+### Example: `search_memory` with date filter
+
+```bash
+curl -X POST 'http://localhost:8000/mcp?character=Kurisu' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "search_memory",
+          "arguments": {
+            "memory": "user_facts",
+            "date_from": "2024-01-01T00:00:00Z",
+            "date_to":   "2024-12-31T23:59:59Z",
+            "limit": 10
+          }
+        }
+      }'
+```
+
+### Example: round-trip add/update/delete
+
+```python
+import requests, json
+
+base = "http://localhost:8000"
+char = "Kurisu"
+def call(method, params):
+    return requests.post(
+        f"{base}/mcp?character={char}",
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        timeout=10,
+    ).json()
+
+# Add one fact.
+add = call("tools/call", {"name": "add_fact", "arguments": {
+    "memory": "user_facts",
+    "user_id": "michael",
+    "content": "Michael is the new lab assistant",
+    "type": "occupation",
+    "importance": 0.7,
+    "confidence": 0.9,
+}})
+print(add["result"]["content"][0]["text"])
+fid = json.loads(add["result"]["content"][0]["text"])["id"]
+
+# Bump its importance.
+call("tools/call", {"name": "update_fact", "arguments": {
+    "memory": "user_facts", "id": fid, "importance": 0.95,
+}})
+
+# And finally remove it.
+call("tools/call", {"name": "delete_fact", "arguments": {
+    "memory": "user_facts", "id": fid,
+}})
+```

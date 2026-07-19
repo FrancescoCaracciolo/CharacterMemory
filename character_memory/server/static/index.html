@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Character Memory Browser</title>
   <link rel="stylesheet" href="/gui/static/styles.css">
+  <!-- The knowledge-graph view is a self-contained canvas force-renderer (no CDN). -->
 </head>
 <body>
   <div class="app">
@@ -47,6 +48,41 @@
         </div>
 
         <div id="extra" class="extra"></div>
+        <div id="graph-view" class="graph-view hidden">
+          <div class="graph-controls">
+            <div class="search">
+              <span class="search-ico">⌕</span>
+              <input id="graph-q" placeholder="Activate the graph by query…" autocomplete="off" spellcheck="false">
+              <button id="graph-q-clear" class="q-clear hidden" title="Clear" aria-label="Clear activation query">×</button>
+            </div>
+            <select id="graph-user" class="user-filter" title="Bias a user's PersonNode"></select>
+            <button id="graph-full" class="btn ghost" title="Show the whole graph and highlight retrieved nodes">◯ full graph</button>
+            <span id="graph-meta" class="graph-meta"></span>
+            <div class="graph-ctl-spacer"></div>
+            <button id="graph-freeze" class="btn ghost" title="Pause / resume physics (space)">❚❚ freeze</button>
+            <button id="graph-fit" class="btn ghost" title="Fit graph to view">⤢ fit</button>
+            <button id="graph-repel" class="btn ghost" title="Re-run layout">↻ relayout</button>
+          </div>
+          <div class="graph-split">
+            <div class="graph-canvas-wrap">
+              <canvas id="cy" class="graph-cy"></canvas>
+              <div id="graph-overlay" class="graph-overlay"></div>
+            </div>
+            <aside id="graph-side" class="graph-side">
+              <div class="graph-side-head">Top activated</div>
+              <div id="graph-detail" class="graph-detail hidden"></div>
+              <ol id="graph-list" class="graph-list"></ol>
+            </aside>
+          </div>
+          <div class="graph-legend">
+            <span><span class="dot dot-self"></span> self</span>
+            <span><span class="dot dot-person"></span> person</span>
+            <span><span class="dot dot-fact"></span> fact</span>
+            <span><span class="dot dot-episode"></span> episode</span>
+            <span><span class="dot dot-entity"></span> entity</span>
+            <span class="graph-tip">node size &amp; opacity ∝ activation</span>
+          </div>
+        </div>
         <div id="records" class="records"></div>
         <div id="paginator" class="paginator"></div>
         <div id="status" class="status hidden"></div>

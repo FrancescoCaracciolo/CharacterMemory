@@ -19,5 +19,6 @@ Importing this subpackage (or ``character_memory.server:app``) requires the
 """
 
 from .api import app, main
+from .mcp import build_router as build_mcp_router
 
-__all__ = ["app", "main"]
+__all__ = ["app", "main", "build_mcp_router"]

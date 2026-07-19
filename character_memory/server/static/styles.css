@@ -221,3 +221,104 @@ select option { background: var(--bg-2); }
   .sidebar { display: none; }
   .search input { width: 200px; }
 }
+
+/* ---- knowledge-graph visualization (Obsidian-style canvas) ---- */
+.graph-view {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 20px 0;
+}
+.graph-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.graph-controls .search input { width: 280px; }
+.graph-meta { color: var(--text-faint); font: 500 11px var(--mono); }
+.graph-ctl-spacer { flex: 1; }
+.graph-freeze-on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+.graph-split {
+  display: grid; grid-template-columns: 1fr 260px; gap: 0;
+  background: #0a0c12; border: 1px solid var(--border); border-radius: var(--radius);
+  min-height: 460px; overflow: hidden; position: relative;
+}
+.graph-canvas-wrap { position: relative; min-width: 0; overflow: hidden; }
+.graph-cy {
+  display: block; width: 100%; height: 100%; min-height: 460px;
+  background:
+    radial-gradient(1100px 700px at 28% 18%, #161b2b 0%, #0a0c12 60%),
+    radial-gradient(900px 600px at 80% 90%, #121322 0%, #0a0c12 55%);
+  cursor: grab; touch-action: none;
+}
+.graph-cy.grabbing { cursor: grabbing; }
+.graph-cy.node-hover { cursor: pointer; }
+.graph-overlay { position: absolute; inset: 0; pointer-events: none; }
+
+/* DOM tooltip following the cursor on node hover. */
+.graph-tip-box {
+  position: absolute; z-index: 50; pointer-events: none;
+  background: rgba(20,24,38,.96); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); padding: 6px 9px; max-width: 280px;
+  font: 500 11.5px/1.4 -apple-system, "Segoe UI", sans-serif; color: var(--text);
+  box-shadow: var(--shadow); white-space: pre-wrap; word-break: break-word;
+  backdrop-filter: blur(4px); opacity: 0; transition: opacity .12s;
+}
+.graph-tip-box.show { opacity: 1; }
+.graph-tip-box .tt-kind { font: 700 9.5px var(--mono); color: var(--accent); text-transform: uppercase; letter-spacing: .3px; }
+.graph-tip-box .tt-act { font: 600 10px var(--mono); color: var(--text-faint); margin-top: 2px; }
+
+.graph-side {
+  border-left: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+}
+.graph-side-head {
+  padding: 10px 12px; border-bottom: 1px solid var(--border);
+  font: 600 11px var(--mono); letter-spacing: .4px; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.graph-detail {
+  padding: 10px 12px 12px; border-bottom: 1px solid var(--border);
+  overflow-y: auto; max-height: 52%;
+  background: var(--panel);
+}
+.graph-detail .gd-head { margin-bottom: 6px; }
+.graph-detail .gd-title {
+  font: 600 13.5px/1.35 -apple-system, "Segoe UI", sans-serif; color: var(--text);
+  word-break: break-word;
+}
+.graph-detail .gd-text {
+  margin-top: 6px; color: var(--text-dim); font-size: 12.5px; line-height: 1.5;
+  word-break: break-word; white-space: pre-wrap;
+}
+.graph-detail .gd-comment {
+  margin-top: 8px; color: var(--info); font-size: 12.5px; font-style: italic;
+  word-break: break-word;
+}
+.graph-detail .gd-meta { margin-top: 8px; color: var(--text-faint); font: 500 11px var(--mono); display: flex; gap: 10px; flex-wrap: wrap; }
+.graph-detail .field { margin-top: 8px; }
+.graph-detail .kw-chips { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+.graph-list { margin: 0; padding: 6px 8px; overflow-y: auto; flex: 1; list-style: none; counter-reset: g; }
+.graph-list li {
+  counter-increment: g; padding: 6px 8px 6px 26px; border-radius: var(--radius-sm);
+  position: relative; cursor: pointer; transition: background .12s;
+  font-size: 12.5px; line-height: 1.35;
+}
+.graph-list li::before {
+  content: counter(g); position: absolute; left: 6px; top: 6px;
+  font: 700 10px var(--mono); color: var(--text-faint);
+  background: var(--bg-3); border-radius: 5px; padding: 0 5px;
+}
+.graph-list li:hover { background: var(--bg-2); }
+.graph-list .gl-kind { font: 600 9.5px var(--mono); color: var(--accent); text-transform: uppercase; letter-spacing: .3px; }
+.graph-list .gl-text { color: var(--text); word-break: break-word; }
+.graph-list .gl-act { font: 600 10px var(--mono); color: var(--text-faint); }
+
+.graph-legend {
+  display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+  font: 500 10.5px var(--mono); color: var(--text-dim);
+  padding: 2px 4px 6px;
+}
+.graph-legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+.dot-self { background: #e8c35a; }
+.dot-person { background: var(--accent); }
+.dot-fact { background: var(--good); }
+.dot-episode { background: var(--info); }
+.dot-entity { background: var(--accent-2); }
+.graph-tip { color: var(--text-faint); margin-left: auto; }
+

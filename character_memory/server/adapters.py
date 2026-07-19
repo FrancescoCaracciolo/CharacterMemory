@@ -28,6 +28,7 @@ from typing import Any, Optional
 
 from character_memory import EmotionStatus, Memory, StructuredMemory
 from character_memory.memory.character_base import RAGMemory
+from character_memory.memory.knowledge_graph_memory import KnowledgeGraphMemory
 
 # Hard cap on how many hits search ever ranks, so a query against a huge memory
 # stays snappy. Pagination slices within this ranked window.
@@ -357,6 +358,92 @@ class EmotionAdapter(MemoryAdapter):
         return [self._record(r) for r in rows[start : start + size]], total
 
 
+class KnowledgeGraphAdapter(MemoryAdapter):
+    """Knowledge-graph memory: paged/searched nodes (graph view via /api/graph)."""
+
+    kind = "graph"
+
+    @property
+    def m(self) -> KnowledgeGraphMemory:
+        return self.memory  # type: ignore[return-type]
+
+    def _nodes(self):
+        try:
+            return list(self.m.retriever.graph.nodes.values())
+        except Exception:
+            return []
+
+    def count(self, user_id: Optional[str] = None) -> int:
+        return len(self._nodes())
+
+    def users(self) -> list[str]:
+        try:
+            return list(self.m.retriever._known_users)
+        except Exception:
+            return []
+
+    def _record(self, node, score: Optional[float] = None) -> MemoryRecord:
+        meta = {
+            "node_id": getattr(node, "id", ""),
+            "node_kind": getattr(node, "kind", ""),
+            "created_at": getattr(node, "created_at", None),
+            "last_recalled": getattr(node, "last_recalled", None),
+            "recall_count": getattr(node, "recall_count", 0),
+            "source": getattr(node, "source", ""),
+            "activation": getattr(node, "activation", 0.0),
+        }
+        fields: dict[str, Any] = {}
+        for k in ("name", "aliases", "user_id", "content", "type", "confidence",
+                  "importance", "summary", "emotional_shift", "timestamp",
+                  "participants", "kind_label", "baseline"):
+            v = getattr(node, k, None)
+            if v is not None:
+                fields[k] = v
+        return MemoryRecord(
+            id=getattr(node, "id", None),
+            user_id=getattr(node, "user_id", None),
+            text=getattr(node, "text", "") or getattr(node, "id", ""),
+            score=score if score is not None else float(getattr(node, "activation", 0.0)),
+            fields=fields,
+            meta=meta,
+        )
+
+    def page(
+        self, page: int, size: int, user_id: Optional[str] = None
+    ) -> tuple[list[MemoryRecord], int]:
+        nodes = self._nodes()
+        total = len(nodes)
+        start = (page - 1) * size
+        # Default browse order: by kind then activation-descending.
+        kind_order = {"self": 0, "person": 1, "fact": 2, "episode": 3, "entity": 4}
+        nodes = sorted(nodes, key=lambda n: (kind_order.get(n.kind, 9), -float(getattr(n, "activation", 0.0))))
+        return [self._record(n) for n in nodes[start : start + size]], total
+
+    def search(
+        self, q: str, page: int, size: int, user_id: Optional[str] = None
+    ) -> tuple[list[MemoryRecord], int]:
+        q = (q or "").strip()
+        if not q:
+            return self.page(page, size, user_id)
+        # Run a read-only activation search so the results mirror what the
+        # prompt would actually surface.
+        try:
+            items = self.m.retriever.retrieve(
+                q, user_id=user_id, limit=SEARCH_CAP, state_changing=False
+            )
+        except Exception:
+            items = []
+        ranked = sorted(items, key=lambda it: -float(it.score or 0.0))
+        total = len(ranked)
+        start = (page - 1) * size
+        recs: list[MemoryRecord] = []
+        for it in ranked[start : start + size]:
+            node = self.m.retriever.graph.nodes.get(it.metadata.get("node_id"))
+            if node is not None:
+                recs.append(self._record(node, score=float(it.score or 0.0)))
+        return recs, total
+
+
 class GenericAdapter(MemoryAdapter):
     """Fallback: anything exposing `get_memories()`."""
 
@@ -416,6 +503,8 @@ def get_adapter(memory: Memory) -> MemoryAdapter:
     cls = _BY_NAME.get(memory.name)
     if cls is not None:
         return cls(memory)
+    if isinstance(memory, KnowledgeGraphMemory):
+        return KnowledgeGraphAdapter(memory)
     if isinstance(memory, EmotionStatus):
         return EmotionAdapter(memory)
     if isinstance(memory, RAGMemory):
@@ -505,4 +594,154 @@ def read_memory(
         "users": _safe(adapter.users, default=[]) or [],
         "records": [asdict(r) for r in records],
         "extra": extra,
+    }
+
+
+def read_graph(
+    agent,
+    *,
+    q: Optional[str] = None,
+    user: Optional[str] = None,
+    limit: int = 50,
+    hops_subgraph: int = 1,
+    max_edges: int = 400,
+    include_co_occurrence: bool = False,
+    full: bool = False,
+    retrieve_k: int = 30,
+) -> dict[str, Any]:
+    """Return the activation-weighted knowledge-graph for the viz.
+
+    Two modes:
+
+    * ``full=False`` (default) — the activation-weighted **subgraph**: keeps the
+      top ``limit`` nodes by activation, growing a connected neighbourhood by
+      ``hops_subgraph`` hops within the node budget so a single high-degree node
+      can't pull in the whole graph. Edges are capped at ``max_edges`` and
+      ``co_occurrence`` edges are dropped by default (visually noisy); set
+      ``include_co_occurrence=True`` to include them.
+    * ``full=True`` — returns (almost) the **entire** graph. Every node carries a
+      ``retrieved`` flag marking whether it landed in the top ``retrieve_k`` by
+      activation for the query. The GUI uses this to light up the retrieved
+      nodes and gray out the rest while still drawing all the links.
+
+    Each node carries both the raw ``activation`` (signed, ACT-R + spreading)
+    and a ``activation_norm`` in ``[0, 1]`` mapped from the returned graph's
+    min/max so the GUI can size/opacity nodes without assuming a positive
+    range (ACT-R base-level activations are routinely negative for old or
+    low-recall nodes).
+    """
+    mem = agent.memories.get("knowledge_graph")
+    if not isinstance(mem, KnowledgeGraphMemory):
+        raise KeyError("knowledge_graph")
+    retriever = mem.retriever
+    full = bool(full)
+    if full:
+        node_budget = max(1, min(6000, int(limit or 6000)))
+        edge_budget = max(0, min(12000, int(max_edges or 10000)))
+        # In full mode the whole graph is the point, so surface co-occurrence
+        # links unless the caller explicitly opts out.
+        include_co = bool(include_co_occurrence) if include_co_occurrence else True
+    else:
+        node_budget = max(1, min(200, int(limit or 50)))
+        edge_budget = max(0, min(2000, int(max_edges or 0)))
+        include_co = bool(include_co_occurrence)
+
+    # Compute activations (read-only).
+    if q and q.strip():
+        trace = retriever.test_activation(q.strip(), user_id=user)
+    else:
+        trace = retriever.test_activation("", user_id=user)
+
+    if full:
+        # Keep the whole graph (capped); the top-`retrieve_k` by activation are
+        # flagged "retrieved" so the GUI can highlight them.
+        ranked = sorted(trace.items(), key=lambda kv: kv[1], reverse=True)
+        k = max(1, min(len(ranked), int(retrieve_k or 30)))
+        retrieved_ids = {nid for nid, _ in ranked[:k]}
+        keep_ids = [nid for nid in retriever.graph.nodes if nid in trace][:node_budget]
+        keep_set = set(keep_ids)
+    else:
+        # Sort all nodes by activation desc; take the top slice as the seed set.
+        ranked = sorted(trace.items(), key=lambda kv: kv[1], reverse=True)
+        seed_ids: list[str] = [nid for nid, _act in ranked[: max(1, node_budget // 3)]]
+        seed_set: set[str] = set(seed_ids)
+        # Grow a *connected* subgraph from the seeds: repeatedly add the
+        # neighbour (of anything already kept) that adds the most edges to the
+        # kept set, breaking ties by activation. This yields an edge-rich,
+        # connected viz rather than a bag of isolated high-activation nodes.
+        keep_ids = list(seed_ids)
+        keep_set = set(seed_set)
+        if hops_subgraph > 0:
+            def edge_yield(nid: str) -> int:
+                return sum(
+                    1 for _e, nb in retriever.graph.neighbors(nid) if nb.id in keep_set
+                )
+
+            while len(keep_set) < node_budget:
+                cand: dict[str, float] = {}
+                for nid in list(keep_set):
+                    for _edge, neighbour in retriever.graph.neighbors(nid):
+                        if neighbour.id not in keep_set:
+                            cand[neighbour.id] = trace.get(neighbour.id, 0.0)
+                if not cand:
+                    break
+                best_nid = max(cand, key=lambda nid: (edge_yield(nid), cand[nid]))
+                keep_set.add(best_nid)
+                keep_ids.append(best_nid)
+        # In subgraph mode everything returned is "retrieved".
+        retrieved_ids = set(keep_ids)
+
+    # Activation normalization across the returned graph (not the whole graph)
+    # so the GUI's radius/opacity math is robust to negative BLL.
+    sub_acts = [trace.get(nid, 0.0) for nid in keep_ids]
+    a_min = min(sub_acts) if sub_acts else 0.0
+    a_max = max(sub_acts) if sub_acts else 0.0
+    a_span = (a_max - a_min) or 1.0
+
+    nodes = []
+    for nid in keep_ids:
+        node = retriever.graph.nodes.get(nid)
+        if node is None:
+            continue
+        raw = float(trace.get(node.id, 0.0))
+        d = {
+            "id": node.id,
+            "kind": node.kind,
+            "text": node.text or node.id,
+            "activation": raw,
+            "activation_norm": float((raw - a_min) / a_span),
+            "retrieved": node.id in retrieved_ids,
+        }
+        for k in ("name", "user_id", "aliases", "content", "type", "confidence",
+                  "importance", "summary", "emotional_shift", "timestamp",
+                  "kind_label", "baseline", "comment"):
+            v = getattr(node, k, None)
+            if v is not None and v != "":
+                d[k] = v
+        nodes.append(d)
+    # Edges: only between kept nodes, skip co_occurrence unless asked, cap the
+    # count. Prefer higher-weight / structural edges over weak ones.
+    edge_objs = [
+        e for e in retriever.graph.edges.values()
+        if e.src in keep_set and e.dst in keep_set
+        and (include_co or e.kind != "co_occurrence")
+    ]
+    edge_objs.sort(key=lambda e: float(e.weight or 0.0), reverse=True)
+    edge_objs = edge_objs[:edge_budget]
+    edges = [
+        {"id": e.id, "kind": e.kind, "src": e.src, "dst": e.dst, "weight": float(e.weight)}
+        for e in edge_objs
+    ]
+    self_node = retriever.graph.SELF_ID if retriever.graph.SELF_ID in retriever.graph.nodes else None
+    return {
+        "character": agent.character_name,
+        "query": q or "",
+        "user": user,
+        "mode": "full" if full else "subgraph",
+        "self_node": self_node,
+        "nodes": nodes,
+        "edges": edges,
+        "activation_range": {"min": a_min, "max": a_max},
+        "truncated": len(retriever.graph.nodes) > len(nodes) or len(retriever.graph.edges) > len(edges),
+        "overview": retriever.overview(),
     }
