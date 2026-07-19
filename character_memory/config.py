@@ -127,6 +127,38 @@ class ContradictionPolicy:
 
 
 @dataclass
+class KnowledgeGraphConfig:
+    """Tunables for the optional knowledge-graph retriever.
+
+    See :doc:`docs/knowledge_graph` for the full design. The KG is off by
+    default; enable it via :attr:`MemoryConfig.enabled_knowledge_graph`.
+
+    - `decay`: ACT-R base-level learning decay parameter (d). Higher -> faster
+      forgetting.
+    - `decay_half_life`: when > 0, an extra exponential recency factor
+      layered on top of the BLL (seconds).
+    - `gain` / `hops` / `hop_decay`: spreading-activation gain, max hops
+      (pinned at 2 by design), and per-hop attenuation.
+    - `hebbian_threshold` / `hebbian_lr`: nodes co-activating above the
+      threshold reinforce their co-occurrence edge by `hebbian_lr`.
+    """
+
+    decay: float = 0.5
+    decay_half_life: float = 60 * 60 * 24 * 7  # one week
+    gain: float = 0.35
+    hops: int = 2
+    hop_decay: float = 0.6
+    base_weight: float = 1.0
+    spread_weight: float = 1.2
+    min_activation: float = 0.0
+    hebbian_threshold: float = 0.15
+    hebbian_lr: float = 0.05
+    self_seed: float = 0.8
+    match_base: float = 4.0
+    match_gain: float = 3.0
+
+
+@dataclass
 class MemoryConfig:
     """Per-memory toggles and retrieval knobs.
 
@@ -142,6 +174,9 @@ class MemoryConfig:
     enabled_emotion: bool = True
     enabled_heartbeat: bool = True
     enabled_user_summary: bool = True
+    #: Knowledge-graph retriever is OFF by default; opt in per character
+    #: (e.g. the Kurisu asset flips this True) or via config.
+    enabled_knowledge_graph: bool = False
 
     # Retrivial Sizes
     character_info_k: int = 4
@@ -151,6 +186,7 @@ class MemoryConfig:
     episodic_k: int = 4
     heartbeat_k: int = 4
     user_summary_k: int = 2
+    knowledge_graph_k: int = 6
 
     # Structured Memory behavior
     # Facts/directives whose effective importance is at/above this value are
@@ -176,6 +212,9 @@ class MemoryConfig:
 
     # DEDUPLICATION
     dedup: DedupConfig = field(default_factory=DedupConfig)
+
+    # KNOWLEDGE GRAPH (optional, off by default — see enabled_knowledge_graph)
+    knowledge_graph: KnowledgeGraphConfig = field(default_factory=KnowledgeGraphConfig)
 
     def is_enabled(self, name: str) -> bool:
         return bool(getattr(self, f"enabled_{name}", False))

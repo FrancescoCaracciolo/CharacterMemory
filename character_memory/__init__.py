@@ -23,6 +23,7 @@ from .config import (
     ContradictionPolicy,
     DedupConfig,
     EmbeddingConfig,
+    KnowledgeGraphConfig,
     LLMConfig,
     MemoryConfig,
 )
@@ -43,6 +44,7 @@ from .memory import (
     ExtractionSpec,
     Extractor,
     HeartbeatJournal,
+    KnowledgeGraphMemory,
     Memory,
     MemoryItem,
     MemoryScope,
@@ -50,6 +52,10 @@ from .memory import (
     StructuredMemory,
     UserDirectiveMemory,
     UserFactMemory,
+)
+from .knowledge_graph import (
+    KnowledgeGraphRetriever,
+    KnowledgeGraphRetrivier,
 )
 from .prompts import PromptConfig
 from .rag import Hit, HybridSearch, RAGSystem
@@ -65,6 +71,7 @@ __all__ = [
     "EmbeddingConfig",
     "ChunkingConfig",
     "ContradictionPolicy",
+    "KnowledgeGraphConfig",
     "MemoryConfig",
     "DedupConfig",
     "PromptConfig",
@@ -91,6 +98,10 @@ __all__ = [
     "EpisodicMemory",
     "EmotionStatus",
     "HeartbeatJournal",
+    "UserSummaryMemory",
+    "KnowledgeGraphMemory",
+    "KnowledgeGraphRetriever",
+    "KnowledgeGraphRetrivier",
     "SQLiteStore",
     "Extractor",
     "ExtractionContext",

@@ -37,6 +37,8 @@ class PromptConfig:
     user_summary_header: str = "Summary of this user"
     user_summary_header_multi: str = "Summaries of these users"
     emotion_header: str = "Emotional state"
+    knowledge_graph_header: str = "Activated knowledge (graph)"
+    knowledge_graph_header_multi: str = "Activated knowledge (graph)"
 
     # Plural headers used when a section is rendered for a multi-participant
     # (group) chat. When a `*_header_multi` is set, the renderer picks it over
@@ -120,6 +122,7 @@ class PromptConfig:
             "episodic",
             "heartbeat",
             "user_summary",
+            "knowledge_graph",
             "dialogue_style",
         ]
     )

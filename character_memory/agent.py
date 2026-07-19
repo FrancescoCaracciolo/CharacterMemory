@@ -47,6 +47,7 @@ from .memory.dedup import Deduplicator, DedupReport
 from .memory.emotion import EmotionStatus
 from .memory.episodic import EpisodicMemory
 from .memory.heartbeat import HeartbeatJournal
+from .memory.knowledge_graph_memory import KnowledgeGraphMemory
 from .memory.store import SQLiteStore
 from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
@@ -61,6 +62,9 @@ _DIALOGUE_GLOB = "Dialogues"
 # Names of the two RAG memories populated from the character directory and of
 # the structured memories whose hybrid index is rebuilt from SQLite rows.
 _STRUCTURED_MEMORIES = ("user_facts", "user_directives", "episodic", "heartbeat", "user_summary")
+# The knowledge-graph memory has its own persistence layout (kg_index/) and a
+# load-or-ingest lifecycle driven by the other memories.
+_KG_MEMORY = "knowledge_graph"
 
 # Anything generate_answer / build_context / render_prompt accepts as a
 # conversation target.
@@ -227,6 +231,16 @@ class CharacterAgent:
             half_life=half, sticky_threshold=sticky,
         )
 
+        # Knowledge graph — optional, additive retriever built last so it can
+        # see every other memory as a source. Wired (LLM/embedder/sources)
+        # after construction in :meth:`_wire_knowledge_graph`.
+        if m.is_enabled("knowledge_graph"):
+            self.memories[_KG_MEMORY] = KnowledgeGraphMemory(
+                self.store, hybrid(),
+                enabled=m.is_enabled("knowledge_graph"),
+                config=m.knowledge_graph,
+            )
+
     def _wire_character(self) -> None:
         self._limits = {
             name: (self.config.memory.k_for(name) if self.config else 4)
@@ -239,6 +253,18 @@ class CharacterAgent:
             llm=self.llm,
             prompts=self.prompts,
         )
+        # Wire the knowledge graph's backends + source-memory back-reference
+        # so it can ingest/update/apply-deduplication against the others.
+        kg = self.memories.get(_KG_MEMORY)
+        if isinstance(kg, KnowledgeGraphMemory):
+            kg.attach_backends(self.llm, self.embedder)
+            kg.wire_sources(self.memories)
+            # Pass the character identity (name + persona) to the retriever so
+            # entity/people extraction is context-aware and relevance-filtered.
+            kg.retriever.character = {
+                "name": self.character_name,
+                "persona": (self.persona or "").strip(),
+            }
 
     # Indexing
     def _chunking_config(self) -> ChunkingConfig:
@@ -279,6 +305,33 @@ class CharacterAgent:
     def _has_index(self, subdir: str) -> bool:
         return os.path.exists(os.path.join(self.save_directory, subdir, "nodes.json"))
 
+    def _wiki_sections(self) -> list[dict[str, Any]]:
+        """Header-chunk the character's `Information/*.md` into wiki sections.
+
+        Each chunk becomes one dict ``{text, header, source}`` fed to the KG's
+        structural wiki ingest (no LLM). Returns ``[]`` when there is no
+        Information directory.
+        """
+        c = self._chunking_config()
+        info_dir = os.path.join(self.character_dir, _INFO_GLOB)
+        if not os.path.isdir(info_dir):
+            return []
+        chunks = get_chunker(
+            c.info_chunker,
+            max_tokens=c.header_max_tokens,
+            min_tokens=c.header_min_tokens,
+        ).chunk_directory(info_dir)
+        out: list[dict[str, Any]] = []
+        for ch in chunks:
+            out.append(
+                {
+                    "text": ch.text,
+                    "header": (ch.metadata or {}).get("header", ""),
+                    "source": ch.source or "wiki",
+                }
+            )
+        return out
+
     def build(self) -> "CharacterAgent":
         """Load persisted indexes if present, otherwise build + persist them."""
         self._require_loaded()
@@ -308,6 +361,24 @@ class CharacterAgent:
             else:
                 mem.rebuild_index()
                 mem.persist(path)
+
+        # Knowledge graph: load-or-ingest. Runs after the structured indexes
+        # so a fresh build reads the already-loaded rows. The graph never
+        # writes back to its sources (modules stay independent).
+        kg = self.memories.get(_KG_MEMORY)
+        if isinstance(kg, KnowledgeGraphMemory):
+            kg_path = os.path.join(self.save_directory, "kg_index")
+            if kg.retriever.has_persisted(kg_path):
+                kg.load(kg_path)
+            else:
+                kg.retriever.ingest(list(self.memories.values()))
+            # Wiki is folded into the graph as typed nodes (characters /
+            # entities / episodes) via an LLM pass. That is expensive, so only
+            # (re)run it when no wiki nodes are present yet; `rebuild()` always
+            # re-ingests. Idempotent inside the retriever.
+            if not kg.retriever._has_wiki_nodes():
+                kg.retriever.ingest_wiki(self._wiki_sections())
+            kg.persist(kg_path)
         self._built = True
         return self
 
@@ -322,6 +393,13 @@ class CharacterAgent:
                 continue
             mem.rebuild_index()
             mem.persist(os.path.join(self.save_directory, f"{name}_index"))
+        # Knowledge graph: rebuild from scratch and re-ingest.
+        kg = self.memories.get(_KG_MEMORY)
+        if isinstance(kg, KnowledgeGraphMemory):
+            kg.retriever.reset()
+            kg.retriever.ingest(list(self.memories.values()))
+            kg.retriever.ingest_wiki(self._wiki_sections())
+            kg.persist(os.path.join(self.save_directory, "kg_index"))
         self._built = True
         return self
 
@@ -332,6 +410,11 @@ class CharacterAgent:
             if mem is None:
                 continue
             mem.persist(os.path.join(self.save_directory, f"{name}_index"))
+        # The knowledge graph changes whenever its source memories change, so
+        # it is persisted alongside them after learning.
+        kg = self.memories.get(_KG_MEMORY)
+        if isinstance(kg, KnowledgeGraphMemory):
+            kg.persist(os.path.join(self.save_directory, "kg_index"))
 
     # Target resolution
     def _as_chat(self, target: Union[Chat, str]) -> Optional[Chat]:
@@ -537,10 +620,15 @@ class CharacterAgent:
             turns, user_id=user_id, participants=participants
         )
         if result is not None:
+            added = result.pop("__added__", {})
             self.persist_structured()
+            # Knowledge graph: ingest the freshly-added items so its nodes
+            # exist before dedup possibly mutates their source rows.
+            self._update_knowledge_graph(added)
             # Post-extraction dedup: compact the freshly-added items against
-            # each memory's existing rows.
-            self._dedup_added(result.pop("__added__", {}))
+            # each memory's existing rows, then mirror the mutations into
+            # the knowledge graph.
+            self._dedup_added(added)
         # Mark extracted whether or not the extractor returned data: a None
         # return means no participating memories, so there is nothing to learn.
         assert self.store is not None
@@ -562,19 +650,42 @@ class CharacterAgent:
             rows[-window:], chat.user_id, participants=chat.participants()
         )
 
+    def _update_knowledge_graph(self, added: dict[str, list]) -> None:
+        """Feed freshly-extracted items to the knowledge graph (if enabled).
+
+        The graph reads its source memories' rows to ingest; the `added` map
+        tells it which rows are new so the update is incremental rather than
+        a full re-ingest. No-op when the KG memory is not configured.
+        """
+        kg = self.memories.get(_KG_MEMORY)
+        if not isinstance(kg, KnowledgeGraphMemory):
+            return
+        # Only the source memories the graph cares about carry weight here;
+        # `KnowledgeGraphRetriever.update` ignores the rest.
+        kg.retriever.update(added)
+        kg.persist(os.path.join(self.save_directory, "kg_index"))
+
     def _dedup_added(self, added: dict[str, list]) -> None:
         """Post-extraction step: compact freshly-added items per memory.
 
         ``added`` maps memory name -> the items that memory's
         ``apply_extraction`` reported as newly added. Only runs when a
-        `Deduplicator` is configured.
+        `Deduplicator` is configured. Any mutations are mirrored into the
+        knowledge graph via `apply_deduplication`.
         """
         if not self.deduplicator:
             return
+        reports: dict[str, DedupReport] = {}
         for name, items in added.items():
             mem = self.memories.get(name)
             if isinstance(mem, StructuredMemory) and items:
-                self.deduplicator.dedup_items(mem, items)
+                reports[name] = self.deduplicator.dedup_items(mem, items)
+        # Mirror the dedup mutations into the knowledge graph so stale nodes
+        # are removed/refreshed in lockstep with their source rows.
+        kg = self.memories.get(_KG_MEMORY)
+        if isinstance(kg, KnowledgeGraphMemory) and reports:
+            kg.retriever.apply_deduplication(reports)
+            kg.persist(os.path.join(self.save_directory, "kg_index"))
 
     def dedup(
         self,
