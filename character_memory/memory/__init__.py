@@ -5,6 +5,7 @@ from .emotion import EmotionStatus
 from .episodic import EpisodicMemory
 from .extract import ExtractionContext, Extractor
 from .heartbeat import HeartbeatJournal
+from .knowledge_graph_memory import KnowledgeGraphMemory
 from .store import SQLiteStore
 from .structured import StructuredMemory
 from .user_directives import UserDirectiveMemory
@@ -26,6 +27,7 @@ __all__ = [
     "HeartbeatJournal",
     "UserSummaryMemory",
     "StructuredMemory",
+    "KnowledgeGraphMemory",
     "SQLiteStore",
     "ExtractionContext",
     "Extractor",
