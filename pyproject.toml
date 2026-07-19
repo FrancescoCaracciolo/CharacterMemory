@@ -64,4 +64,4 @@ exclude = ["examples*", "tests*", "assets*"]
 # Ship the memory-browser GUI static assets inside the wheel so
 # `GET /gui` works after `pip install charactermemory[server]`.
 [tool.setuptools.package-data]
-"character_memory.server.static" = ["*.html", "*.js", "*.css"]
+"character_memory.server.static" = ["*.html", "*.js", "*.css", "*.json"]

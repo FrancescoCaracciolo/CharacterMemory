@@ -46,10 +46,10 @@ from pydantic import BaseModel, Field
 
 from character_memory import (
     CharacterAgent,
+    CharacterManifest,
     EmbeddingConfig,
     LLMConfig,
     MemoryConfig,
-    PromptConfig,
 )
 
 # Read-side memory browser: normalises each memory backend into paged,
@@ -62,6 +62,10 @@ from .adapters import read_memory as read_memory_page
 # HTTP transport, JSON-only. Mounted at /mcp with ``?character=<name>``
 # binding every call to one CharacterAgent from the AGENTS dict below.
 from .mcp import build_router as build_mcp_router
+# Admin router: write-side endpoints (create / configure / delete / rebuild /
+# chat) that back the Configure tab of the GUI. Reads live in `adapters.py`.
+from .admin import build_admin_router as build_admin_router_impl
+from .admin import build_jobs_router as build_jobs_router_impl
 
 # Default to the current working directory: once installed the package has no
 # notion of a "repo root", so the server operates relative to the cwd it is
@@ -119,15 +123,19 @@ def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
         char_dir = os.path.join(assets_dir, name)
         if not os.path.isdir(char_dir):
             continue
-        memory_config = MemoryConfig()
         marker = os.path.join(char_dir, ".knowledge_graph")
+        # The manifest carries persisted per-character toggles/persona; layer the
+        # KG opt-in (env override or `.knowledge_graph` marker) on top so it
+        # stays the single source of truth for "is the graph on".
+        memory_config = CharacterManifest.load(char_dir, name=name).to_memory_config()
         if name in kg_chars or os.path.isfile(marker):
             memory_config.enabled_knowledge_graph = True
+        # `prompt_config` and `persona` are read from the manifest inside the
+        # agent constructor, so they don't need to be passed here.
         agent = CharacterAgent(
             directory=char_dir,
             name=name,
             save_directory=os.path.join(SAVE_ROOT, name),
-            prompt_config=PromptConfig(),
         )
         agent.load_from_config(LLMConfig(), EmbeddingConfig(), memory_config)
         agent.build()  # load-or-build (idempotent); KG is loaded, not rebuilt
@@ -193,6 +201,11 @@ app = FastAPI(title="CharacterMemory server")
 # memory's hybrid index, and ``persist_structured()`` so the change survives
 # a server restart. ``build_mcp_router`` is implemented in :file:`.mcp`.
 app.include_router(build_mcp_router(AGENTS))
+
+# Mount the admin router (write side: create/configure/delete/rebuild/chat).
+# It receives the live AGENTS dict so mutations are reflected immediately.
+app.include_router(build_admin_router_impl(AGENTS, ASSETS_DIR, SAVE_ROOT))
+app.include_router(build_jobs_router_impl())
 
 
 @app.on_event("shutdown")

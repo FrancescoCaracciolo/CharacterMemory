@@ -1306,4 +1306,31 @@ async function init() {
     showError(e.message);
   }
 }
+
+// ----------------------------------------------------------------- tab switching
+// Share DOM helpers with config.js (the Configure tab) through `window.cmUtil`
+// so the configurator never duplicates el()/clear()/$()/markdown()/getJSON().
+window.cmUtil = { $, el, clear, getJSON, markdown, esc };
+
+function setTab(name) {
+  const browse = name === "browse";
+  $("tab-browse").classList.toggle("active", browse);
+  $("tab-browse").setAttribute("aria-selected", browse ? "true" : "false");
+  $("tab-configure").classList.toggle("active", !browse);
+  $("tab-configure").setAttribute("aria-selected", browse ? "false" : "true");
+  const main = document.querySelector(".app > .main");
+  const cfg = $("cfg-pane");
+  if (main) main.classList.toggle("hidden", !browse);
+  if (cfg) cfg.classList.toggle("hidden", browse);
+  if (!browse && window.cmConfig && typeof window.cmConfig.activate === "function") {
+    window.cmConfig.activate();
+  }
+}
+
+function wireTabs() {
+  $("tab-browse").addEventListener("click", () => setTab("browse"));
+  $("tab-configure").addEventListener("click", () => setTab("configure"));
+}
+wireTabs();
+
 init();

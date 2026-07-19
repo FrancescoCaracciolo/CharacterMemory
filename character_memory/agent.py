@@ -53,6 +53,7 @@ from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
 from .memory.user_summary import UserSummaryMemory
+from .manifest import CharacterManifest
 from .prompts import PromptConfig
 from .rag.hybrid import HybridSearch
 
@@ -86,12 +87,19 @@ class CharacterAgent:
         self.character_dir = directory
         self.character_name = name or os.path.basename(os.path.normpath(directory))
         self.save_directory = save_directory or os.path.join(directory, ".cm_data")
-        self.prompts = prompt_config or PromptConfig()
+        # Persisted per-character config (character.json). When absent the
+        # fallback is a synthesised default using the folder/name — see
+        # CharacterManifest.load. Explicit constructor args always win; the
+        # manifest only fills in what the caller left at its dataclass default.
+        self.manifest = CharacterManifest.load(directory, name=self.character_name)
+        self.prompts = prompt_config or self.manifest.to_prompt_config()
         # Short character blurb surfaced to the extractor (and the answer prompt)
         # so the model knows who the character is. Auto-summarizing the
         # Information/*.md into a blurb is intentionally out of scope; callers
-        # pass this in if they want the persona clause populated.
-        self.persona = persona
+        # pass this in if they want the persona clause populated. The explicit
+        # constructor arg wins; otherwise fall back to whatever the persisted
+        # manifest records (empty for a fresh character).
+        self.persona = persona or self.manifest.persona
 
         # Not wired until load_* is called.
         self.config: Optional[CharacterMemoryConfig] = None
@@ -135,10 +143,16 @@ class CharacterAgent:
         if config is not None:
             full = config
         else:
+            # The manifest carries per-character toggles (`enabled_*` / `*_k`)
+            # and persona overrides. Apply it over the default MemoryConfig when
+            # the caller did not pass one explicitly, so a persisted character
+            # rehydrates its toggles on load. KG opt-in via `.knowledge_graph`
+            # marker is applied separately by the server discover step.
+            mem_cfg = memory_config or self.manifest.to_memory_config()
             full = CharacterMemoryConfig(
                 llm=llm_config or LLMConfig(),
                 embedding=embedding_config or EmbeddingConfig(),
-                memory=memory_config or MemoryConfig(),
+                memory=mem_cfg,
                 chunking=chunking_config or ChunkingConfig(),
             )
         self.config = full

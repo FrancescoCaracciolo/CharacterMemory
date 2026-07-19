@@ -11,6 +11,10 @@
   <div class="app">
     <header class="topbar">
       <div class="brand"><span class="logo">◆</span> Character Memory</div>
+      <nav class="tabbar" role="tablist" aria-label="View">
+        <button id="tab-browse" class="tab active" role="tab" aria-selected="true">Browse</button>
+        <button id="tab-configure" class="tab" role="tab" aria-selected="false">Configure</button>
+      </nav>
       <div class="topbar-actions">
         <label class="char-picker">
           <span>Character</span>
@@ -128,7 +132,195 @@
         <div id="status" class="status hidden"></div>
       </section>
     </div>
+
+    <!-- ================================================================ -->
+    <!-- Configure tab: character list + editor (persona / files / chat). -->
+    <!-- ================================================================ -->
+    <div id="cfg-pane" class="cfg-pane hidden">
+      <aside class="cfg-rail">
+        <div class="cfg-rail-head">
+          <span class="cfg-rail-title">Characters</span>
+          <button id="cfg-new" class="btn primary tight" title="Create a new character">+ New</button>
+        </div>
+        <nav id="cfg-char-list" class="cfg-char-list" aria-label="Characters"></nav>
+      </aside>
+
+      <section id="cfg-empty" class="cfg-empty">
+        <div class="cfg-empty-big">◆</div>
+        <div class="cfg-empty-text">Select a character on the left — or click <b>+ New</b> to build one.</div>
+      </section>
+
+      <section id="cfg-pane-main" class="cfg-main hidden">
+        <header class="cfg-head">
+          <div class="cfg-head-title">
+            <h2 id="cfg-name">—</h2>
+            <button id="cfg-delete" class="btn danger ghost" title="Delete this character and all its data">Delete</button>
+          </div>
+          <nav class="editor-tabs" role="tablist">
+            <button class="etab active" data-edit="persona" role="tab">Persona &amp; memories</button>
+            <button class="etab" data-edit="files" role="tab">Files</button>
+            <button class="etab" data-edit="chat" role="tab">Chat</button>
+          </nav>
+        </header>
+
+        <!-- Persona + memories -->
+        <div class="edit-pane" data-edit="persona">
+          <div class="cfg-block">
+            <div class="cfg-block-head">
+              <label class="cfg-label" for="cfg-persona">Persona / description</label>
+              <button id="cfg-save-persona" class="btn primary">Save persona</button>
+            </div>
+            <textarea id="cfg-persona" class="cfg-textarea" rows="5"
+              placeholder="Short blurb the character uses to know who they are. Optional."></textarea>
+          </div>
+
+          <div class="cfg-block">
+            <div class="cfg-block-head">
+              <label class="cfg-label">Memories</label>
+              <button id="cfg-save-memory" class="btn primary">Save memories</button>
+            </div>
+            <div id="cfg-memory-list" class="cfg-memory-list"></div>
+          </div>
+
+          <div class="cfg-block">
+            <div class="cfg-block-head">
+              <label class="cfg-label" for="cfg-kg">
+                <input id="cfg-kg" type="checkbox" class="switch-input inline">
+                Knowledge graph
+              </label>
+              <span class="cfg-hint">Off by default. Building it runs an LLM extraction pass.</span>
+            </div>
+          </div>
+
+          <div class="cfg-block">
+            <div class="cfg-block-head">
+              <label class="cfg-label">Indexes</label>
+              <button id="cfg-rebuild" class="btn ghost">⟳ Rebuild indexes</button>
+            </div>
+            <div id="cfg-build-status" class="cfg-build-status"></div>
+          </div>
+        </div>
+
+        <!-- Files -->
+        <div class="edit-pane hidden" data-edit="files">
+          <div class="files-toolbar">
+            <div class="bucket-switch">
+              <button class="bucket-btn active" data-bucket="information">Information (wiki)</button>
+              <button class="bucket-btn" data-bucket="dialogues">Dialogues</button>
+            </div>
+            <label class="btn ghost upload-btn" title="Upload .md / .txt files">
+              ↑ Upload
+              <input id="cfg-upload" type="file" multiple accept=".md,.txt,text/markdown,text/plain" hidden>
+            </label>
+            <button id="cfg-new-file" class="btn ghost">+ New file</button>
+          </div>
+          <div class="files-split">
+            <ul id="cfg-file-list" class="cfg-file-list" aria-label="Files"></ul>
+            <div class="cfg-file-editor">
+              <div class="cfg-file-editor-head">
+                <input id="cfg-filename" class="cfg-filename" placeholder="filename.md" spellcheck="false">
+                <button id="cfg-save-file" class="btn primary tight">Save</button>
+                <button id="cfg-delete-file" class="btn danger ghost tight">Delete</button>
+              </div>
+              <textarea id="cfg-file-content" class="cfg-file-content" spellcheck="false"
+                placeholder="# Section\n\nMarkdown for the character's wiki or dialogue transcript."></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- Mini chat -->
+        <div class="edit-pane hidden" data-edit="chat">
+          <div class="chat-wrap">
+            <div id="chat-log" class="chat-log" aria-live="polite"></div>
+            <form id="chat-form" class="chat-form">
+              <input id="cfg-chat-user" class="chat-user" value="user" title="Your user id" spellcheck="false">
+              <input id="chat-input" class="chat-input" placeholder="Say something to the character…" autocomplete="off">
+              <button id="chat-send" class="btn primary" type="submit">Send</button>
+              <button id="cfg-chat-clear" class="btn ghost" type="button" title="Clear this conversation view">Clear</button>
+            </form>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- Wizard modal: 5-step character creation.                         -->
+    <!-- ================================================================ -->
+    <div id="wiz-overlay" class="wiz-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="wiz-title">
+      <div class="wiz-card">
+        <header class="wiz-head">
+          <div>
+            <div class="wiz-eyebrow">New character</div>
+            <h2 id="wiz-title">Create a character</h2>
+          </div>
+          <button id="wiz-close" class="wiz-close" title="Cancel" aria-label="Cancel">×</button>
+        </header>
+
+        <ol id="wiz-stepper" class="wiz-stepper">
+          <li class="wiz-step active" data-step="1"><span class="wiz-dot">1</span><span class="wiz-step-label">Identity</span></li>
+          <li class="wiz-step" data-step="2"><span class="wiz-dot">2</span><span class="wiz-step-label">Wiki files</span></li>
+          <li class="wiz-step" data-step="3"><span class="wiz-dot">3</span><span class="wiz-step-label">Dialogues</span></li>
+          <li class="wiz-step" data-step="4"><span class="wiz-dot">4</span><span class="wiz-step-label">Memories</span></li>
+          <li class="wiz-step" data-step="5"><span class="wiz-dot">5</span><span class="wiz-step-label">Build</span></li>
+        </ol>
+
+        <!-- Step 1: Identity -->
+        <section class="wiz-pane active" data-step="1">
+          <p class="wiz-intro">Pick a name and a short description. The name becomes the character's folder and identifier.</p>
+          <label class="cfg-label" for="wiz-name">Name</label>
+          <input id="wiz-name" class="wiz-input" placeholder="e.g. Kurisu" autocomplete="off">
+          <label class="cfg-label" for="wiz-desc">Description / persona</label>
+          <textarea id="wiz-desc" class="cfg-textarea" rows="4"
+            placeholder="A short blurb describing who the character is. Optional but recommended."></textarea>
+          <p class="wiz-error hidden" id="wiz-err-1"></p>
+        </section>
+
+        <!-- Step 2: Wiki files -->
+        <section class="wiz-pane hidden" data-step="2">
+          <p class="wiz-intro">Drop the character's lore, story or reference docs. Markdown is chunked by header. Optional — you can add files later.</p>
+          <label class="btn ghost upload-btn" title="Upload wiki files">
+            ↑ Upload wiki files
+            <input id="wiz-wiki-upload" type="file" multiple accept=".md,.txt,text/markdown,text/plain" hidden>
+          </label>
+          <ul id="wiz-wiki-list" class="wiz-file-list" aria-label="Wiki files"></ul>
+        </section>
+
+        <!-- Step 3: Dialogue files -->
+        <section class="wiz-pane hidden" data-step="3">
+          <p class="wiz-intro">Drop dialogue transcripts. Each turn should be <code>Speaker: text</code>, separated by blank lines. Optional.</p>
+          <label class="btn ghost upload-btn" title="Upload dialogue files">
+            ↑ Upload dialogue files
+            <input id="wiz-dialogue-upload" type="file" multiple accept=".md,.txt,text/markdown,text/plain" hidden>
+          </label>
+          <ul id="wiz-dialogue-list" class="wiz-file-list" aria-label="Dialogue files"></ul>
+        </section>
+
+        <!-- Step 4: Memories -->
+        <section class="wiz-pane hidden" data-step="4">
+          <p class="wiz-intro">Pick which memories the character should maintain. Defaults are sensible; change only what you need.</p>
+          <div id="wiz-memories" class="cfg-memory-list"></div>
+          <label class="wiz-kg-row">
+            <input id="wiz-kg" type="checkbox" class="switch-input inline">
+            <span>Enable knowledge graph <span class="cfg-hint">(slower build; LLM extraction)</span></span>
+          </label>
+        </section>
+
+        <!-- Step 5: Build -->
+        <section class="wiz-pane hidden" data-step="5">
+          <p class="wiz-intro">Build the indexes. This chunks the files, embeds them, and (if enabled) runs knowledge-graph extraction. May take a while.</p>
+          <div id="wiz-build-status" class="wiz-build-status">Ready to build.</div>
+        </section>
+
+        <footer class="wiz-foot">
+          <button id="wiz-back" class="btn ghost">Back</button>
+          <span class="wiz-spacer"></span>
+          <button id="wiz-next" class="btn primary">Next →</button>
+          <button id="wiz-build" class="btn primary hidden">Build</button>
+        </footer>
+      </div>
+    </div>
   </div>
   <script src="/gui/static/app.js"></script>
+  <script src="/gui/static/config.js"></script>
 </body>
 </html>

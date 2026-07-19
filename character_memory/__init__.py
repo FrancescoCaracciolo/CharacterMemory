@@ -57,6 +57,7 @@ from .knowledge_graph import (
     KnowledgeGraphRetriever,
     KnowledgeGraphRetrivier,
 )
+from .manifest import MEMORY_NAMES, CharacterManifest
 from .prompts import PromptConfig
 from .rag import Hit, HybridSearch, RAGSystem
 
@@ -75,6 +76,8 @@ __all__ = [
     "MemoryConfig",
     "DedupConfig",
     "PromptConfig",
+    "CharacterManifest",
+    "MEMORY_NAMES",
     "LLMClient",
     "EmbeddingProvider",
     "OpenAICompatibleLLM",
