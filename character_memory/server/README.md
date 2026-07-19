@@ -30,6 +30,16 @@ charactermemory-server
 uvicorn character_memory.server:app --reload
 ```
 
+A few flags are available on the console script (the env-var equivalents are
+listed below and also work when launching through uvicorn directly):
+
+| Flag                     | Default     | Purpose                                            |
+|--------------------------|-------------|----------------------------------------------------|
+| `--host HOST`            | `0.0.0.0`   | Bind host.                                         |
+| `--port PORT`            | `8000`      | Bind port.                                         |
+| `--reload` / `--no-reload` | on        | Toggle uvicorn auto-reload.                        |
+| `--rebuild-kg [NAME…]`   | _unset_     | Rebuild a character's KG at startup (see below).   |
+
 The server reads its configuration from environment variables (the same ones
 the rest of the library uses):
 
@@ -42,6 +52,7 @@ the rest of the library uses):
 | `OPENAI_EMBEDDINGS_MODEL`    | `text-embedding-ada-002` | Embeddings model.                         |
 | `CM_ASSETS_DIR`    | `./assets`         | Root folder scanned for character subdirectories.        |
 | `CM_SAVE_DIR`      | `./.cm_servers`    | Where each character's SQLite store + indexes live.      |
+| `CM_REBUILD_KG`    | _empty_            | Comma-separated character names to rebuild at startup, or `all`. |
 
 Both `CM_ASSETS_DIR` and `CM_SAVE_DIR` are relative to the **current working
 directory** (the server has no notion of a repo root once installed).
@@ -61,6 +72,34 @@ assets/
 ```
 
 Use `GET /` to list the characters the server has loaded.
+
+### Rebuilding a knowledge graph
+
+A character that opts into the knowledge-graph memory (via a
+`.knowledge_graph` marker file in its folder or `CM_KG_CHARACTERS`) loads its
+graph from the persisted `kg_index` on a plain start — it is **not** rebuilt.
+To force a fresh build — e.g. after editing the wiki / `Information/*.md`,
+changing the extractor, or wiping the store — pass `--rebuild-kg`:
+
+```bash
+# rebuild Kurisu's KG at startup, then serve (reload is disabled by default
+# so the expensive LLM extraction pass runs exactly once):
+charactermemory-server --rebuild-kg kurisu
+
+# rebuild several characters:
+charactermemory-server --rebuild-kg Kurisu Mayuri
+
+# rebuild every KG-enabled character:
+charactermemory-server --rebuild-kg
+```
+
+Names are matched case-insensitively. A character requested via `--rebuild-kg`
+that does not have the KG memory enabled is logged and skipped (it is not
+silently enabled). Without `--reload`, auto-reload is turned off automatically
+when `--rebuild-kg` is used; pass `--reload` explicitly to override that.
+
+The equivalent environment variable is `CM_REBUILD_KG` (comma-separated names,
+or `all`), which also works when launching through uvicorn directly.
 
 ---
 

@@ -75,6 +75,21 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 # --------------------------------------------------------------------------- #
 # Character registry: build one CharacterAgent per subfolder of `assets/`.
 # --------------------------------------------------------------------------- #
+def _parse_rebuild_kg_env() -> set[str]:
+    """Parse `CM_REBUILD_KG`.
+
+    Empty/unset -> no rebuilds. ``all`` or ``*`` -> the sentinel ``{"*"}``,
+    meaning "every KG-enabled character". Otherwise the comma-separated
+    character names to rebuild (lowercased for case-insensitive matching).
+    """
+    raw = os.environ.get("CM_REBUILD_KG", "").strip().lower()
+    if not raw:
+        return set()
+    if raw in {"all", "*"}:
+        return {"*"}
+    return {c.strip() for c in raw.split(",") if c.strip()}
+
+
 def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
     """Build a `CharacterAgent` for each character directory under `assets_dir`.
 
@@ -82,6 +97,15 @@ def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
     `.knowledge_graph` marker file in its directory or by being explicitly
     listed in `CM_KG_CHARACTERS` (a comma-separated env var). Kurisu ships
     with the marker so the KG is on by default for her.
+
+    The KG itself is loaded from disk if a persisted `kg_index` is present --
+    it is never silently rebuilt on a plain start. To force a (re)build, list
+    the character (or ``all``) in `CM_REBUILD_KG`; that triggers
+    `CharacterAgent.rebuild_knowledge_graph()` after the normal load (via
+    :func:`_apply_rebuild_kg`). This runs at module import time, so it only
+    sees `CM_REBUILD_KG` when the module is imported by a uvicorn worker
+    *after* `main()` set it -- i.e. the ``--reload`` subprocess path. The
+    in-process (default, no-reload) path is handled directly in :func:`main`.
     """
     agents: dict[str, CharacterAgent] = {}
     if not os.path.isdir(assets_dir):
@@ -89,8 +113,8 @@ def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
     kg_chars = {
         c.strip() for c in os.environ.get("CM_KG_CHARACTERS", "").split(",") if c.strip()
     }
-    if not os.path.isdir(assets_dir):
-        return agents
+    rebuild_kg = _parse_rebuild_kg_env()
+    rebuild_all = "*" in rebuild_kg
     for name in sorted(os.listdir(assets_dir)):
         char_dir = os.path.join(assets_dir, name)
         if not os.path.isdir(char_dir):
@@ -106,8 +130,12 @@ def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
             prompt_config=PromptConfig(),
         )
         agent.load_from_config(LLMConfig(), EmbeddingConfig(), memory_config)
-        agent.build()  # load-or-build (idempotent)
+        agent.build()  # load-or-build (idempotent); KG is loaded, not rebuilt
         agents[name] = agent
+    # Apply a requested KG rebuild once all agents are built, using the shared
+    # helper so behaviour matches the in-process path in main().
+    if rebuild_kg:
+        _apply_rebuild_kg(agents, rebuild_all=rebuild_all, targets=rebuild_kg)
     return agents
 
 
@@ -331,10 +359,121 @@ def read_graph(
 
 
 def main() -> None:  # pragma: no cover - manual run helper / console script
-    """Console-script entry point: run the server with uvicorn."""
+    """Console-script entry point: run the server with uvicorn.
+
+    Examples::
+
+        charactermemory-server
+        charactermemory-server --rebuild-kg kurisu
+        charactermemory-server --rebuild-kg        # all KG-enabled characters
+        charactermemory-server --rebuild-kg Kurisu Mayuri --port 9000
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="charactermemory-server",
+        description="Run the CharacterMemory FastAPI server.",
+    )
+    parser.add_argument(
+        "--host", default="0.0.0.0",
+        help="Bind host (default: 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000,
+        help="Bind port (default: 8000).",
+    )
+    reload_group = parser.add_mutually_exclusive_group()
+    reload_group.add_argument(
+        "--reload", dest="reload", action="store_true", default=None,
+        help="Enable uvicorn auto-reload (default unless --rebuild-kg is given).",
+    )
+    reload_group.add_argument(
+        "--no-reload", dest="reload", action="store_false",
+        help="Disable uvicorn auto-reload.",
+    )
+    parser.add_argument(
+        "--rebuild-kg", nargs="*", default=None, metavar="CHARACTER",
+        help=(
+            "Rebuild one or more characters' knowledge graph at startup, then "
+            "serve. With no names, rebuilds every KG-enabled character. "
+            "Default: load existing graphs (no rebuild)."
+        ),
+    )
+    args = parser.parse_args()
+
+    # A KG rebuild runs an expensive LLM extraction pass; default to no reload
+    # when --rebuild-kg is given so it isn't re-triggered on every file change.
+    reload_flag = args.reload
+    if reload_flag is None:
+        reload_flag = args.rebuild_kg is None
+        if args.rebuild_kg is not None and not reload_flag:
+            print(
+                "[charactermemory] --rebuild-kg given: auto-reload disabled by "
+                "default (pass --reload to force)."
+            )
+
+    requested = args.rebuild_kg
+    if requested is not None:
+        names = [n.strip() for n in requested if n and n.strip()]
+        rebuild_all = not names
+        targets = {n.lower() for n in names}
+        # Bridge to a uvicorn worker subprocess (the --reload re-import path)
+        # which reads CM_REBUILD_KG inside _discover_characters.
+        os.environ["CM_REBUILD_KG"] = ",".join(names) if names else "all"
+        # In-process path (reload off, the default). `AGENTS` was built at
+        # module import time -- before main() ran -- so it has NOT seen
+        # CM_REBUILD_KG; rebuild the already-loaded agents directly. When
+        # reload is on the fresh subprocess will do it, so skip here to avoid a
+        # double rebuild.
+        if not reload_flag:
+            applied = _apply_rebuild_kg(AGENTS, rebuild_all=rebuild_all, targets=targets)
+            if not applied:
+                print(
+                    "[charactermemory] --rebuild-kg: no matching characters "
+                    f"({sorted(names) or 'all'}). Available: {sorted(AGENTS)}."
+                )
+
     import uvicorn
 
-    uvicorn.run("character_memory.server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "character_memory.server:app",
+        host=args.host,
+        port=args.port,
+        reload=reload_flag,
+    )
+
+
+def _apply_rebuild_kg(
+    agents: "dict[str, CharacterAgent]",
+    *,
+    rebuild_all: bool,
+    targets: "set[str]",
+) -> bool:
+    """Rebuild the knowledge graph for the matching agents in `agents`.
+
+    Returns True if at least one rebuild ran. A character is rebuilt when it
+    has the knowledge_graph memory enabled AND (rebuild_all is set, `targets`
+    contains the ``"*"`` sentinel, OR its name matches `targets`
+    case-insensitively). Names that don't exist or don't have KG enabled are
+    reported and skipped.
+    """
+    applied = False
+    rebuild_all = rebuild_all or "*" in targets
+    for name, agent in sorted(agents.items()):
+        wants = rebuild_all or name.lower() in targets
+        if not wants:
+            continue
+        kg_enabled = "knowledge_graph" in agent.memories
+        if not kg_enabled:
+            print(
+                f"[charactermemory] --rebuild-kg: {name} has the knowledge_graph "
+                f"memory disabled; skipping."
+            )
+            continue
+        print(f"[charactermemory] rebuilding knowledge graph: {name}")
+        agent.rebuild_knowledge_graph()
+        applied = True
+    return applied
 
 
 if __name__ == "__main__":  # pragma: no cover - manual run helper

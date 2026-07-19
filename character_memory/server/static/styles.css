@@ -249,6 +249,37 @@ select option { background: var(--bg-2); }
 .graph-cy.grabbing { cursor: grabbing; }
 .graph-cy.node-hover { cursor: pointer; }
 .graph-overlay { position: absolute; inset: 0; pointer-events: none; }
+.graph-settings {
+  position: absolute; top: 10px; right: 10px; z-index: 20; width: 212px;
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 9px;
+  background: rgba(16,19,30,.94); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow);
+  backdrop-filter: blur(4px);
+}
+.graph-settings.hidden { display: none; }
+.gs-title {
+  font: 600 11px var(--mono); letter-spacing: .4px; text-transform: uppercase;
+  color: var(--text-dim); margin-bottom: 1px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.gs-close {
+  background: var(--bg-3); border: none; color: var(--text-dim);
+  width: 18px; height: 18px; line-height: 1; border-radius: 5px; cursor: pointer; font-size: 14px;
+}
+.gs-close:hover { color: var(--text); }
+.gs-reset {
+  margin-top: 3px; background: var(--bg-2); color: var(--text-dim);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  padding: 5px 8px; font: 500 11px var(--mono); cursor: pointer;
+}
+.gs-reset:hover { color: var(--text); background: var(--bg-3); }
+.gs-row {
+  display: grid; grid-template-columns: 1fr auto; align-items: center;
+  gap: 3px 8px;
+}
+.gs-label { font-size: 11.5px; color: var(--text-dim); grid-column: 1 / 2; }
+.gs-val { font: 600 10.5px var(--mono); color: var(--accent); grid-column: 2 / 3; text-align: right; }
+.gs-row input[type=range] { grid-column: 1 / 3; width: 100%; accent-color: var(--accent); cursor: pointer; }
 
 /* DOM tooltip following the cursor on node hover. */
 .graph-tip-box {

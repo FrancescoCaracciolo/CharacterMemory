@@ -62,11 +62,51 @@
             <button id="graph-freeze" class="btn ghost" title="Pause / resume physics (space)">❚❚ freeze</button>
             <button id="graph-fit" class="btn ghost" title="Fit graph to view">⤢ fit</button>
             <button id="graph-repel" class="btn ghost" title="Re-run layout">↻ relayout</button>
+            <button id="graph-settings-btn" class="btn ghost" title="Graph settings">⚙ settings</button>
           </div>
           <div class="graph-split">
             <div class="graph-canvas-wrap">
               <canvas id="cy" class="graph-cy"></canvas>
               <div id="graph-overlay" class="graph-overlay"></div>
+              <div id="graph-settings" class="graph-settings">
+                <div class="gs-title">Graph settings <button id="gs-close" class="gs-close" title="Hide panel">×</button></div>
+                <label class="gs-row">
+                  <span class="gs-label">Repulsion</span>
+                  <span class="gs-val" id="gs-repulsion-val">3200</span>
+                  <input type="range" id="gs-repulsion" min="500" max="8000" step="100" value="3200">
+                </label>
+                <label class="gs-row">
+                  <span class="gs-label">Link distance</span>
+                  <span class="gs-val" id="gs-link-val">78</span>
+                  <input type="range" id="gs-link" min="30" max="220" step="2" value="78">
+                </label>
+                <label class="gs-row">
+                  <span class="gs-label">Gravity</span>
+                  <span class="gs-val" id="gs-gravity-val">0.018</span>
+                  <input type="range" id="gs-gravity" min="0" max="0.06" step="0.002" value="0.018">
+                </label>
+                <label class="gs-row">
+                  <span class="gs-label">Particle speed</span>
+                  <span class="gs-val" id="gs-particles-val">1.0</span>
+                  <input type="range" id="gs-particles" min="0" max="3" step="0.1" value="1">
+                </label>
+                <label class="gs-row">
+                  <span class="gs-label">Label zoom</span>
+                  <span class="gs-val" id="gs-labelzoom-val">2.4</span>
+                  <input type="range" id="gs-labelzoom" min="1.2" max="4" step="0.1" value="2.4">
+                </label>
+                <label class="gs-row">
+                  <span class="gs-label">Node limit</span>
+                  <span class="gs-val" id="gs-nodes-val">50</span>
+                  <input type="range" id="gs-nodes" min="10" max="6000" step="10" value="50">
+                </label>
+                <label class="gs-row">
+                  <span class="gs-label">Edge limit</span>
+                  <span class="gs-val" id="gs-edges-val">300</span>
+                  <input type="range" id="gs-edges" min="50" max="10000" step="50" value="300">
+                </label>
+                <button id="gs-reset" class="gs-reset" title="Restore defaults">reset defaults</button>
+              </div>
             </div>
             <aside id="graph-side" class="graph-side">
               <div class="graph-side-head">Top activated</div>

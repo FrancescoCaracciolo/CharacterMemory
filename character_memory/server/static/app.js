@@ -576,12 +576,50 @@ const GRAPH_EDGE_COLOR = {
 };
 const GRAPH_FONT = '"JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace';
 
+// Live, user-tunable graph settings (driven by the settings panel sliders).
+// Shared by reference with the renderer so changes apply without a rebuild.
+const GRAPH_SETTINGS = {
+  repulsion: 3200,      // centrifugal force (node-node push-apart)
+  linkDistance: 78,     // spring rest length
+  gravity: 0.018,       // pull toward centre
+  particleSpeed: 1.0,   // edge-particle flow speed
+  labelZoom: 2.4,       // zoom level at which all labels appear
+  nodeLimit: 50,        // nodes fetched (subgraph mode)
+  edgeLimit: 300,       // edges fetched
+};
+const GRAPH_SETTINGS_DEFAULTS = { ...GRAPH_SETTINGS };
+
+// Persist graph UI choices (settings + full mode + panel visibility) so they
+// survive reloads. Best-effort: ignored if localStorage is unavailable.
+const GRAPH_UI_KEY = "cm_graph_ui_v1";
+function loadGraphUI() {
+  try {
+    const raw = localStorage.getItem(GRAPH_UI_KEY);
+    if (!raw) return;
+    const o = JSON.parse(raw);
+    if (o.settings) Object.assign(GRAPH_SETTINGS, o.settings);
+    if (o.full != null) state.graph.full = !!o.full;
+    const panel = $("graph-settings");
+    if (o.panel === "open") panel.classList.remove("hidden");
+    else if (o.panel === "closed") panel.classList.add("hidden");
+  } catch (e) { /* ignore */ }
+}
+function saveGraphUI() {
+  try {
+    const open = !$("graph-settings").classList.contains("hidden");
+    localStorage.setItem(GRAPH_UI_KEY, JSON.stringify({
+      settings: GRAPH_SETTINGS, full: state.graph.full, panel: open ? "open" : "closed",
+    }));
+  } catch (e) { /* ignore */ }
+}
+
 function graphUrl() {
   const full = state.graph.full;
+  const s = GRAPH_SETTINGS;
   const params = new URLSearchParams(
     full
-      ? { limit: "4000", hops: "2", max_edges: "9000", include_co_occurrence: "1", full: "1", retrieve_k: "30" }
-      : { limit: "50", hops: "1", max_edges: "300" }
+      ? { limit: String(s.nodeLimit), hops: "2", max_edges: String(s.edgeLimit), include_co_occurrence: "1", full: "1", retrieve_k: "30" }
+      : { limit: String(s.nodeLimit), hops: "1", max_edges: String(s.edgeLimit) }
   );
   if (state.graph.q) params.set("q", state.graph.q);
   if (state.graph.user) params.set("user", state.graph.user);
@@ -610,6 +648,7 @@ function hexA(hex, a) {
 // imperative API used by the rest of the app (setData / fit / focus / freeze).
 function createGraphViz(canvas, opts) {
   const onSelect = opts && opts.onSelect;
+  const settings = (opts && opts.settings) || GRAPH_SETTINGS;
   const ctx = canvas.getContext("2d");
   const dpr = () => window.devicePixelRatio || 1;
 
@@ -634,8 +673,8 @@ function createGraphViz(canvas, opts) {
   const tip = el("div", { class: "graph-tip-box" });
   document.getElementById("graph-overlay").appendChild(tip);
 
-  // physics constants (world units)
-  const REP = 3200, SPRING = 0.045, REST = 78, GRAV = 0.018, DAMP = 0.82, MAXV = 28;
+  // physics constants (world units) — REP/REST/GRAV are live-tunable via settings
+  const SPRING = 0.045, DAMP = 0.82, MAXV = 28;
 
   // -------------------------------------------------------------- sizing
   function resize() {
@@ -741,7 +780,7 @@ function createGraphViz(canvas, opts) {
         let d2 = dx * dx + dy * dy;
         if (d2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = dx * dx + dy * dy + 0.01; }
         const d = Math.sqrt(d2);
-        const f = REP / d2, fx = f * dx / d, fy = f * dy / d;
+        const f = settings.repulsion / d2, fx = f * dx / d, fy = f * dy / d;
         a.ax += fx; a.ay += fy; b.ax -= fx; b.ay -= fy;
       }
     }
@@ -749,11 +788,11 @@ function createGraphViz(canvas, opts) {
       const a = byId.get(e.src), b = byId.get(e.dst); if (!a || !b) continue;
       let dx = b.x - a.x, dy = b.y - a.y;
       const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-      const f = SPRING * (d - REST), fx = f * dx / d, fy = f * dy / d;
+      const f = SPRING * (d - settings.linkDistance), fx = f * dx / d, fy = f * dy / d;
       a.ax += fx; a.ay += fy; b.ax -= fx; b.ay -= fy;
     }
     for (const a of nodes) {
-      a.ax -= GRAV * a.x; a.ay -= GRAV * a.y;
+      a.ax -= settings.gravity * a.x; a.ay -= settings.gravity * a.y;
       if (a.id === draggingId) { a.vx = 0; a.vy = 0; continue; }
       a.vx = (a.vx + a.ax) * DAMP; a.vy = (a.vy + a.ay) * DAMP;
       a.vx = clamp(a.vx, -MAXV, MAXV); a.vy = clamp(a.vy, -MAXV, MAXV);
@@ -811,7 +850,7 @@ function createGraphViz(canvas, opts) {
     ctx.globalCompositeOperation = "lighter";
     for (const e of edges) {
       const a = byId.get(e.src), b = byId.get(e.dst); if (!a || !b) continue;
-      e.p = (e.p + dt * (0.05 + 0.25 * e.w)) % 1;
+      e.p = (e.p + dt * settings.particleSpeed * (0.04 + 0.22 * e.w)) % 1;
       let pa = (activeId && !e._hot) ? 0 : (e._hot ? 0.95 : 0.3);
       if (dimMode) {
         const both = a.retrieved && b.retrieved;
@@ -865,14 +904,17 @@ function createGraphViz(canvas, opts) {
 
     // labels: hidden by default (Obsidian-style dots), shown on hover or when
     // zoomed in past a threshold. Kept short so the canvas stays clean.
-    const showAll = view.scale > 2.4;
+    // Hovering a node also reveals its direct neighbours' labels.
+    const showAll = view.scale > settings.labelZoom;
+    const hoveredNeighbors = (activeId && adj.get(activeId)) || null;
     ctx.textAlign = "center"; ctx.textBaseline = "top";
     ctx.font = `10px ${GRAPH_FONT}`;
     for (const a of nodes) {
-      const show = showAll || (activeId && a.id === activeId);
+      const isActive = !!activeId && a.id === activeId;
+      const show = showAll || isActive || (hoveredNeighbors && hoveredNeighbors.has(a.id));
       if (!show) continue;
       const txt = a.label.length > 22 ? a.label.slice(0, 21) + "…" : a.label;
-      ctx.fillStyle = `rgba(230,233,242,${activeId && a.id === activeId ? 0.95 : 0.6})`;
+      ctx.fillStyle = `rgba(230,233,242,${isActive ? 0.95 : 0.6})`;
       ctx.shadowColor = "rgba(8,10,16,0.95)"; ctx.shadowBlur = 4;
       ctx.fillText(txt, a.x, a.y + a.r + 3);
       ctx.shadowBlur = 0;
@@ -1037,11 +1079,46 @@ async function renderGraphView() {
     (data.query ? ` · query “${data.query}”` : "");
 
   const canvas = $("cy");
-  if (!state.graph._gv) state.graph._gv = createGraphViz(canvas, { onSelect: renderNodeDetail });
+  if (!state.graph._gv) state.graph._gv = createGraphViz(canvas, { onSelect: renderNodeDetail, settings: GRAPH_SETTINGS });
   state.graph._gv.resize();
   state.graph._gv.setData(data);
   requestAnimationFrame(() => state.graph._gv.resize());
   renderGraphList(data);
+}
+
+// Bind one settings slider to GRAPH_SETTINGS. `live` sliders only reheat the
+// physics (no refetch); fetch sliders (node/edge limit) debounce a reload.
+let _sliderTimer = null;
+function wireSlider(id, key, opts) {
+  opts = opts || {};
+  const input = $(id), val = $(id + "-val");
+  const fmt = opts.fmt || ((v) => String(v));
+  input.addEventListener("input", () => {
+    const v = Number(input.value);
+    GRAPH_SETTINGS[key] = v;
+    if (val) val.textContent = fmt(v);
+    if (opts.live && state.graph._gv) state.graph._gv.reheat(0.6);
+    else {
+      clearTimeout(_sliderTimer);
+      _sliderTimer = setTimeout(() => renderGraphView(), opts.debounce || 250);
+    }
+    saveGraphUI();
+  });
+}
+function syncSlider(id, key, v) {
+  const input = $(id), val = $(id + "-val");
+  input.value = v; GRAPH_SETTINGS[key] = v;
+  if (val) val.textContent = (id === "gs-gravity") ? v.toFixed(3)
+    : (id === "gs-particles" || id === "gs-labelzoom") ? v.toFixed(1) : String(v);
+}
+function syncAllSliders() {
+  syncSlider("gs-repulsion", "repulsion", GRAPH_SETTINGS.repulsion);
+  syncSlider("gs-link", "linkDistance", GRAPH_SETTINGS.linkDistance);
+  syncSlider("gs-gravity", "gravity", GRAPH_SETTINGS.gravity);
+  syncSlider("gs-particles", "particleSpeed", GRAPH_SETTINGS.particleSpeed);
+  syncSlider("gs-labelzoom", "labelZoom", GRAPH_SETTINGS.labelZoom);
+  syncSlider("gs-nodes", "nodeLimit", GRAPH_SETTINGS.nodeLimit);
+  syncSlider("gs-edges", "edgeLimit", GRAPH_SETTINGS.edgeLimit);
 }
 
 function wireGraphControls() {
@@ -1076,8 +1153,32 @@ function wireGraphControls() {
     state.graph.full = !state.graph.full;
     $("graph-full").classList.toggle("graph-freeze-on", state.graph.full);
     $("graph-full").textContent = state.graph.full ? "● full graph" : "◯ full graph";
+    // Full mode shows the whole graph by default; bump the caps so the slider
+    // still lets the user dial it back down.
+    if (state.graph.full) { syncSlider("gs-nodes", "nodeLimit", 6000); syncSlider("gs-edges", "edgeLimit", 9000); }
+    else { syncSlider("gs-nodes", "nodeLimit", 50); syncSlider("gs-edges", "edgeLimit", 300); }
+    saveGraphUI();
     renderGraphView();
   });
+  $("graph-settings-btn").addEventListener("click", () => {
+    $("graph-settings").classList.toggle("hidden");
+    saveGraphUI();
+  });
+  $("gs-close").addEventListener("click", () => { $("graph-settings").classList.add("hidden"); saveGraphUI(); });
+  $("gs-reset").addEventListener("click", () => {
+    Object.assign(GRAPH_SETTINGS, GRAPH_SETTINGS_DEFAULTS);
+    syncAllSliders();
+    if (state.graph._gv) state.graph._gv.reheat(1);
+    saveGraphUI();
+  });
+  syncAllSliders();
+  wireSlider("gs-repulsion", "repulsion", { live: true, fmt: (v) => String(v) });
+  wireSlider("gs-link", "linkDistance", { live: true, fmt: (v) => String(v) });
+  wireSlider("gs-gravity", "gravity", { live: true, fmt: (v) => v.toFixed(3) });
+  wireSlider("gs-particles", "particleSpeed", { live: true, fmt: (v) => v.toFixed(1) });
+  wireSlider("gs-labelzoom", "labelZoom", { live: true, fmt: (v) => v.toFixed(1) });
+  wireSlider("gs-nodes", "nodeLimit", { fmt: (v) => String(v) });
+  wireSlider("gs-edges", "edgeLimit", { fmt: (v) => String(v) });
   $("graph-fit").addEventListener("click", () => {
     if (state.graph._gv) state.graph._gv.fit();
   });
@@ -1171,6 +1272,9 @@ async function init() {
     // Tear down the previous renderer when switching characters.
     if (state.graph._gv) { try { state.graph._gv.destroy(); } catch (err) {} }
     state.graph = { data: null, q: "", user: "", _gv: null, _wired: false };
+    // Reset the fetch-limit sliders (they get bumped when full mode is on).
+    GRAPH_SETTINGS.nodeLimit = 50; GRAPH_SETTINGS.edgeLimit = 300;
+    syncSlider("gs-nodes", "nodeLimit", 50); syncSlider("gs-edges", "edgeLimit", 300);
     $("q").value = "";
     $("graph-q").value = "";
     loadOverview();

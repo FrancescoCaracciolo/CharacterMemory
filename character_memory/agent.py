@@ -362,9 +362,12 @@ class CharacterAgent:
                 mem.rebuild_index()
                 mem.persist(path)
 
-        # Knowledge graph: load-or-ingest. Runs after the structured indexes
-        # so a fresh build reads the already-loaded rows. The graph never
-        # writes back to its sources (modules stay independent).
+        # Knowledge graph: load if persisted, otherwise build + persist. Runs
+        # after the structured indexes so a fresh build reads the already-loaded
+        # rows. The graph never writes back to its sources (modules stay
+        # independent). A persisted graph is loaded verbatim here -- to rebuild
+        # an existing one use rebuild_knowledge_graph() (kg-only) or rebuild()
+        # (everything); neither runs from build().
         kg = self.memories.get(_KG_MEMORY)
         if isinstance(kg, KnowledgeGraphMemory):
             kg_path = os.path.join(self.save_directory, "kg_index")
@@ -372,13 +375,11 @@ class CharacterAgent:
                 kg.load(kg_path)
             else:
                 kg.retriever.ingest(list(self.memories.values()))
-            # Wiki is folded into the graph as typed nodes (characters /
-            # entities / episodes) via an LLM pass. That is expensive, so only
-            # (re)run it when no wiki nodes are present yet; `rebuild()` always
-            # re-ingests. Idempotent inside the retriever.
-            if not kg.retriever._has_wiki_nodes():
+                # Wiki is folded into the graph as typed nodes (characters /
+                # entities / episodes) via an LLM pass. Expensive, so it only
+                # runs on a fresh build; re-running needs an explicit rebuild.
                 kg.retriever.ingest_wiki(self._wiki_sections())
-            kg.persist(kg_path)
+                kg.persist(kg_path)
         self._built = True
         return self
 
@@ -401,6 +402,29 @@ class CharacterAgent:
             kg.retriever.ingest_wiki(self._wiki_sections())
             kg.persist(os.path.join(self.save_directory, "kg_index"))
         self._built = True
+        return self
+
+    def rebuild_knowledge_graph(self) -> "CharacterAgent":
+        """Rebuild only the knowledge graph, leaving every other index alone.
+
+        Cheaper and more targeted than :meth:`rebuild` (which re-chunks the
+        character corpus and rebuilds the structured memories too). The graph
+        is rebuilt from the existing source-memory rows in SQLite and the
+        character's wiki sections, then persisted. Use this for a one-off KG
+        refresh -- e.g. ``charactermemory-server --rebuild-kg kurisu``.
+        """
+        self._require_loaded()
+        assert self.store is not None
+        kg = self.memories.get(_KG_MEMORY)
+        if not isinstance(kg, KnowledgeGraphMemory):
+            raise RuntimeError(
+                f"Character {self.character_name!r} does not have the "
+                f"knowledge_graph memory enabled; nothing to rebuild."
+            )
+        kg.retriever.reset()
+        kg.retriever.ingest(list(self.memories.values()))
+        kg.retriever.ingest_wiki(self._wiki_sections())
+        kg.persist(os.path.join(self.save_directory, "kg_index"))
         return self
 
     def persist_structured(self) -> None:
