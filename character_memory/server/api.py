@@ -46,7 +46,6 @@ from pydantic import BaseModel, Field
 
 from character_memory import (
     CharacterAgent,
-    CharacterManifest,
     EmbeddingConfig,
     LLMConfig,
     MemoryConfig,
@@ -124,20 +123,29 @@ def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
         if not os.path.isdir(char_dir):
             continue
         marker = os.path.join(char_dir, ".knowledge_graph")
-        # The manifest carries persisted per-character toggles/persona; layer the
-        # KG opt-in (env override or `.knowledge_graph` marker) on top so it
-        # stays the single source of truth for "is the graph on".
-        memory_config = CharacterManifest.load(char_dir, name=name).to_memory_config()
-        if name in kg_chars or os.path.isfile(marker):
-            memory_config.enabled_knowledge_graph = True
-        # `prompt_config` and `persona` are read from the manifest inside the
-        # agent constructor, so they don't need to be passed here.
+        config_path = os.path.join(char_dir, "config.yaml")
         agent = CharacterAgent(
             directory=char_dir,
             name=name,
             save_directory=os.path.join(SAVE_ROOT, name),
         )
-        agent.load_from_config(LLMConfig(), EmbeddingConfig(), memory_config)
+        # Prefer the per-character config.yaml when present (it carries every
+        # override: prompts, memory toggles, persona, sub-configs). Otherwise
+        # fall back to dataclass defaults + a plain MemoryConfig. The KG opt-in
+        # (env override or `.knowledge_graph` marker) is layered on top either
+        # way so it stays the single source of truth for "is the graph on".
+        if os.path.isfile(config_path):
+            agent.load_from_config(config_path)
+            if (name in kg_chars or os.path.isfile(marker)) and agent.config is not None:
+                agent.config.memory.enabled_knowledge_graph = True
+                # Rebuild memories with the KG toggle flipped: load_from_config
+                # already wired the standard memories without KG, so reload.
+                agent.load_from_config(agent.config)
+        else:
+            memory_config = MemoryConfig()
+            if name in kg_chars or os.path.isfile(marker):
+                memory_config.enabled_knowledge_graph = True
+            agent.load_from_config(LLMConfig(), EmbeddingConfig(), memory_config)
         agent.build()  # load-or-build (idempotent); KG is loaded, not rebuilt
         agents[name] = agent
     # Apply a requested KG rebuild once all agents are built, using the shared
@@ -341,6 +349,7 @@ def read_graph(
     user: Optional[str] = Query(None, description="Bias the user's own PersonNode."),
     limit: int = Query(50, ge=1, le=6000, description="Max nodes to return by activation."),
     hops: int = Query(1, ge=0, le=2, description="Subgraph expansion hops around top nodes."),
+    max_edges: int = Query(400, ge=0, le=12000, description="Max edges to return."),
     include_co_occurrence: bool = Query(False, description="Include co_occurrence edges (default on in full mode)."),
     full: bool = Query(False, description="Return the whole graph (retrieved nodes flagged)."),
     retrieve_k: int = Query(30, ge=1, le=500, description="Top-k nodes flagged 'retrieved' when full."),
@@ -364,7 +373,7 @@ def read_graph(
         )
     try:
         return read_graph_view(
-            agent, q=q, user=user, limit=limit, hops_subgraph=hops,
+            agent, q=q, user=user, limit=limit, hops_subgraph=hops, max_edges=max_edges,
             include_co_occurrence=include_co_occurrence, full=full, retrieve_k=retrieve_k,
         )
     except KeyError:

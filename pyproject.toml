@@ -32,6 +32,8 @@ dependencies = [
     "rank-bm25>=0.2.2",
     # Tokenization for header-based chunking budgets
     "tiktoken>=0.13",
+    # Per-character config.yaml (prompts + sub-configs).
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

@@ -41,10 +41,15 @@ from pydantic import BaseModel, Field
 
 from character_memory import (
     CharacterAgent,
-    CharacterManifest,
     EmbeddingConfig,
     LLMConfig,
     MemoryConfig,
+)
+from character_memory.character_config import (
+    default_config_yaml,
+    load_config,
+    path_for as config_path_for,
+    save_config,
 )
 from character_memory.manifest import MEMORY_NAMES
 
@@ -207,17 +212,14 @@ def build_admin_router(
         }
 
     def _reload_agent(name: str, *, rebuild_indexes: bool = False) -> CharacterAgent:
-        """Drop the cached agent and rebuild it from disk (manifest + files).
+        """Drop the cached agent and rebuild it from disk (config.yaml + files).
 
         ``rebuild_indexes=False`` keeps the existing persisted indexes (cheap —
         used after a config change). ``True`` forces a full re-chunk + re-index
         via :meth:`CharacterAgent.rebuild`.
         """
         char_dir = _char_dir(name)
-        manifest = CharacterManifest.load(char_dir, name=name)
-        mem_cfg = manifest.to_memory_config()
-        if os.path.isfile(os.path.join(char_dir, ".knowledge_graph")):
-            mem_cfg.enabled_knowledge_graph = True
+        config_path = config_path_for(char_dir)
         old = agents.get(name)
         if old is not None:
             try:
@@ -229,7 +231,18 @@ def build_admin_router(
             name=name,
             save_directory=_save_dir(name),
         )
-        agent.load_from_config(LLMConfig(), EmbeddingConfig(), mem_cfg)
+        # Prefer config.yaml; fall back to defaults when absent (legacy
+        # character with only Information/ + Dialogues/ on disk).
+        if os.path.isfile(config_path):
+            agent.load_from_config(config_path)
+            if os.path.isfile(os.path.join(char_dir, ".knowledge_graph")) and agent.config is not None:
+                agent.config.memory.enabled_knowledge_graph = True
+                agent.load_from_config(agent.config)
+        else:
+            mem_cfg = MemoryConfig()
+            if os.path.isfile(os.path.join(char_dir, ".knowledge_graph")):
+                mem_cfg.enabled_knowledge_graph = True
+            agent.load_from_config(LLMConfig(), EmbeddingConfig(), mem_cfg)
         if rebuild_indexes:
             agent.rebuild()
         else:
@@ -259,11 +272,13 @@ def build_admin_router(
                 status_code=409,
                 detail=f"A character named {name!r} already exists.",
             )
-        # Scaffold the folder layout the chunkers expect + a fresh manifest.
+        # Scaffold the folder layout the chunkers expect + a fresh config.yaml
+        # carrying every default (prompts + sub-configs) the GUI can later edit.
         os.makedirs(os.path.join(_char_dir(name), BUCKETS["information"]))
         os.makedirs(os.path.join(_char_dir(name), BUCKETS["dialogues"]))
-        manifest = CharacterManifest(name=name)
-        manifest.save(_char_dir(name))
+        config_path = config_path_for(_char_dir(name))
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(default_config_yaml(name=name))
         agent = _reload_agent(name)
         return _scan_character(agent.character_name)
 
@@ -288,19 +303,17 @@ def build_admin_router(
     @router.get("/characters/{name}/config")
     def get_config(name: str) -> dict:
         _require_existing(name)
-        manifest = CharacterManifest.load(_char_dir(name), name=name)
-        # Project onto a default MemoryConfig so unset fields show their library
-        # defaults — the GUI reads `enabled_<m>` / `<m>_k` literally.
-        mem = manifest.to_memory_config()
+        loaded = load_config(_char_dir(name))
+        mem = loaded.config.memory
         memory_view = {}
         for m in MEMORY_NAMES:
-            memory_view[f"enabled_{m}"] = getattr(mem, f"enabled_{m}")
+            memory_view[f"enabled_{m}"] = getattr(mem, f"enabled_{m}", False)
             if hasattr(mem, f"{m}_k"):
                 memory_view[f"{m}_k"] = getattr(mem, f"{m}_k")
         marker = os.path.join(_char_dir(name), ".knowledge_graph")
         return {
             "name": name,
-            "persona": manifest.persona,
+            "persona": loaded.persona,
             "kg_enabled": os.path.isfile(marker) or mem.enabled_knowledge_graph,
             "memory": memory_view,
         }
@@ -309,37 +322,44 @@ def build_admin_router(
     def put_config(name: str, patch: ConfigPatch) -> dict:
         _require_existing(name)
         char_dir = _char_dir(name)
-        manifest = CharacterManifest.load(char_dir, name=name)
 
+        # Load the current file (or defaults), apply the patch, persist back.
+        loaded = load_config(char_dir)
+        cfg = loaded.config
+        prompts = loaded.prompts
+        persona = loaded.persona
         if patch.persona is not None:
-            manifest.persona = patch.persona
+            persona = patch.persona
         if patch.memory:
-            # Merge into the manifest's override maps so unset keys keep their
-            # current/library default rather than being wiped.
-            enabled = dict(manifest.enabled)
-            k_sizes = dict(manifest.k_sizes)
+            mem = cfg.memory
             for key, val in patch.memory.items():
                 if key.startswith("enabled_") and key[len("enabled_"):] in MEMORY_NAMES:
-                    enabled[key[len("enabled_"):]] = bool(val)
+                    setattr(mem, key, bool(val))
                 elif key.endswith("_k") and key[:-2] in MEMORY_NAMES:
                     try:
-                        k_sizes[key[:-2]] = int(val)
+                        setattr(mem, key, int(val))
                     except (TypeError, ValueError):
                         pass
-            manifest.enabled = enabled
-            manifest.k_sizes = k_sizes
-        manifest.save(char_dir)
-
-        # KG toggle = marker file on/off. Marker is the single source of truth
-        # the discovery step consults, so toggling it is enough.
+        # KG toggle: set the YAML field AND manage the `.knowledge_graph`
+        # marker the discovery step consults.
         marker = os.path.join(char_dir, ".knowledge_graph")
-        kg_on = patch.kg_enabled
-        if kg_on is True and not os.path.isfile(marker):
-            with open(marker, "w", encoding="utf-8") as f:
-                f.write("# knowledge graph enabled via the configurator\n")
-        elif kg_on is False and os.path.isfile(marker):
-            os.remove(marker)
+        if patch.kg_enabled is True:
+            cfg.memory.enabled_knowledge_graph = True
+            if not os.path.isfile(marker):
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write("# knowledge graph enabled via the configurator\n")
+        elif patch.kg_enabled is False:
+            cfg.memory.enabled_knowledge_graph = False
+            if os.path.isfile(marker):
+                os.remove(marker)
 
+        save_config(
+            char_dir,
+            config=cfg,
+            prompts=prompts,
+            persona=persona,
+            name=name,
+        )
         # Reload so toggles/persona take effect in the live agent.
         _reload_agent(name)
         return get_config(name)

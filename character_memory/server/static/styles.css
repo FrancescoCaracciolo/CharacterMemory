@@ -273,6 +273,11 @@ select option { background: var(--bg-2); }
   padding: 5px 8px; font: 500 11px var(--mono); cursor: pointer;
 }
 .gs-reset:hover { color: var(--text); background: var(--bg-3); }
+.gs-check {
+  display: flex; align-items: center; gap: 6px; margin-top: 3px;
+  font: 500 11px var(--mono); color: var(--text-dim); cursor: pointer;
+}
+.gs-check input { accent-color: var(--accent, #6fb7ef); cursor: pointer; }
 .gs-row {
   display: grid; grid-template-columns: 1fr auto; align-items: center;
   gap: 3px 8px;

@@ -644,7 +644,10 @@ def read_graph(
     else:
         node_budget = max(1, min(200, int(limit or 50)))
         edge_budget = max(0, min(2000, int(max_edges or 0)))
-        include_co = bool(include_co_occurrence)
+        # Always include co_occurrence edges in the subgraph: many characters'
+        # knowledge graphs are co_occurrence-dominant, and dropping them would
+        # leave a graph of isolated dots with no visible structure.
+        include_co = True
 
     # Compute activations (read-only).
     if q and q.strip():

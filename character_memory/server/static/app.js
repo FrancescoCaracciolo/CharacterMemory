@@ -586,6 +586,8 @@ const GRAPH_SETTINGS = {
   labelZoom: 2.4,       // zoom level at which all labels appear
   nodeLimit: 50,        // nodes fetched (subgraph mode)
   edgeLimit: 300,       // edges fetched
+  hideSparse: false,    // drop episode/fact with <2 structural edges
+  hideEpFact: false,    // drop every episode/fact node
 };
 const GRAPH_SETTINGS_DEFAULTS = { ...GRAPH_SETTINGS };
 
@@ -1052,6 +1054,42 @@ function createGraphViz(canvas, opts) {
   };
 }
 
+// Drop episode/fact nodes based on two toggles:
+//  - hideSparse: hide episode/fact with fewer than two *structural* edges
+//    (co_occurrence edges are noisy and do not count toward the threshold).
+//  - hideEpFact: hide every episode/fact node entirely.
+// Applied client-side so toggling is instant (no refetch). The raw fetched
+// payload is preserved in state.graph.data for re-filtering.
+const GRAPH_LEAF_KINDS = new Set(["episode", "fact"]);
+function filterGraphData(data) {
+  if (!GRAPH_SETTINGS.hideSparse && !GRAPH_SETTINGS.hideEpFact) return data;
+  // Degree counts only structural (non-co_occurrence) edges.
+  const deg = new Map();
+  for (const e of data.edges) {
+    if (e.kind === "co_occurrence") continue;
+    deg.set(e.src, (deg.get(e.src) || 0) + 1);
+    deg.set(e.dst, (deg.get(e.dst) || 0) + 1);
+  }
+  const keep = new Set();
+  for (const n of data.nodes) {
+    if (GRAPH_LEAF_KINDS.has(n.kind)) {
+      if (GRAPH_SETTINGS.hideEpFact) continue;
+      if (GRAPH_SETTINGS.hideSparse && (deg.get(n.id) || 0) < 2) continue;
+    }
+    keep.add(n.id);
+  }
+  return {
+    ...data,
+    nodes: data.nodes.filter(n => keep.has(n.id)),
+    edges: data.edges.filter(e => keep.has(e.src) && keep.has(e.dst)),
+  };
+}
+function applyGraphFilter() {
+  if (!state.graph.data || !state.graph._gv) return;
+  state.graph._gv.setData(filterGraphData(state.graph.data));
+  requestAnimationFrame(() => state.graph._gv.resize());
+}
+
 async function renderGraphView() {
   if (!state.graph._wired) wireGraphControls();
   $("graph-user").value = state.user || "";
@@ -1072,18 +1110,19 @@ async function renderGraphView() {
   }
   state.graph.data = data;
   $("status").classList.add("hidden");
+  const view = filterGraphData(data);
   const trunc = data.truncated ? " (truncated)" : "";
   $("graph-meta").textContent =
-    `${data.nodes.length} nodes · ${data.edges.length} edges${trunc}` +
+    `${view.nodes.length} nodes · ${view.edges.length} edges${trunc}` +
     (data.mode === "full" ? " · full" : "") +
     (data.query ? ` · query “${data.query}”` : "");
 
   const canvas = $("cy");
   if (!state.graph._gv) state.graph._gv = createGraphViz(canvas, { onSelect: renderNodeDetail, settings: GRAPH_SETTINGS });
   state.graph._gv.resize();
-  state.graph._gv.setData(data);
+  state.graph._gv.setData(view);
   requestAnimationFrame(() => state.graph._gv.resize());
-  renderGraphList(data);
+  renderGraphList(view);
 }
 
 // Bind one settings slider to GRAPH_SETTINGS. `live` sliders only reheat the
@@ -1119,6 +1158,19 @@ function syncAllSliders() {
   syncSlider("gs-labelzoom", "labelZoom", GRAPH_SETTINGS.labelZoom);
   syncSlider("gs-nodes", "nodeLimit", GRAPH_SETTINGS.nodeLimit);
   syncSlider("gs-edges", "edgeLimit", GRAPH_SETTINGS.edgeLimit);
+  syncCheckbox("gs-hide-sparse", "hideSparse");
+  syncCheckbox("gs-hide-epfact", "hideEpFact");
+}
+function wireCheckbox(id, key) {
+  const el = $(id);
+  el.addEventListener("change", () => {
+    GRAPH_SETTINGS[key] = el.checked;
+    applyGraphFilter();
+    saveGraphUI();
+  });
+}
+function syncCheckbox(id, key) {
+  const el = $(id); if (el) el.checked = !!GRAPH_SETTINGS[key];
 }
 
 function wireGraphControls() {
@@ -1168,6 +1220,7 @@ function wireGraphControls() {
   $("gs-reset").addEventListener("click", () => {
     Object.assign(GRAPH_SETTINGS, GRAPH_SETTINGS_DEFAULTS);
     syncAllSliders();
+    applyGraphFilter();
     if (state.graph._gv) state.graph._gv.reheat(1);
     saveGraphUI();
   });
@@ -1179,6 +1232,8 @@ function wireGraphControls() {
   wireSlider("gs-labelzoom", "labelZoom", { live: true, fmt: (v) => v.toFixed(1) });
   wireSlider("gs-nodes", "nodeLimit", { fmt: (v) => String(v) });
   wireSlider("gs-edges", "edgeLimit", { fmt: (v) => String(v) });
+  wireCheckbox("gs-hide-sparse", "hideSparse");
+  wireCheckbox("gs-hide-epfact", "hideEpFact");
   $("graph-fit").addEventListener("click", () => {
     if (state.graph._gv) state.graph._gv.fit();
   });
@@ -1274,7 +1329,10 @@ async function init() {
     state.graph = { data: null, q: "", user: "", _gv: null, _wired: false };
     // Reset the fetch-limit sliders (they get bumped when full mode is on).
     GRAPH_SETTINGS.nodeLimit = 50; GRAPH_SETTINGS.edgeLimit = 300;
+    GRAPH_SETTINGS.hideSparse = false; GRAPH_SETTINGS.hideEpFact = false;
     syncSlider("gs-nodes", "nodeLimit", 50); syncSlider("gs-edges", "edgeLimit", 300);
+    syncCheckbox("gs-hide-sparse", "hideSparse");
+    syncCheckbox("gs-hide-epfact", "hideEpFact");
     $("q").value = "";
     $("graph-q").value = "";
     loadOverview();

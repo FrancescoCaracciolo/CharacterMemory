@@ -1,5 +1,12 @@
 """Persisted per-character manifest.
 
+.. deprecated::
+    Superseded by :mod:`character_memory.character_config` and the comprehensive
+    ``config.yaml`` format. The agent no longer reads or writes
+    ``character.json``; the new loader reads a legacy manifest for one-way
+    migration only. This module is kept importable so older scripts that
+    construct ``CharacterManifest`` directly keep working.
+
 Historically a "character" was *only* a directory (``assets/<Name>/`` with
 ``Information/`` + ``Dialogues/`` subfolders). Its identity (persona), the
 prompt templates, and every memory toggle lived exclusively in Python code —

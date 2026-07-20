@@ -53,7 +53,7 @@ from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
 from .memory.user_summary import UserSummaryMemory
-from .manifest import CharacterManifest
+from .character_config import load_from_character_dir
 from .prompts import PromptConfig
 from .rag.hybrid import HybridSearch
 
@@ -87,19 +87,20 @@ class CharacterAgent:
         self.character_dir = directory
         self.character_name = name or os.path.basename(os.path.normpath(directory))
         self.save_directory = save_directory or os.path.join(directory, ".cm_data")
-        # Persisted per-character config (character.json). When absent the
-        # fallback is a synthesised default using the folder/name — see
-        # CharacterManifest.load. Explicit constructor args always win; the
-        # manifest only fills in what the caller left at its dataclass default.
-        self.manifest = CharacterManifest.load(directory, name=self.character_name)
-        self.prompts = prompt_config or self.manifest.to_prompt_config()
+        self.prompts = prompt_config or PromptConfig()
+        # Whether `prompt_config` was explicitly passed. Used by
+        # `load_from_config(path)` to decide whether the file's prompts should
+        # win (constructor arg wins when explicitly provided).
+        self._prompts_explicit = prompt_config is not None
         # Short character blurb surfaced to the extractor (and the answer prompt)
         # so the model knows who the character is. Auto-summarizing the
         # Information/*.md into a blurb is intentionally out of scope; callers
-        # pass this in if they want the persona clause populated. The explicit
-        # constructor arg wins; otherwise fall back to whatever the persisted
-        # manifest records (empty for a fresh character).
-        self.persona = persona or self.manifest.persona
+        # pass this in if they want the persona clause populated. May also be
+        # loaded from `config.yaml` via `load_from_config(path)`.
+        self.persona = persona
+        # Path of the config.yaml last loaded, when `load_from_config(path)`
+        # was used. None until then.
+        self.config_path: Optional[str] = None
 
         # Not wired until load_* is called.
         self.config: Optional[CharacterMemoryConfig] = None
@@ -124,7 +125,7 @@ class CharacterAgent:
     # Loading
     def load_from_config(
         self,
-        llm_config: Optional[LLMConfig] = None,
+        config_or_path: Union[str, os.PathLike, "CharacterMemoryConfig", None] = None,
         embedding_config: Optional[EmbeddingConfig] = None,
         memory_config: Optional[MemoryConfig] = None,
         chunking_config: Optional[ChunkingConfig] = None,
@@ -133,26 +134,48 @@ class CharacterAgent:
         embedder: Optional[EmbeddingProvider] = None,
         config: Optional[CharacterMemoryConfig] = None,
     ) -> "CharacterAgent":
-        """Wire backends from config objects.
+        """Wire backends from config objects or a ``config.yaml`` path.
 
-        Either pass a top-level `config` (a full
-        `CharacterMemoryConfig`) or any combination of the individual
-        sub-configs; omitted ones default to their dataclass defaults.
-        `llm` / `embedder` let you override the auto-built OpenAI clients.
+        Three call styles, all valid:
+
+        * ``load_from_config("path/to/config.yaml")`` — load a persisted
+          per-character YAML (persona, prompts, every sub-config). The
+          file is the single source of truth for the character.
+        * ``load_from_config(CharacterMemoryConfig(...))`` — pass a full
+          in-memory config object as the first positional arg.
+        * ``load_from_config(llm_config, embedding_config, memory_config,
+          chunking_config)`` — the original positional-subconfig style.
+
+        ``llm`` / ``embedder`` let you override the auto-built OpenAI clients.
+        Constructor persona/prompt args always win; the YAML only fills what
+        the caller did not set explicitly.
         """
-        if config is not None:
+        # Case 1: a path to config.yaml. Load persona + prompts + full config.
+        full: CharacterMemoryConfig
+        if isinstance(config_or_path, (str, os.PathLike)):
+            loaded = load_from_character_dir(os.fspath(config_or_path))
+            self.config_path = os.fspath(config_or_path)
+            full = loaded.config
+            # Constructor args win over the file. `self.persona` was set in
+            # __init__ from the persona=... arg; only adopt the file's when the
+            # caller did not pass one. `self.prompts` likewise — if the caller
+            # passed prompt_config, __init__ already stored it; otherwise adopt
+            # the file's.
+            if not self.persona and loaded.persona:
+                self.persona = loaded.persona
+            if self._prompts_explicit is not True:
+                self.prompts = loaded.prompts
+        elif isinstance(config_or_path, CharacterMemoryConfig):
+            full = config_or_path
+        elif config is not None:
             full = config
         else:
-            # The manifest carries per-character toggles (`enabled_*` / `*_k`)
-            # and persona overrides. Apply it over the default MemoryConfig when
-            # the caller did not pass one explicitly, so a persisted character
-            # rehydrates its toggles on load. KG opt-in via `.knowledge_graph`
-            # marker is applied separately by the server discover step.
-            mem_cfg = memory_config or self.manifest.to_memory_config()
+            # config_or_path is the legacy llm_config positional.
+            llm_config = config_or_path if isinstance(config_or_path, LLMConfig) else None
             full = CharacterMemoryConfig(
                 llm=llm_config or LLMConfig(),
                 embedding=embedding_config or EmbeddingConfig(),
-                memory=mem_cfg,
+                memory=memory_config or MemoryConfig(),
                 chunking=chunking_config or ChunkingConfig(),
             )
         self.config = full
