@@ -13,6 +13,11 @@ import json
 import os
 from typing import Any, Optional
 
+try:
+    import fcntl
+except ImportError:  # Windows / non-POSIX: fall back to atomic-rename only.
+    fcntl = None
+
 import faiss
 import numpy as np
 
@@ -165,16 +170,35 @@ class HybridSearch(RAGSystem):
         ]
 
     def persist(self, path: str) -> None:
+        """Persist nodes + dense index to `path` atomically and cross-process safe.
+
+        Writes both files via temp + ``os.replace`` (POSIX-atomic), under an
+        exclusive ``flock`` on ``<path>/.lock``. This prevents torn writes and
+        interleaved writes when the cm_server and the Discord bot persist the
+        same index concurrently. The lock is per index directory, matching the
+        existing per-character in-process lock convention; it is auto-released
+        by the OS on close/exit, so a crash can't leave it stuck.
+        """
         os.makedirs(path, exist_ok=True)
         nodes_json = [
             {"id": n.metadata.get("id", i), "text": n.text,
              "source": n.metadata.get("source", ""), "metadata": n.metadata}
             for i, n in enumerate(self._nodes)
         ]
-        with open(os.path.join(path, "nodes.json"), "w", encoding="utf-8") as f:
-            json.dump(nodes_json, f, ensure_ascii=False)
-        if self._index is not None:
-            faiss.write_index(self._index, os.path.join(path, "faiss.index"))
+        lock_path = os.path.join(path, ".lock")
+        # "a+" keeps an existing lock file without truncating it; the file's
+        # contents are never read, it only anchors the flock.
+        with open(lock_path, "a+") as lock_f:
+            if fcntl is not None:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            nodes_tmp = os.path.join(path, "nodes.json.tmp")
+            with open(nodes_tmp, "w", encoding="utf-8") as f:
+                json.dump(nodes_json, f, ensure_ascii=False)
+            os.replace(nodes_tmp, os.path.join(path, "nodes.json"))
+            if self._index is not None:
+                idx_tmp = os.path.join(path, "faiss.index.tmp")
+                faiss.write_index(self._index, idx_tmp)
+                os.replace(idx_tmp, os.path.join(path, "faiss.index"))
 
     def load(self, path: str) -> None:
         with open(os.path.join(path, "nodes.json"), encoding="utf-8") as f:
@@ -208,4 +232,6 @@ class HybridSearch(RAGSystem):
             self._build_faiss()
             # Persist the corrected index so later loads are fast.
             if os.path.exists(idx_file):
-                faiss.write_index(self._index, idx_file)
+                idx_tmp = idx_file + ".tmp"
+                faiss.write_index(self._index, idx_tmp)
+                os.replace(idx_tmp, idx_file)
