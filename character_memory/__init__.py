@@ -33,6 +33,7 @@ from .llm import (
     OpenAICompatibleEmbeddings,
     OpenAICompatibleLLM,
 )
+from .llm.base import LLMResponse
 from .memory import (
     CharacterInfoMemory,
     DialogueStyleMemory,
@@ -60,6 +61,20 @@ from .knowledge_graph import (
 from .manifest import MEMORY_NAMES, CharacterManifest
 from .prompts import PromptConfig
 from .rag import Hit, HybridSearch, RAGSystem
+from .tools import (
+    TextChunk,
+    Tool,
+    ToolCall,
+    ToolCallEvent,
+    ToolRegistry,
+    ToolResult,
+    ToolResultEvent,
+    get_tool,
+    global_registry,
+    memory_tools,
+    register_tool,
+    tool,
+)
 
 __version__ = "0.1.0"
 
@@ -79,9 +94,23 @@ __all__ = [
     "CharacterManifest",
     "MEMORY_NAMES",
     "LLMClient",
+    "LLMResponse",
     "EmbeddingProvider",
     "OpenAICompatibleLLM",
     "OpenAICompatibleEmbeddings",
+    # Tool calling
+    "Tool",
+    "ToolCall",
+    "ToolResult",
+    "ToolRegistry",
+    "tool",
+    "register_tool",
+    "get_tool",
+    "global_registry",
+    "memory_tools",
+    "TextChunk",
+    "ToolCallEvent",
+    "ToolResultEvent",
     "RAGSystem",
     "HybridSearch",
     "Hit",

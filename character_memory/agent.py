@@ -27,7 +27,7 @@ Prompt assembly and per-memory extraction are delegated to a
 
 import os
 import time
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Iterable, Iterator, Optional, Union
 
 from .chat import Chat, _ChatBackend
 from .chunking.registry import get_chunker
@@ -57,6 +57,16 @@ from .character_config import load_from_character_dir
 from .prompts import PromptConfig
 from .rag.base import Query
 from .rag.hybrid import HybridSearch
+from .tools.base import (
+    TextChunk,
+    Tool,
+    ToolCall,
+    ToolCallEvent,
+    ToolResult,
+    ToolResultEvent,
+)
+from .tools.memory_tools import memory_tools as _build_memory_tools
+from .tools.registry import ToolRegistry
 
 _INFO_GLOB = "Information"
 _DIALOGUE_GLOB = "Dialogues"
@@ -71,6 +81,31 @@ _KG_MEMORY = "knowledge_graph"
 # Anything generate_answer / build_context / render_prompt accepts as a
 # conversation target.
 Target = Union[Chat, str, list[dict[str, str]]]
+
+# What `generate_answer(tools=...)` accepts: a registry, a single Tool, or a
+# list of tools/callables (callables are wrapped via the @tool decorator).
+ToolsArg = Union[ToolRegistry, Tool, Iterable]
+
+
+def _as_registry(tools: ToolsArg) -> ToolRegistry:
+    """Normalise the ``tools`` argument into a :class:`ToolRegistry`.
+
+    A registry passes through; a single Tool / callable wraps in a fresh
+    registry; an iterable builds one. Callables are auto-decorated, so you can
+    hand ``generate_answer`` a list of plain functions.
+    """
+    if isinstance(tools, ToolRegistry):
+        return tools
+    if isinstance(tools, Tool) or callable(tools):
+        return ToolRegistry([tools])
+    return ToolRegistry(tools)
+
+
+def _json_dumps(obj: Any) -> str:
+    """``json.dumps`` with ``ensure_ascii=False`` (used for tool-call args)."""
+    import json
+
+    return json.dumps(obj, ensure_ascii=False)
 
 
 class CharacterAgent:
@@ -663,7 +698,10 @@ class CharacterAgent:
         stream: bool = False,
         save: bool = True,
         user_id: str = "default",
-    ) -> Union[str, Iterator[str]]:
+        tools: Optional[ToolsArg] = None,
+        max_tool_iterations: int = 8,
+        tool_choice: Optional[Any] = None,
+    ) -> Union[str, Iterator[Any]]:
         """Generate an assistant reply for `target`.
 
         `target` is a `Chat`, a chat id, or a raw list of openai-style
@@ -673,6 +711,29 @@ class CharacterAgent:
         fires on the configured interval. `stream=True` returns an iterator
         of text chunks (the full reply is still persisted once the stream
         completes when `save` is true).
+
+        Tool calling (opt-in):
+
+        * `tools` — a :class:`~character_memory.tools.ToolRegistry`, a single
+          :class:`~character_memory.tools.Tool`, or a list of either. Pass
+          :meth:`memory_tools` for the built-in memory self-tools. When
+          provided, the agent runs a model → tool → model loop and returns the
+          final text reply.
+        * `max_tool_iterations` caps how many tool rounds the loop will run
+          before forcing a plain-text reply (default 8).
+        * `tool_choice` follows the OpenAI convention (``"auto"``, ``"none"``,
+          ``"required"``, or a specific tool). ``None`` lets the backend pick.
+
+        Streaming + tools: with ``stream=True`` and ``tools`` set, the return
+        value is an iterator of :class:`~character_memory.tools.TextChunk` /
+        :class:`~character_memory.tools.ToolCallEvent` /
+        :class:`~character_memory.tools.ToolResultEvent` events. Without
+        tools, ``stream=True`` keeps the legacy plain-text-chunk behaviour.
+
+        Persistence: only the final assistant **text** reply is written to the
+        chat. Intermediate tool-call / tool-result messages stay in memory for
+        the loop and are never persisted, so chat history and extraction stay
+        clean.
         """
         self._require_loaded()
         assert self.llm is not None
@@ -686,11 +747,177 @@ class CharacterAgent:
         elif isinstance(target, str):
             chat = self._as_chat(target)
 
+        # No tools → legacy single-shot path, bit-for-bit unchanged.
+        if tools is None:
+            if stream:
+                return self._stream_answer(messages, chat, save, uid)
+            reply = self.llm.chat(messages)
+            self._after_generate(chat, save, reply)
+            return reply
+
+        registry = _as_registry(tools)
+        if len(registry) == 0:
+            # Empty tool set is equivalent to no tools; don't insist on a
+            # tool-calling client for it.
+            if stream:
+                return self._stream_answer(messages, chat, save, uid)
+            reply = self.llm.chat(messages)
+            self._after_generate(chat, save, reply)
+            return reply
+
         if stream:
-            return self._stream_answer(messages, chat, save, uid)
-        reply = self.llm.chat(messages)
+            return self._stream_answer_with_tools(
+                messages, registry, chat, save, uid,
+                max_tool_iterations=max_tool_iterations, tool_choice=tool_choice,
+            )
+        reply = self._generate_with_tools(
+            messages, registry,
+            max_tool_iterations=max_tool_iterations, tool_choice=tool_choice,
+        )
         self._after_generate(chat, save, reply)
         return reply
+
+    # ------------------------------------------------------------------ #
+    # Tool-calling loop
+    # ------------------------------------------------------------------ #
+    def _generate_with_tools(
+        self,
+        messages: list[dict],
+        registry: ToolRegistry,
+        *,
+        max_tool_iterations: int,
+        tool_choice: Optional[Any],
+    ) -> str:
+        """Non-streaming model↔tool loop; returns the final assistant text.
+
+        Each round appends the assistant tool-call message + one ``tool``-role
+        message per call to the in-memory ``messages`` list. Those intermediate
+        messages are never persisted — only the returned final text is saved by
+        the caller. The loop stops when the model returns plain text (no tool
+        calls) or when ``max_tool_iterations`` is reached.
+        """
+        assert self.llm is not None
+        schemas = registry.schemas()
+        for _ in range(max(1, max_tool_iterations)):
+            resp = self.llm.chat_with_tools(
+                messages, schemas, tool_choice=tool_choice,
+            )
+            if not resp.has_tool_calls:
+                return resp.content
+            # Append the assistant turn carrying the tool calls (the API needs
+            # the exact tool_calls payload echoed back), then the results.
+            messages.append(self._assistant_tool_message(resp.content, resp.tool_calls))
+            for tc in resp.tool_calls:
+                result = registry.execute(tc.name, tc.arguments)
+                # Stamp the correlation id so the backend can pair request/result.
+                result.call.id = tc.id
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tc.name,
+                    "content": result.text,
+                })
+        # Out of iterations: ask once more for a plain-text answer, no tools.
+        resp = self.llm.chat_with_tools(messages, schemas, tool_choice="none")
+        return resp.content
+
+    def _stream_answer_with_tools(
+        self,
+        messages: list[dict],
+        registry: ToolRegistry,
+        chat: Optional[Chat],
+        save: bool,
+        user_id: str,
+        *,
+        max_tool_iterations: int,
+        tool_choice: Optional[Any],
+    ) -> Iterator[Any]:
+        """Streaming model↔tool loop.
+
+        Yields the event union (:class:`TextChunk` / :class:`ToolCallEvent` /
+        :class:`ToolResultEvent`). Each tool round streams its text/ToolCall
+        events; the :class:`ToolCallEvent` already carries the *fully
+        assembled* calls (the client accumulates OpenAI's argument fragments),
+        so the loop uses those directly — no second model call per round. The
+        final assistant text streams as text chunks; the concatenated text is
+        persisted once the generator closes (when ``save`` and a chat is
+        bound), matching the plain-stream save semantics.
+        """
+        assert self.llm is not None
+        schemas = registry.schemas()
+        collected: list[str] = []
+        for _ in range(max(1, max_tool_iterations)):
+            round_calls: list[ToolCall] = []
+            round_content: list[str] = []
+            has_calls = False
+            for ev in self.llm.chat_with_tools_stream(
+                messages, schemas, tool_choice=tool_choice,
+            ):
+                if isinstance(ev, TextChunk):
+                    collected.append(ev.text)
+                    round_content.append(ev.text)
+                    yield ev
+                elif isinstance(ev, ToolCallEvent):
+                    has_calls = True
+                    round_calls = ev.calls
+                    yield ev
+            if not has_calls:
+                # Plain-text reply (streamed above); done.
+                if save and chat is not None:
+                    self._after_generate(chat, True, "".join(collected))
+                return
+            # The ToolCallEvent carried the completed calls; use them to extend
+            # the transcript and execute the tools (one ToolResultEvent each).
+            content = "".join(round_content)
+            messages.append(self._assistant_tool_message(content, round_calls))
+            for tc in round_calls:
+                result = registry.execute(tc.name, tc.arguments)
+                result.call.id = tc.id
+                yield ToolResultEvent(result)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tc.name,
+                    "content": result.text,
+                })
+        # Out of iterations: one more round with tools disabled, streamed.
+        for ev in self.llm.chat_with_tools_stream(messages, schemas, tool_choice="none"):
+            if isinstance(ev, TextChunk):
+                collected.append(ev.text)
+                yield ev
+        if save and chat is not None:
+            self._after_generate(chat, True, "".join(collected))
+
+    @staticmethod
+    def _assistant_tool_message(content: str, calls: list[ToolCall]) -> dict:
+        """Render an assistant message carrying tool calls in OpenAI's shape."""
+        return {
+            "role": "assistant",
+            "content": content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": _json_dumps(tc.arguments),
+                    },
+                }
+                for tc in calls
+            ],
+        }
+
+    def memory_tools(self) -> list[Tool]:
+        """The built-in read-only memory self-tools for this agent.
+
+        Returns a fresh list each call. Pass it to ``generate_answer``::
+
+            agent.generate_answer(chat, tools=agent.memory_tools())
+
+        Let the character look up its own memories mid-conversation. Always
+        read-only — writes stay on the extractor/MCP path.
+        """
+        return _build_memory_tools(self)
 
     def _stream_answer(
         self,
