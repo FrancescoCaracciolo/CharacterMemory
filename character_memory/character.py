@@ -6,6 +6,7 @@ from character_memory.prompts import PromptConfig
 from .memory.extract import Extractor, ExtractionContext, build_extraction
 from .memory.base import Memory, MemoryItem
 from .memory.structured import StructuredMemory
+from .rag.base import Query
 
 
 class Character:
@@ -118,17 +119,20 @@ class Character:
 
     def build_context(
         self,
-        query: str,
+        query: Query,
         user_id: str = "default",
         limits: dict[str, int] = {},
         participants: Optional[list[str]] = None,
     ) -> dict[str, str]:
         """Return `{memory_name: rendered_section}` for enabled, non-empty memories.
 
-        When ``participants`` has more than one entry each memory is rendered
-        through its participants-aware path (PER_USER memories recall + group
-        per speaker; CHARACTER memories recall once). A single participant (or
-        none) uses the legacy single-user rendering unchanged.
+        ``query`` may be a plain string or a list of ``(text, weight)`` pairs
+        (one per recent chat message, with older ones weighted less); it is
+        forwarded to each memory's recall and never interpolated into prompt
+        text. When ``participants`` has more than one entry each memory is
+        rendered through its participants-aware path (PER_USER memories recall
+        + group per speaker; CHARACTER memories recall once). A single
+        participant (or none) uses the legacy single-user rendering unchanged.
         """
         order = self.prompts.section_order if self.prompts is not None else [m.name for m in self.memories]
         template = self.prompts.section_template if self.prompts is not None else "## {title}\n{body}"
@@ -159,7 +163,7 @@ class Character:
 
     def render_prompt(
         self,
-        query: str,
+        query: Query,
         user_id: str = "default",
         limits: dict[str, int] = {},
         participants: Optional[list[str]] = None,

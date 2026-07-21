@@ -1,4 +1,4 @@
-from .base import Hit, RAGSystem
+from .base import Hit, Query, RAGSystem, WeightedQuery, as_queries
 from .hybrid import HybridSearch
 
-__all__ = ["Hit", "RAGSystem", "HybridSearch"]
+__all__ = ["Hit", "Query", "RAGSystem", "WeightedQuery", "as_queries", "HybridSearch"]

@@ -7,9 +7,34 @@ The memory layer and the agent only ever talk to this interface.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Union
 
 from ..chunking.base import Chunk
+
+# A retrieval query. Either a plain string (single query, weight 1.0) or a
+# list of ``(text, weight)`` pairs — e.g. one per recent chat message, with
+# older messages weighted less. Weights scale each query's contribution to the
+# fused ranking. A single bare string is the legacy/common path.
+WeightedQuery = tuple[str, float]
+Query = Union[str, list[WeightedQuery]]
+
+
+def as_queries(query: Query) -> list[WeightedQuery]:
+    """Normalize a ``Query`` into a ``[(text, weight), ...]`` list.
+
+    A bare string becomes ``[(query, 1.0)]``; a weighted list is copied with
+    empty/whitespace-only texts dropped. Weights are clamped to be
+    non-negative (a zero-weight query is a harmless no-op; a negative weight
+    would invert ranking, which we never want).
+    """
+    if isinstance(query, str):
+        return [(query, 1.0)] if query.strip() else []
+    out: list[WeightedQuery] = []
+    for q, w in query:
+        if not isinstance(q, str) or not q.strip():
+            continue
+        out.append((q, max(0.0, float(w))))
+    return out
 
 
 @dataclass
@@ -40,11 +65,13 @@ class RAGSystem(ABC):
         """Add `chunks` to an existing index."""
 
     @abstractmethod
-    def search(self, query: str, k: int = 5, where: dict | None = None) -> list[Hit]:
+    def search(self, query: Query, k: int = 5, where: dict | None = None) -> list[Hit]:
         """Return up to `k` hits for `query`.
 
-        `where` optionally filters on metadata equality (e.g.
-        `{"user_id": "alice"}`).
+        `query` may be a plain string or a list of ``(text, weight)`` pairs;
+        a weighted list runs one search per query and fuses the results with
+        weight-scaled reciprocal rank fusion. `where` optionally filters on
+        metadata equality (e.g. `{"user_id": "alice"}`).
         """
 
     @abstractmethod

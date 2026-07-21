@@ -23,7 +23,7 @@ import numpy as np
 
 from ..chunking.base import Chunk
 from ..llm.embedding_base import EmbeddingProvider
-from .base import Hit, RAGSystem
+from .base import Hit, Query, RAGSystem, as_queries
 
 # llama-index as a library: node schema + BM25 retriever.
 from llama_index.core.schema import TextNode
@@ -104,47 +104,43 @@ class HybridSearch(RAGSystem):
         self._index = index
 
     # SEARCH
-    def search(self, query: str, k: int = 5, where: dict | None = None) -> list[Hit]:
+    def search(self, query: Query, k: int = 5, where: dict | None = None) -> list[Hit]:
+        """Return up to `k` hits for `query`, fusing across weighted queries.
+
+        ``query`` may be a plain string or a list of ``(text, weight)`` pairs.
+        Each query runs its own BM25 + dense pass; the positional result lists
+        are fused with reciprocal rank fusion where a query of weight ``w``
+        contributes ``w / (rrf_k + rank + 1)`` per hit. A single (or unweighted)
+        query is the legacy path and ranks identically to before.
+        """
         if not self._nodes or self._index is None:
+            return []
+        queries = as_queries(query)
+        if not queries:
             return []
         pool = min(max(self.candidate_pool, k * 3), len(self._nodes))
 
-        # Lexical candidates (ranked), keyed by internal positional index.
-        bm25_hits: list[tuple[int, int]] = []  # (positional, rank)
-        if self._bm25 is not None:
-            nodes = self._bm25.retrieve(query)
-            rank = 0
-            for n in nodes:
-                if not _matches(where, n.metadata):
-                    continue
-                bm25_hits.append((int(n.metadata.get("_pos", -1)), rank))
-                rank += 1
-                if len(bm25_hits) >= pool:
-                    break
+        # Embed every query text in one batch (one round-trip for the dense
+        # pass regardless of how many messages are in the window).
+        q_texts = [q for q, _ in queries]
+        q_vecs = self.embedder.embed(q_texts).astype("float32")
+        if q_vecs.ndim == 1:  # embed() squeezed a single query to (dim,).
+            q_vecs = q_vecs.reshape(1, -1)
 
-        # Dense saerch (ranked by cosine similarity via inner product).
-        qv = self.embedder.embed(query).astype("float32")
-        sims, idxs = self._index.search(np.ascontiguousarray(qv), pool)
-        dense_hits: list[tuple[int, int, float]] = []  # (positional, rank, sim)
-        rank = 0
-        for nid, sim in zip(idxs[0], sims[0]):
-            if nid < 0:
-                continue
-            node = self._nodes[nid]
-            if not _matches(where, node.metadata):
-                continue
-            dense_hits.append((int(nid), rank, float(sim)))
-            rank += 1
-
-        # Reciprocal Rank Fusion over positional indices.
+        # Reciprocal Rank Fusion over positional indices, weight-scaled.
         scores: dict[int, float] = {}
-        for pos, rank in bm25_hits:
-            scores[pos] = scores.get(pos, 0.0) + 1.0 / (self.rrf_k + rank + 1)
-        for pos, rank, _sim in dense_hits:
-            scores[pos] = scores.get(pos, 0.0) + 1.0 / (self.rrf_k + rank + 1)
+        # Dense similarity kept per positional id for display/debugging; when
+        # several queries hit the same node we keep the highest similarity.
+        sim_by_pos: dict[int, float] = {}
+        for (qtext, weight), qv in zip(queries, q_vecs):
+            bm25_hits, dense_hits = self._query_candidates(qtext, qv, pool, where)
+            for pos, rank in bm25_hits:
+                scores[pos] = scores.get(pos, 0.0) + weight / (self.rrf_k + rank + 1)
+            for pos, rank, sim in dense_hits:
+                scores[pos] = scores.get(pos, 0.0) + weight / (self.rrf_k + rank + 1)
+                if sim > sim_by_pos.get(pos, -1.0):
+                    sim_by_pos[pos] = sim
 
-        # Dense similarity is kept on the hit for display/debugging.
-        sim_by_pos = {pos: sim for pos, _r, sim in dense_hits}
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
         hits: list[Hit] = []
         for pos, score in ranked:
@@ -155,6 +151,44 @@ class HybridSearch(RAGSystem):
                 Hit(text=node.text, score=score, source=meta.get("source", ""), metadata=meta)
             )
         return hits
+
+    def _query_candidates(
+        self, qtext: str, qv: "np.ndarray", pool: int, where: dict | None
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int, float]]]:
+        """Run one query's BM25 + dense passes, returning ranked positional hits.
+
+        Returns ``(bm25_hits, dense_hits)`` where each entry is ``(positional,
+        rank)`` (BM25) or ``(positional, rank, similarity)`` (dense). `where`
+        filters on metadata equality. Used by :meth:`search` for each weighted
+        query; the caller fuses the lists with weight-scaled RRF.
+        """
+        # Lexical candidates, keyed by internal positional index.
+        bm25_hits: list[tuple[int, int]] = []
+        if self._bm25 is not None:
+            nodes = self._bm25.retrieve(qtext)
+            rank = 0
+            for n in nodes:
+                if not _matches(where, n.metadata):
+                    continue
+                bm25_hits.append((int(n.metadata.get("_pos", -1)), rank))
+                rank += 1
+                if len(bm25_hits) >= pool:
+                    break
+
+        # Dense search (ranked by cosine similarity via inner product).
+        # `qv` is a single 1-D row vector; FAISS needs a 2-D (1, dim) array.
+        sims, idxs = self._index.search(np.ascontiguousarray(qv.reshape(1, -1)), pool)
+        dense_hits: list[tuple[int, int, float]] = []
+        rank = 0
+        for nid, sim in zip(idxs[0], sims[0]):
+            if nid < 0:
+                continue
+            node = self._nodes[nid]
+            if not _matches(where, node.metadata):
+                continue
+            dense_hits.append((int(nid), rank, float(sim)))
+            rank += 1
+        return bm25_hits, dense_hits
 
     # --------------------------------------------------------------- persist
     @property

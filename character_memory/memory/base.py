@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from ..chunking import Chunk
+from ..rag.base import Query
 
 if TYPE_CHECKING:  # avoid a circular import at runtime (extract.py imports base)
     from .extract import ExtractionContext
@@ -97,9 +98,14 @@ class Memory(ABC):
 
     @abstractmethod
     def recall(
-        self, query: str, user_id: str, limit: int, state_changing: bool = True
+        self, query: Query, user_id: str, limit: int, state_changing: bool = True
     ) -> list[MemoryItem]:
         """Return up to `limit` items relevant to `query` for `user_id`.
+
+        `query` is normally the last user message, but may be a list of
+        ``(text, weight)`` pairs (e.g. one per recent chat message, with older
+        ones weighted less). Backends that search fuse the weighted queries;
+        backends that ignore the query (e.g. emotion) accept it unchanged.
 
         When `state_changing` is `False`, the recall is read-only: memories
         must not mutate any bookkeeping (e.g. recall-count bumps or
@@ -129,7 +135,7 @@ class Memory(ABC):
         return "\n".join(f"- {it.text}" for it in items)
 
     def build_section(
-        self, query: str, user_id: str, limit: int, state_changing: bool = True
+        self, query: Query, user_id: str, limit: int, state_changing: bool = True
     ) -> Optional[str]:
         """Recall (if enabled) and format; `None` when there is nothing to show.
 
@@ -152,7 +158,7 @@ class Memory(ABC):
     # a 1:1 chat is bit-for-bit identical to the legacy rendering.
     def recall_participants(
         self,
-        query: str,
+        query: Query,
         participants: list[str],
         limit: int,
         state_changing: bool = True,
@@ -218,7 +224,7 @@ class Memory(ABC):
 
     def build_section_participants(
         self,
-        query: str,
+        query: Query,
         participants: list[str],
         limit: int,
         state_changing: bool = True,

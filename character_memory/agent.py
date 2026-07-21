@@ -55,6 +55,7 @@ from .memory.user_facts import UserFactMemory
 from .memory.user_summary import UserSummaryMemory
 from .character_config import load_from_character_dir
 from .prompts import PromptConfig
+from .rag.base import Query
 from .rag.hybrid import HybridSearch
 
 _INFO_GLOB = "Information"
@@ -544,6 +545,47 @@ class CharacterAgent:
                 break
         return (last_user, user_id, msgs, [user_id])
 
+    def _weighted_query(
+        self, last_user_msg: str, prior: list[dict[str, str]]
+    ) -> Query:
+        """Build a history-aware retrieval query from recent user messages.
+
+        Takes the last ``retrieval_history_window`` user-role messages
+        (most-recent first) and returns a list of ``(text, weight)`` pairs
+        where weight = ``retrieval_recency_decay ** i`` (the current message
+        at i=0 has weight 1.0, older ones fade). Returns a bare string when
+        history-aware retrieval is disabled (window <= 1) or no prior messages
+        exist, so the common path stays a single query.
+        """
+        window = 1
+        decay = 1.0
+        if self.config is not None:
+            window = max(1, int(getattr(self.config.memory, "retrieval_history_window", 1)))
+            decay = float(getattr(self.config.memory, "retrieval_recency_decay", 1.0))
+        if window <= 1:
+            return last_user_msg
+        # Collect user-role contents from `prior`, newest first.
+        recent: list[str] = []
+        for m in reversed(prior):
+            if m.get("role") == "user" and m.get("content"):
+                recent.append(m["content"])
+            if len(recent) >= window:
+                break
+        # The current message leads at weight 1.0; drop it from the history
+        # tail to avoid double-counting when `prior` already contains it.
+        cur = (last_user_msg or "").strip()
+        tail = [t for t in recent if t.strip() != cur]
+        if not tail:
+            # No usable older message: stay on the single-query legacy path.
+            return last_user_msg
+        if not cur:
+            # No explicit current message; lead with the newest from history.
+            return [(tail[i], decay ** i) for i in range(min(window, len(tail)))]
+        queries: list[tuple[str, float]] = [(last_user_msg, 1.0)]
+        for i, text in enumerate(tail[: window - 1]):
+            queries.append((text, decay ** (i + 1)))
+        return queries
+
     # Prompt
     def build_context(
         self, target: Target, *, user_id: str = "default"
@@ -551,7 +593,8 @@ class CharacterAgent:
         """Return `{memory_name: rendered_section}` for the target."""
         self._require_loaded()
         assert self.character is not None
-        query, uid, _, participants = self._resolve_target(target, user_id)
+        last_user_msg, uid, prior, participants = self._resolve_target(target, user_id)
+        query = self._weighted_query(last_user_msg, prior)
         return self.character.build_context(
             query, uid, limits=self._limits, participants=participants
         )
@@ -560,7 +603,8 @@ class CharacterAgent:
         """Full system-style context block (system line + all sections)."""
         self._require_loaded()
         assert self.character is not None
-        query, uid, _, participants = self._resolve_target(target, user_id)
+        last_user_msg, uid, prior, participants = self._resolve_target(target, user_id)
+        query = self._weighted_query(last_user_msg, prior)
         return self.character.render_prompt(
             query, uid, limits=self._limits, participants=participants
         )
@@ -587,7 +631,7 @@ class CharacterAgent:
     # Generation
     def _build_messages(
         self,
-        query: str,
+        query: Query,
         user_id: str,
         prior: list[dict[str, str]],
         participants: Optional[list[str]] = None,
@@ -632,7 +676,8 @@ class CharacterAgent:
         """
         self._require_loaded()
         assert self.llm is not None
-        query, uid, prior, participants = self._resolve_target(target, user_id)
+        last_user_msg, uid, prior, participants = self._resolve_target(target, user_id)
+        query = self._weighted_query(last_user_msg, prior)
         messages = self._build_messages(query, uid, prior, participants=participants)
 
         chat: Optional[Chat] = None

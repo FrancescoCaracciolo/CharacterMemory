@@ -216,6 +216,21 @@ class MemoryConfig:
     # KNOWLEDGE GRAPH (optional, off by default — see enabled_knowledge_graph)
     knowledge_graph: KnowledgeGraphConfig = field(default_factory=KnowledgeGraphConfig)
 
+    # HISTORY-AWARE RETRIEVAL
+    # Retrieval normally uses only the last user message as the query. These
+    # knobs widen that: the last `retrieval_history_window` user messages each
+    # drive their own hybrid search and the result lists are fused with
+    # weight-scaled RRF, where older messages contribute `retrieval_recency_decay`
+    # times less per step back (weight = decay ** i, most recent at i=0 = 1.0).
+    # ``window=1`` (or empty history) reproduces the legacy single-query path
+    # bit-for-bit; ``decay=1.0`` keeps every message in the window equally
+    # strong.
+    #: How many recent user messages to use as retrieval queries (most-recent
+    #: first, including the current one).
+    retrieval_history_window: int = 5
+    #: Per-step weight multiplier for older messages (0 < decay <= 1.0).
+    retrieval_recency_decay: float = 0.6
+
     def is_enabled(self, name: str) -> bool:
         return bool(getattr(self, f"enabled_{name}", False))
 
