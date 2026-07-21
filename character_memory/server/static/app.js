@@ -669,7 +669,6 @@ function createGraphViz(canvas, opts) {
   const mouse = { x: 0, y: 0, inside: false };
   let lastT = performance.now();
   let raf = 0;
-  let first = true;                     // auto-fit on the very first dataset
 
   // DOM tooltip living inside the overlay (sibling of the canvas).
   const tip = el("div", { class: "graph-tip-box" });
@@ -677,6 +676,14 @@ function createGraphViz(canvas, opts) {
 
   // physics constants (world units) — REP/REST/GRAV are live-tunable via settings
   const SPRING = 0.045, DAMP = 0.82, MAXV = 28;
+  const MIN_SCALE = 0.05;              // allow zooming/fitting way out for big graphs
+  // Per-frame cost caps: radial-gradient halos and additive particles are the
+  // expensive parts of the render. On big graphs (hundreds of nodes / thousands
+  // of edges) they exhaust the GPU and trigger canvas context loss — which shows
+  // up as the graph "disappearing" after a few seconds. Drop them past a threshold.
+  const HALO_NODE_CAP = 150;
+  const PARTICLE_EDGE_CAP = 500;
+  const WARMUP_NODE_CAP = 1200;       // synchronous settle before first fit
 
   // -------------------------------------------------------------- sizing
   function resize() {
@@ -730,8 +737,17 @@ function createGraphViz(canvas, opts) {
     for (const n of next) prevPos.set(n.id, { x: n.x, y: n.y });
     nodes = next; edges = nextEdges;
     alpha = 1;
-    if (first) { resize(); fitView(false); first = false; }
-    else resize();
+    // Warm-start the force sim synchronously so the first fit frames the
+    // *settled* (expanded) layout, not the tight initial spiral. Without this,
+    // big graphs expand off-screen after load; with a delayed re-fit they
+    // jumped/drifted after a few seconds. Capped so huge graphs don't block.
+    if (nodes.length <= WARMUP_NODE_CAP) {
+      const iters = nodes.length <= 400 ? 180 : 90;
+      for (let i = 0; i < iters; i++) simulate();
+    }
+    alpha = 0.02;                    // sim is essentially settled; no post-fit drift
+    resize();
+    fitView(false);
   }
 
   // -------------------------------------------------------------- camera
@@ -745,12 +761,16 @@ function createGraphViz(canvas, opts) {
   function fitView(animate = true) {
     if (!nodes.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of nodes) { minX = Math.min(minX, n.x); minY = Math.min(minY, n.y); maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y); }
+    for (const n of nodes) {
+      if (!isFinite(n.x) || !isFinite(n.y)) return;   // never fit a poisoned layout
+      minX = Math.min(minX, n.x); minY = Math.min(minY, n.y); maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y);
+    }
     const w = Math.max(1, maxX - minX), h = Math.max(1, maxY - minY);
     const pad = 70;
-    const s = clamp(Math.min((view.w - 2 * pad) / w, (view.h - 2 * pad) / h), 0.2, 2.5);
+    const vw = view.w || canvas.clientWidth || 1, vh = view.h || canvas.clientHeight || 1;
+    const s = clamp(Math.min((vw - 2 * pad) / w, (vh - 2 * pad) / h), MIN_SCALE, 2.5);
     const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-    const t = { scale: s, panX: view.w / 2 - cx * s, panY: view.h / 2 - cy * s };
+    const t = { scale: s, panX: vw / 2 - cx * s, panY: vh / 2 - cy * s };
     if (animate) Object.assign(target, t);
     else { Object.assign(view, t); Object.assign(target, t); }
   }
@@ -848,9 +868,10 @@ function createGraphViz(canvas, opts) {
     }
     ctx.setLineDash([]);
 
-    // flowing particles along edges
+    // flowing particles along edges (skipped past the edge cap — additive arcs
+    // are expensive and big graphs overload the GPU).
     ctx.globalCompositeOperation = "lighter";
-    for (const e of edges) {
+    if (edges.length <= PARTICLE_EDGE_CAP) for (const e of edges) {
       const a = byId.get(e.src), b = byId.get(e.dst); if (!a || !b) continue;
       e.p = (e.p + dt * settings.particleSpeed * (0.04 + 0.22 * e.w)) % 1;
       let pa = (activeId && !e._hot) ? 0 : (e._hot ? 0.95 : 0.3);
@@ -865,9 +886,11 @@ function createGraphViz(canvas, opts) {
     }
     ctx.globalCompositeOperation = "source-over";
 
-    // node halos (additive bloom) — skipped for grayed (non-retrieved) nodes
+    // node halos (additive bloom) — skipped for grayed (non-retrieved) nodes and
+    // skipped entirely on big graphs (gradient allocation is the heaviest cost).
     const GRAYC = "#5b647e";
-    for (const a of nodes) {
+    const drawHalos = nodes.length <= HALO_NODE_CAP;
+    if (drawHalos) for (const a of nodes) {
       const isGray = dimMode && !a.retrieved;
       const baseA = 0.4 + 0.6 * a.act;
       const na = (activeId && !a._hot) ? baseA * 0.4 : baseA;
@@ -1002,7 +1025,7 @@ function createGraphViz(canvas, opts) {
     e.preventDefault();
     const w = toWorld(e.offsetX, e.offsetY);
     const factor = Math.exp(-e.deltaY * 0.0015);
-    const ns = clamp(view.scale * factor, 0.2, 4);
+    const ns = clamp(view.scale * factor, MIN_SCALE, 4);
     view.scale = target.scale = ns;
     view.panX = target.panX = e.offsetX - w.x * ns;
     view.panY = target.panY = e.offsetY - w.y * ns;
@@ -1039,6 +1062,16 @@ function createGraphViz(canvas, opts) {
     setData, resize, fit: () => fitView(true), focus: focusNode,
     reheat, freeze: () => { frozen = !frozen; return frozen; },
     isFrozen: () => frozen,
+    debugView: () => {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const n of nodes) {
+        if (!isFinite(n.x) || !isFinite(n.y)) continue;
+        minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+        maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y);
+      }
+      return { scale: view.scale, w: view.w, h: view.h, panX: view.panX, panY: view.panY,
+               minX, minY, maxX, maxY, n: nodes.length };
+    },
     destroy() {
       cancelAnimationFrame(raf);
       canvas.removeEventListener("mousedown", onDown);

@@ -52,6 +52,7 @@ from character_memory.character_config import (
     save_config,
 )
 from character_memory.manifest import MEMORY_NAMES
+from .sync import MemorySync
 
 # Two file buckets the GUI knows about. Map to the on-disk directories the
 # chunkers read (see CharacterAgent._INFO_GLOB / _DIALOGUE_GLOB).
@@ -155,11 +156,17 @@ def build_admin_router(
     agents: "dict[str, CharacterAgent]",
     assets_dir: str,
     save_root: str,
+    sync_monitors: "dict[str, MemorySync]",
+    sync_interval: float = 3.0,
 ) -> APIRouter:
     """Return an :class:`APIRouter` implementing the configurator contract.
 
     ``agents`` is the live registry shared with the rest of the server — every
     mutation (create / delete / config save / rebuild) updates it in place.
+    ``sync_monitors`` is the matching live registry of background cache
+    synchronizers; create/delete keeps it in lockstep with ``agents`` so a
+    freshly-created character gets a poller and a deleted one's poller is
+    stopped.
     """
     router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -217,6 +224,11 @@ def build_admin_router(
         ``rebuild_indexes=False`` keeps the existing persisted indexes (cheap —
         used after a config change). ``True`` forces a full re-chunk + re-index
         via :meth:`CharacterAgent.rebuild`.
+
+        The matching sync monitor is recreated too: the old one is stopped
+        (its agent is closing) and a fresh one is seeded from the current
+        on-disk mtimes so it doesn't immediately fire a redundant reload of
+        the state ``build()`` just loaded.
         """
         char_dir = _char_dir(name)
         config_path = config_path_for(char_dir)
@@ -248,7 +260,33 @@ def build_admin_router(
         else:
             agent.build()
         agents[name] = agent
+        _recreate_monitor(name)
         return agent
+
+    def _recreate_monitor(name: str) -> None:
+        """Stop the old monitor for ``name`` (if any) and start a fresh one
+        seeded against the agent's just-loaded state.
+
+        Carries over the old monitor's pause state: if the caller paused the
+        monitor around a bulk write (e.g. the ``/rebuild`` job) and the reload
+        swapped it, the new monitor comes up already paused so the bulk write
+        stays protected. The caller resumes it when the write is done.
+        """
+        old = sync_monitors.pop(name, None)
+        was_paused = bool(old is not None and old._paused.is_set())
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+        agent = agents.get(name)
+        if agent is None or sync_interval <= 0:
+            return
+        monitor = MemorySync(agent, interval=sync_interval)
+        monitor.start()
+        if was_paused:
+            monitor.pause()
+        sync_monitors[name] = monitor
 
     # ----------------------------- characters ----------------------------- #
     @router.get("/characters")
@@ -286,6 +324,12 @@ def build_admin_router(
     def delete_character(name: str) -> dict:
         _require_existing(name)
         agent = agents.pop(name, None)
+        monitor = sync_monitors.pop(name, None)
+        if monitor is not None:
+            try:
+                monitor.stop()
+            except Exception:
+                pass
         if agent is not None:
             try:
                 agent.close()
@@ -450,6 +494,15 @@ def build_admin_router(
                 job.detail = "Another rebuild is already running for this character."
                 job.ended = time.time()
                 return
+            # Pause the sync monitor for the whole rebuild: _reload_agent
+            # starts a fresh one, but rebuild() + persist_structured() write to
+            # the same memory.db / index files the poller watches, and we don't
+            # want it racing the writer with a mid-rebuild mem.load(). Resumed
+            # (and re-seeded) in ``finally`` so the just-persisted state is the
+            # new baseline.
+            monitor = sync_monitors.get(name)
+            if monitor is not None:
+                monitor.pause()
             try:
                 job.state = "running"
                 job.stage = "loading"
@@ -475,11 +528,32 @@ def build_admin_router(
                 job.stage = "failed"
                 job.detail = f"{type(exc).__name__}: {exc}"
             finally:
+                # _reload_agent may have swapped the monitor; resolve fresh.
+                m = sync_monitors.get(name)
+                if m is not None:
+                    m.resume()
                 job.ended = time.time()
                 lock.release()
 
         threading.Thread(target=_work, daemon=True).start()
         return {"job_id": job_id, "character": name}
+
+    # ----------------------------- cache refresh ----------------------------- #
+    @router.post("/characters/{name}/refresh")
+    def refresh(name: str) -> dict:
+        """Force an immediate reload of this character's in-RAM caches.
+
+        The background poller (``CM_SYNC_INTERVAL``, default 3 s) already picks
+        up external writes from the Discord bot / CLI / another worker, but
+        this endpoint lets a caller force a sync the instant it knows a write
+        landed — e.g. right after kicking the bot — rather than waiting for
+        the next tick. Returns ``reloaded: true`` when a reload actually ran,
+        ``false`` when the on-disk state was already current.
+        """
+        _require_existing(name)
+        monitor = sync_monitors.get(name)
+        reloaded = bool(monitor.check_now()) if monitor is not None else False
+        return {"character": name, "reloaded": reloaded}
 
     # ----------------------------- mini chat ----------------------------- #
     @router.post("/characters/{name}/chat")

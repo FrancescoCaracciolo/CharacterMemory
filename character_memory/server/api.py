@@ -65,12 +65,22 @@ from .mcp import build_router as build_mcp_router
 # chat) that back the Configure tab of the GUI. Reads live in `adapters.py`.
 from .admin import build_admin_router as build_admin_router_impl
 from .admin import build_jobs_router as build_jobs_router_impl
+# Background cache synchronizer: reloads in-RAM hybrid indexes + the KG graph
+# when another process (the Discord bot, the CLI, a second worker) writes to
+# the shared per-character save_directory.
+from .sync import MemorySync
 
 # Default to the current working directory: once installed the package has no
 # notion of a "repo root", so the server operates relative to the cwd it is
 # launched from. Both are overridable via the environment variables below.
 ASSETS_DIR = os.environ.get("CM_ASSETS_DIR", os.path.join(os.getcwd(), "assets"))
 SAVE_ROOT = os.environ.get("CM_SAVE_DIR", os.path.join(os.getcwd(), ".cm_servers"))
+
+# Background sync poll interval (seconds). The monitor reloads a character's
+# in-RAM caches when its on-disk state is touched by another process; 0
+# disables the background poller (caches only refresh on manual ``/refresh``
+# / ``refresh_memory`` calls). Useful for tests and single-process runs.
+SYNC_INTERVAL = float(os.environ.get("CM_SYNC_INTERVAL", "3.0"))
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -158,6 +168,20 @@ def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
 AGENTS: dict[str, CharacterAgent] = _discover_characters(ASSETS_DIR)
 
 
+# One cache synchronizer per character. The poller reloads in-RAM hybrid
+# indexes + the KG graph when another process (Discord bot, CLI, …) writes to
+# the shared save_directory, so the server never serves stale search results
+# or graph views. ``CM_SYNC_INTERVAL=0`` leaves the map empty (poller off);
+# callers can still force a reload via POST /api/admin/characters/{name}/refresh
+# or the ``refresh_memory`` MCP tool. Built at import time so a uvicorn reload
+# subprocess re-creates the monitors alongside AGENTS.
+SYNC_MONITORS: dict[str, MemorySync] = {
+    name: MemorySync(agent, interval=SYNC_INTERVAL).start()
+    for name, agent in AGENTS.items()
+    if SYNC_INTERVAL > 0
+}
+
+
 def _get_agent(character: str) -> CharacterAgent:
     if character not in AGENTS:
         raise HTTPException(
@@ -207,18 +231,26 @@ app = FastAPI(title="CharacterMemory server")
 # ``adapters.read_memory`` (semantic search + lexical fallback + pagination)
 # so quality matches the GUI; writes commit to SQLite, rebuild the affected
 # memory's hybrid index, and ``persist_structured()`` so the change survives
-# a server restart. ``build_mcp_router`` is implemented in :file:`.mcp`.
-app.include_router(build_mcp_router(AGENTS))
+# a server restart. ``SYNC_MONITORS`` is wired in so the ``refresh_memory``
+# tool can force an immediate cache reload. ``build_mcp_router`` is in :file:`.mcp`.
+app.include_router(build_mcp_router(AGENTS, SYNC_MONITORS))
 
 # Mount the admin router (write side: create/configure/delete/rebuild/chat).
 # It receives the live AGENTS dict so mutations are reflected immediately.
-app.include_router(build_admin_router_impl(AGENTS, ASSETS_DIR, SAVE_ROOT))
+# SYNC_MONITORS is passed in so the manual ``/refresh`` endpoint can force an
+# immediate cache reload on demand.
+app.include_router(build_admin_router_impl(AGENTS, ASSETS_DIR, SAVE_ROOT, SYNC_MONITORS))
 app.include_router(build_jobs_router_impl())
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
-    """Flush structured-memory indexes to disk on exit."""
+    """Stop the sync pollers, then flush structured-memory indexes to disk."""
+    for monitor in SYNC_MONITORS.values():
+        try:
+            monitor.stop()
+        except Exception:  # pragma: no cover - best effort
+            pass
     for agent in AGENTS.values():
         try:
             agent.close()

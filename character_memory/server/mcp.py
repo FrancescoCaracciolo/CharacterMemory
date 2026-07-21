@@ -42,6 +42,7 @@ from ..memory.character_base import RAGMemory
 from ..memory.emotion import EmotionStatus
 from ..memory.knowledge_graph_memory import KnowledgeGraphMemory
 from ..memory.structured import StructuredMemory
+from .sync import MemorySync
 
 
 # --------------------------------------------------------------------------- #
@@ -273,6 +274,56 @@ def _tool_search_knowledge_graph(agent: CharacterAgent, mem: Any, args: dict) ->
         return read_graph(agent, q=q, user=user, limit=limit, hops_subgraph=hops)
     except KeyError:
         return _json_error("knowledge_graph memory not built.")
+
+
+def _tool_deduplicate_knowledge_graph(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    """One-time person/alias dedup of an already-built knowledge graph.
+
+    Collapses any ``PersonNode`` that is actually the character (by name or
+    any declared alias) into the singular ``self`` node, then folds
+    ``PersonNode``s that share a name/alias into one survivor — edges are
+    rewired so no relationship is lost. Use this to clean up a graph built
+    before the self-dedup existed, or after editing the character's
+    ``aliases``. No LLM cost; the result is persisted.
+    """
+    kg = agent.memories.get("knowledge_graph")
+    if not isinstance(kg, KnowledgeGraphMemory):
+        return _json_error(
+            f"Character {agent.character_name!r} does not have the "
+            f"knowledge_graph memory enabled."
+        )
+    before = kg.retriever.overview()
+    report = kg.retriever.deduplicate_persons()
+    kg.retriever._rebuild_index()
+    try:
+        kg.persist(os.path.join(agent.save_directory, "kg_index"))
+    except Exception as e:  # noqa: BLE001 - surface persistence failure to the caller
+        return _json_error(f"dedup ran but persist failed: {e!r}")
+    after = kg.retriever.overview()
+    return {
+        "character": agent.character_name,
+        "before": before,
+        "after": after,
+        "report": report,
+    }
+
+
+def _tool_refresh_memory(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    """Force an immediate reload of this character's in-RAM memory caches.
+
+    The background sync poller (``CM_SYNC_INTERVAL``, default 3 s) already
+    picks up writes from other processes (Discord bot, CLI, …), but this tool
+    lets an MCP client force a sync the instant it knows a write landed — e.g.
+    right after driving the bot — rather than waiting up to ``interval``
+    seconds for the next tick. Returns ``reloaded: true`` when a reload ran,
+    ``false`` when the on-disk state was already current. No-op (and still
+    ``200`` / ``reloaded: false``) when the poller is disabled
+    (``CM_SYNC_INTERVAL=0``) — in that mode the caller relies on this tool as
+    the only sync path.
+    """
+    monitor = _SYNC_MONITORS_REF[0].get(agent.character_name)
+    reloaded = bool(monitor.check_now()) if monitor is not None else False
+    return {"character": agent.character_name, "reloaded": reloaded}
 
 
 def _tool_search_memory(agent: CharacterAgent, mem: Any, args: dict) -> dict:
@@ -658,6 +709,11 @@ def _tool_add_dialogue(agent: CharacterAgent, mem: Any, args: dict) -> dict:
 _CHAR = "__character__"
 _TOOLS: list[dict[str, Any]] = []
 _HANDLER_INFO: dict[str, tuple[Callable[..., dict], bool]] = {}
+# Live reference to the per-character :class:`MemorySync` map, set by
+# :func:`build_router`. Stored in a one-element list so :func:`build_router`
+# can rebind it without ``global``. The ``refresh_memory`` tool reads it to
+# force an immediate cache reload.
+_SYNC_MONITORS_REF: list[dict[str, MemorySync]] = [{}]
 
 
 def _register(
@@ -684,6 +740,20 @@ _register(
     "record count, and known user_ids (sidebar overview).",
     {"type": "object", "properties": {}, "required": []},
     _tool_list_memories,
+    needs_memory=False,
+)
+
+_register(
+    "refresh_memory",
+    "Force an immediate reload of this character's in-RAM memory caches "
+    "(structured hybrid indexes + the knowledge graph). Call this when "
+    "another process using the same character (e.g. the Discord bot, the "
+    "CLI) has just written memories and you need search/retrieval to "
+    "reflect them without waiting for the background sync poller "
+    "(CM_SYNC_INTERVAL, default 3 s). Returns ``reloaded`` (true when a "
+    "reload ran, false when the on-disk state was already current).",
+    {"type": "object", "properties": {}, "required": []},
+    _tool_refresh_memory,
     needs_memory=False,
 )
 
@@ -716,6 +786,20 @@ _register(
         "required": [],
     },
     _tool_search_knowledge_graph,
+    needs_memory=False,
+)
+
+_register(
+    "deduplicate_knowledge_graph",
+    "One-time person/alias dedup of an already-built knowledge graph. Collapses "
+    "any PersonNode that is actually the character (by name or any declared "
+    "alias) into the singular 'self' node, then folds PersonNodes that share a "
+    "name/alias into one survivor (edges are rewired, nothing is lost). Use to "
+    "clean up a graph built before the self-dedup existed, or after editing the "
+    "character's aliases. No LLM cost; the result is persisted. Returns before/"
+    "after node counts and the merge report.",
+    {"type": "object", "properties": {}, "required": []},
+    _tool_deduplicate_knowledge_graph,
     needs_memory=False,
 )
 
@@ -1151,12 +1235,24 @@ def _invoke(
 # --------------------------------------------------------------------------- #
 # FastAPI router
 # --------------------------------------------------------------------------- #
-def build_router(agent_registry: dict[str, CharacterAgent]) -> APIRouter:
+def build_router(
+    agent_registry: dict[str, CharacterAgent],
+    sync_monitors: Optional[dict[str, MemorySync]] = None,
+) -> APIRouter:
     """Return a FastAPI router that serves the MCP endpoint for this app.
 
     Mount it on the existing app in :file:`api.py`; the route is ``POST /mcp``
     and reads the bound character from the ``?character=`` query parameter.
+
+    ``sync_monitors`` is the live per-character :class:`MemorySync` map (shared
+    with the admin router) so the ``refresh_memory`` tool can force an
+    immediate cache reload. Optional for callers that don't run the poller; in
+    that case ``refresh_memory`` reports ``reloaded: false``.
     """
+    # Keep a live reference to the monitors dict the tool handler reads. We
+    # store the dict itself (not a copy) so monitors added/removed by the
+    # admin router (create/delete character) are visible here too.
+    _SYNC_MONITORS_REF[0] = sync_monitors or {}
     router = APIRouter()
 
     @router.post("/mcp")
