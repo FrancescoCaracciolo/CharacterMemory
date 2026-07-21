@@ -174,12 +174,21 @@ _FACT_EXTRACTION_PROMPT = (
 )
 
 
-def _existing_state_clause(graph: KnowledgeGraph, known_users: list[str]) -> str:
+def _existing_state_clause(
+    graph: KnowledgeGraph,
+    known_users: list[str],
+    character: Optional[CharacterContext] = None,
+) -> str:
     """Render the 'already in the graph' clause so the LLM reuses existing names.
 
     Capped so a huge graph doesn't blow the prompt: ~60 entity names and all
     known people (names + aliases). Names are lowercased-compared at resolve
     time, so this is a hint, not a hard constraint.
+
+    When ``character`` is wired, the character's own name + aliases are
+    declared up front with the instruction to use ``'self'`` for them — this
+    is the extraction-layer reinforcement of the deterministic self-dedup so
+    the LLM does not mint a PersonNode for the character under another name.
     """
     people: list[str] = []
     for n in graph.nodes_of_kind("person"):
@@ -190,6 +199,16 @@ def _existing_state_clause(graph: KnowledgeGraph, known_users: list[str]) -> str
         {getattr(n, "name", "") or n.text for n in graph.nodes_of_kind("entity")}
     )
     parts: list[str] = []
+    if character:
+        name = (character.get("name") or "").strip()
+        aliases = [str(a).strip() for a in (character.get("aliases") or []) if str(a).strip()]
+        if name:
+            aka = f" (aka {', '.join(aliases[:4])})" if aliases else ""
+            parts.append(
+                f"The character themselves is {name}{aka}. For ANY fact about them — under "
+                f"any of these names — use the subject 'self'. Do NOT create a person entry "
+                f"for the character."
+            )
     if known_users:
         parts.append(f"Known user_ids: {known_users} (use 'self' for facts about the character).")
     if people:
@@ -221,7 +240,7 @@ def _extract_fact_subjects(
     numbered = [f"{i}. {f.get('content') or f.get('text') or ''}" for i, f in enumerate(facts)]
     prompt = _FACT_EXTRACTION_PROMPT.format(
         char_clause=_char_clause(character),
-        state_clause=_existing_state_clause(graph, known_users),
+        state_clause=_existing_state_clause(graph, known_users, character),
     )
     messages = [
         {"role": "system", "content": prompt},
@@ -265,15 +284,18 @@ def ingest_emotion(
     emotion: EmotionStatus,
     *,
     known_users: Optional[Iterable[str]] = None,
+    character: Optional[CharacterContext] = None,
 ) -> None:
     """SelfNode baseline + RelationEdge per known user.
 
     `known_users` should be the union of every participant the character
     knows (from `user_summary`); each gets their own RelationEdge carrying
-    their per-user emotion dims and relationship comment.
+    their per-user emotion dims and relationship comment. `character` (name
+    + aliases) seeds the SelfNode's searchable text so the character is one
+    node, queryable by any of their names.
     """
     self_node = graph.ensure_self(baseline=getattr(emotion, "baseline", {}) or {})
-    self_node.text = "the character"
+    self_node.text = _self_node_text(character)
     for uid in known_users or []:
         if not uid:
             continue
@@ -384,7 +406,7 @@ def ingest_facts(
         # Resolve the subject endpoint and link it to the fact. A named person
         # subject becomes a PersonNode (the "someone else relevant" rule); a
         # place/object stays in `entities` and never reaches here.
-        subj_id = _resolve_subject(graph, subject, known_users or [])
+        subj_id = _resolve_subject(graph, subject, known_users or [], character)
         graph.upsert_edge(
             FactEdge(
                 id="",
@@ -421,17 +443,28 @@ def ingest_facts(
     return created_fact_ids
 
 
-def _resolve_subject(graph: KnowledgeGraph, subject: str, known_users: list[str]) -> str:
+def _resolve_subject(
+    graph: KnowledgeGraph,
+    subject: str,
+    known_users: list[str],
+    character: Optional[CharacterContext] = None,
+) -> str:
     """Map an extraction-time `subject` string to a node id.
 
-    Resolution order: 'self' -> SelfNode; a known user_id -> its PersonNode;
-    a known person name/alias -> that PersonNode; otherwise a fresh
-    **PersonNode** keyed by the name (a relevant person the fact is about —
-    the "someone the user talks about who is relevant" rule). Places/objects
-    never reach here; they are handled as entities in :func:`ingest_facts`.
+    Resolution order: the character themselves (``'self'`` token, the
+    character's name, or any declared alias) -> SelfNode; a known user_id ->
+    its PersonNode; a known person name/alias -> that PersonNode; otherwise a
+    fresh **PersonNode** keyed by the name (a relevant person the fact is
+    about — the "someone the user talks about who is relevant" rule).
+    Places/objects never reach here; they are handled as entities in
+    :func:`ingest_facts`.
     """
     s = subject.strip()
-    if not s or s.lower() == "self":
+    if not s:
+        return graph.SELF_ID
+    # The character routes to the singular SelfNode even when the LLM used
+    # the character's real name or a nickname instead of the 'self' token.
+    if _is_self_name(s, [], character):
         return graph.SELF_ID
     if s in known_users or f"person:{s}" in graph.nodes:
         return f"person:{s}"
@@ -896,18 +929,62 @@ def _looks_like_self(
     them too would split their identity across two nodes. We check the
     character context name and the SelfNode text.
     """
-    candidates = {c.lower() for c in [name, *aliases] if c}
-    if character:
-        cn = (character.get("name") or "").strip().lower()
-        if cn and cn in candidates:
-            return True
-    self_node = graph.nodes.get(graph.SELF_ID)
-    if self_node is not None:
-        self_text = (getattr(self_node, "text", "") or "").lower()
-        for c in candidates:
-            if c and c in self_text:
-                return True
-    return False
+    return _is_self_name(name, aliases, character)
+
+
+def _self_labels(character: Optional[CharacterContext]) -> set[str]:
+    """Lowercased set of all names by which the character is known.
+
+    Combines ``character['name']`` and ``character['aliases']`` (the unified
+    list wired from the config — hand-authored ∪ persona-scanned). The
+    literal token ``'self'`` is always included so the fact-extraction
+    subject token maps cleanly to the SelfNode.
+    """
+    if not character:
+        return {"self"}
+    out: set[str] = {"self"}
+    cn = (character.get("name") or "").strip().lower()
+    if cn:
+        out.add(cn)
+    for a in character.get("aliases") or []:
+        a = str(a or "").strip().lower()
+        if a:
+            out.add(a)
+    return out
+
+
+def _is_self_name(
+    name: str,
+    aliases: Iterable[str],
+    character: Optional[CharacterContext],
+) -> bool:
+    """True if `name`/`aliases` denote the character themselves.
+
+    Central self-detection used by BOTH ingestion paths (fact subjects and
+    wiki persons) so the character can never be split into ``self`` plus one
+    or more ``person:`` nodes. A candidate matches when any of its labels
+    (lowercased) equals the character's name, any declared alias, or the
+    literal ``'self'`` token.
+    """
+    candidates = {str(c).strip().lower() for c in [name, *aliases] if str(c or "").strip()}
+    if not candidates:
+        return False
+    return bool(candidates & _self_labels(character))
+
+
+def _self_node_text(character: Optional[CharacterContext]) -> str:
+    """Searchable text for the SelfNode: the character's name + aliases.
+
+    Replaces the old generic literal ``'the character'`` so the SelfNode is
+    actually surfaced by name/alias queries and so substring-based
+    self-detection has a real signal. Falls back to ``'the character'`` when
+    no identity is wired.
+    """
+    if not character:
+        return "the character"
+    parts = [c for c in [character.get("name") or "", *(character.get("aliases") or [])] if c]
+    parts = list(dict.fromkeys([p.strip() for p in parts if p and p.strip()]))
+    return ". ".join(parts) or "the character"
 
 
 # --------------------------------------------------------------------- helpers

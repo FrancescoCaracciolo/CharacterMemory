@@ -98,6 +98,11 @@ class CharacterAgent:
         # pass this in if they want the persona clause populated. May also be
         # loaded from `config.yaml` via `load_from_config(path)`.
         self.persona = persona
+        # Alternate names the character goes by (nicknames, full name, …).
+        # Used by the knowledge-graph self-dedup so the character is a single
+        # node under every name. Populated from `config.yaml` (top-level
+        # `aliases:` ∪ persona-scanned) in `load_from_config`.
+        self.character_aliases: list[str] = []
         # Path of the config.yaml last loaded, when `load_from_config(path)`
         # was used. None until then.
         self.config_path: Optional[str] = None
@@ -163,6 +168,11 @@ class CharacterAgent:
             # the file's.
             if not self.persona and loaded.persona:
                 self.persona = loaded.persona
+            # Adopt the file's aliases unless the caller passed some via the
+            # constructor. The file's list already includes name + persona
+            # scans, so it is the richest source.
+            if not self.character_aliases and loaded.aliases:
+                self.character_aliases = list(loaded.aliases)
             if self._prompts_explicit is not True:
                 self.prompts = loaded.prompts
         elif isinstance(config_or_path, CharacterMemoryConfig):
@@ -296,11 +306,18 @@ class CharacterAgent:
         if isinstance(kg, KnowledgeGraphMemory):
             kg.attach_backends(self.llm, self.embedder)
             kg.wire_sources(self.memories)
-            # Pass the character identity (name + persona) to the retriever so
-            # entity/people extraction is context-aware and relevance-filtered.
+            # Pass the character identity (name + persona + aliases) to the
+            # retriever so entity/people extraction is context-aware,
+            # relevance-filtered, and self-dedup knows every name the
+            # character goes by. Always include the canonical name in the
+            # alias set so the self-collapse is robust even with no aliases.
+            aliases = list(self.character_aliases or [])
+            if self.character_name and self.character_name not in aliases:
+                aliases = [self.character_name, *aliases]
             kg.retriever.character = {
                 "name": self.character_name,
                 "persona": (self.persona or "").strip(),
+                "aliases": aliases,
             }
 
     # Indexing

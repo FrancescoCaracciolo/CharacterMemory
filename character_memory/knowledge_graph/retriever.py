@@ -105,9 +105,10 @@ class KnowledgeGraphRetriever:
         # user_ids the graph currently knows about (drives person resolution
         # and the SelfNode relation edges). Refreshed on every ingest.
         self._known_users: list[str] = []
-        # Character identity (name + persona) used to make entity extraction
-        # context-aware and relevance-filtered. Set by the agent at build time.
-        self.character: Optional[dict[str, str]] = None
+        # Character identity (name + persona + aliases) used to make entity
+        # extraction context-aware and relevance-filtered, and to drive the
+        # self-dedup pass. Set by the agent at build time.
+        self.character: Optional[dict[str, Any]] = None
 
     # --------------------------------------------------------------- backends
     def load(
@@ -152,7 +153,7 @@ class KnowledgeGraphRetriever:
             # Make sure every known user has a node before wiring relations.
             for uid in known_users:
                 self.graph.ensure_person(uid)
-            ingest_emotion(self.graph, emotion, known_users=known_users)
+            ingest_emotion(self.graph, emotion, known_users=known_users, character=self.character)
 
         facts = mems.get("user_facts")
         if isinstance(facts, UserFactMemory):
@@ -167,6 +168,11 @@ class KnowledgeGraphRetriever:
             ingest_episodes(self.graph, episodic)
 
         self._known_users = known_users or [n.user_id for n in self.graph.nodes_of_kind("person")]
+        # Deterministic self-healing: collapse any person node that is actually
+        # the character into the SelfNode, then fold duplicate persons sharing
+        # a name/alias. Runs after every ingest so an extraction slip never
+        # leaves a duplicate node behind. No LLM cost.
+        self._dedup_persons()
         # Keep the node-text hybrid index in sync with whatever we just built.
         self._rebuild_index()
         return self
@@ -195,6 +201,7 @@ class KnowledgeGraphRetriever:
             ingest_wiki_llm(self.graph, self.llm, sections, character=self.character)
         else:
             ingest_wiki(self.graph, sections)
+        self._dedup_persons()
         self._rebuild_index()
         return self
 
@@ -244,6 +251,7 @@ class KnowledgeGraphRetriever:
             if ids:
                 rows = [r for r in ep_mem.store.select(ep_mem.table) if int(r.get("id") or -1) in ids]
                 ingest_episodes(self.graph, ep_mem, rows=rows)
+        self._dedup_persons()
         self._rebuild_index()
         return self
 
@@ -263,6 +271,32 @@ class KnowledgeGraphRetriever:
         if any(rep.removed_ids or rep.updated_ids for rep in report.values()):
             self._rebuild_index()
         return self
+
+    def deduplicate_persons(self) -> dict[str, list]:
+        """Run the deterministic person-dedup passes and return a report.
+
+        Public entry point (used by the ``deduplicate_knowledge_graph`` MCP
+        tool) for a one-time cleanup of an already-built graph: collapses
+        any PersonNode that is actually the character into the SelfNode,
+        then folds duplicate PersonNodes sharing a name/alias. Does NOT
+        rebuild the node-text index or persist — the caller does that.
+        """
+        into_self = self.graph.collapse_into_self(self._character_labels())
+        merged = self.graph.merge_duplicate_persons()
+        return {"collapsed_into_self": into_self, "merged_persons": merged}
+
+    def _dedup_persons(self) -> None:
+        """Internal post-ingest hook: run the dedup passes (no index rebuild)."""
+        self.graph.collapse_into_self(self._character_labels())
+        self.graph.merge_duplicate_persons()
+
+    def _character_labels(self) -> list[str]:
+        """The character's name + aliases from the wired identity, for dedup."""
+        if not self.character:
+            return []
+        labels = [self.character.get("name") or ""]
+        labels.extend(self.character.get("aliases") or [])
+        return [str(c).strip() for c in labels if str(c or "").strip()]
 
     def _remove_by_source(self, mem_name: str, row_id: Any) -> None:
         tag = f"{mem_name}:{row_id}"

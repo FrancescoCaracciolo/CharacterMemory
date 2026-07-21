@@ -246,6 +246,197 @@ class KnowledgeGraph:
         self._counters[kind] += 1
         return f"{kind}:{self._counters[kind]}"
 
+    # ------------------------------------------------------------ person merging
+    # Two reusable, LLM-free merge passes. Both operate purely on the in-memory
+    # graph and rewire edges so no information is lost; the merged node keeps
+    # the union of aliases and the more formal (longer) display name. They are
+    # the deterministic backstop for the alias-splitting problem: even when the
+    # extraction LLM slips a synonym through, these collapse it on the next
+    # ingest. See :meth:`collapse_into_self` for the character-self case.
+    def merge_duplicate_persons(self) -> list[tuple[str, list[str]]]:
+        """Fold PersonNodes that refer to the same real person into one node.
+
+        Two PersonNodes are considered the same person when their label sets
+        ``{name, *aliases, user_id}`` intersect case-insensitively — so
+        ``person:okabe {Rintaro Okabe}`` and ``person:123 {Okabe}`` collapse.
+        For each such group the survivor is chosen preferring a real
+        ``user_id`` (non-slug) key then the longest name; everyone else's
+        aliases are merged in, their edges are rewired onto the survivor via
+        :meth:`upsert_edge` (which merges strengths idempotently), and the
+        duplicate nodes are removed.
+
+        Returns ``[(survivor_id, [removed_ids]), ...]`` for logging.
+        """
+        persons = [n for n in self.nodes.values() if isinstance(n, PersonNode)]
+        # Union-find over persons keyed by lowercased label intersection.
+        parent: dict[str, str] = {p.id: p.id for p in persons}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        label_to_ids: dict[str, list[str]] = {}
+        for p in persons:
+            labels = {
+                str(c).lower()
+                for c in [p.name, p.user_id, *(p.aliases or [])]
+                if c
+            }
+            for lab in labels:
+                label_to_ids.setdefault(lab, []).append(p.id)
+        for ids in label_to_ids.values():
+            for other in ids[1:]:
+                union(ids[0], other)
+
+        groups: dict[str, list[str]] = {}
+        for p in persons:
+            groups.setdefault(find(p.id), []).append(p.id)
+
+        report: list[tuple[str, list[str]]] = []
+        for root, members in groups.items():
+            if len(members) < 2:
+                continue
+            survivor = self._pick_person_survivor(members)
+            removed = [m for m in members if m != survivor]
+            if not removed:
+                continue
+            self._merge_person_nodes(survivor, removed)
+            report.append((survivor, removed))
+        return report
+
+    def collapse_into_self(self, labels: Iterable[str]) -> list[str]:
+        """Merge any PersonNode referring to the character into the SelfNode.
+
+        ``labels`` is the character's name + aliases (any case). Any
+        PersonNode whose ``{name, *aliases, user_id}`` intersects that set
+        case-insensitively is folded into the singular ``self`` node: edges
+        are rewired onto ``self`` (strengths merged via :meth:`upsert_edge`),
+        the aliases are recorded on the SelfNode's text so it stays
+        searchable, and the duplicate person nodes are removed.
+
+        Returns the ids of the removed person nodes, for logging.
+        """
+        target = {str(c).lower() for c in labels if c}
+        if not target:
+            return []
+        # Make sure the SelfNode exists; without it there is nothing to fold into.
+        if not isinstance(self.nodes.get(self.SELF_ID), SelfNode):
+            return []
+        removed: list[str] = []
+        absorbed_aliases: list[str] = []
+        for node in list(self.nodes.values()):
+            if not isinstance(node, PersonNode):
+                continue
+            node_labels = {
+                str(c).lower()
+                for c in [node.name, node.user_id, *(node.aliases or [])]
+                if c
+            }
+            if not (node_labels & target):
+                continue
+            # Remember the labels so the SelfNode text can mention them.
+            for c in [node.name, *(node.aliases or [])]:
+                if c and c.lower() not in target:
+                    absorbed_aliases.append(c)
+            self._rewire_edges(node.id, self.SELF_ID)
+            self.remove_node(node.id)
+            removed.append(node.id)
+        if removed or absorbed_aliases:
+            self_node = self.nodes.get(self.SELF_ID)
+            if isinstance(self_node, SelfNode):
+                # Rebuild a searchable text from whatever labels we now know.
+                seen = list(dict.fromkeys(
+                    [*(self_node.text.split(". ") if self_node.text else []), *absorbed_aliases]
+                ))
+                self_node.text = ". ".join(s for s in seen if s and s.lower() != "the character") or "the character"
+        return removed
+
+    def _pick_person_survivor(self, member_ids: list[str]) -> str:
+        """Choose the canonical survivor id from a group of duplicate persons.
+
+        Prefer a node anchored to a **real user identity** (one whose
+        ``user_id`` came from a ``user_summary`` row, not an LLM canonical
+        key) so that subsequent ingests' ``ensure_person(user_id)`` calls
+        hit the same node instead of re-splitting the person. The heuristic:
+        real platform ids almost always contain a digit, underscore, or
+        uppercase letter, whereas LLM wiki keys are clean lowercase words
+        (``okabe``, ``rintaro``). Break ties by the longest display name so
+        the most formal variant wins.
+        """
+        import re as _re
+
+        _real_id = _re.compile(r"[0-9_A-Z]")
+
+        def score(nid: str) -> tuple[int, int]:
+            node = self.nodes.get(nid)
+            uid = getattr(node, "user_id", "") or ""
+            # A real external id contains a digit/underscore/uppercase letter;
+            # a clean lowercase slug (LLM canonical key) does not.
+            has_real_id = bool(uid) and bool(_real_id.search(uid))
+            name_len = len(getattr(node, "name", "") or "")
+            return (1 if has_real_id else 0, name_len)
+
+        return max(member_ids, key=score)
+
+    def _merge_person_nodes(self, survivor_id: str, removed_ids: list[str]) -> None:
+        """Fold ``removed_ids`` into ``survivor_id``: merge aliases, rewire, drop."""
+        survivor = self.nodes.get(survivor_id)
+        if not isinstance(survivor, PersonNode):
+            return
+        for rid in removed_ids:
+            dup = self.nodes.get(rid)
+            if not isinstance(dup, PersonNode):
+                continue
+            # Keep the more formal (longer) display name; union the aliases.
+            if dup.name and len(dup.name) > len(survivor.name or ""):
+                if survivor.name:
+                    survivor.aliases = list(dict.fromkeys([*survivor.aliases, survivor.name]))
+                survivor.name = dup.name
+            else:
+                survivor.aliases = list(dict.fromkeys([*survivor.aliases, dup.name]))
+            survivor.aliases = list(dict.fromkeys([*survivor.aliases, *(dup.aliases or [])]))
+            survivor.aliases = [a for a in survivor.aliases if a and a != survivor.name]
+            self._rewire_edges(rid, survivor_id)
+            self.remove_node(rid)
+        survivor.text = self._person_text(survivor.name, survivor.aliases)
+
+    def _rewire_edges(self, old_id: str, new_id: str) -> None:
+        """Move every edge touching ``old_id`` onto ``new_id`` and dedupe.
+
+        Each affected edge is re-inserted via :meth:`upsert_edge` so the merge
+        logic in :meth:`_merge_edge` combines strengths (max for scalars,
+        larger magnitude for signed dims) instead of overwriting. Self-loops
+        created by the rewire (both endpoints now ``new_id``) are dropped.
+        """
+        if old_id == new_id:
+            return
+        affected = [eid for eid in list(self._adj.get(old_id, []))]
+        for eid in affected:
+            edge = self.edges.get(eid)
+            if edge is None:
+                continue
+            new_src = new_id if edge.src == old_id else edge.src
+            new_dst = new_id if edge.dst == old_id else edge.dst
+            if new_src == new_dst:
+                # Would become a self-loop on the survivor; drop it.
+                self.remove_edge(eid)
+                continue
+            # Drop the old edge then re-insert under the new canonical id so
+            # upsert_edge can merge it with any existing edge between the same
+            # (kind, src, dst) triple.
+            self.remove_edge(eid)
+            edge.src = new_src
+            edge.dst = new_dst
+            edge.id = ""
+            self.upsert_edge(edge)
+
     # ------------------------------------------------------------------ edges
     def add_edge(self, edge: Edge) -> Edge:
         """Insert `edge`. Symmetric kinds are indexed under both endpoints."""
