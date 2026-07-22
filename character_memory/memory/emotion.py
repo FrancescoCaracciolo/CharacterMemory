@@ -282,7 +282,7 @@ class EmotionStatus(Memory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
         if not value:
             return []
         # Multi-user: a list of {user_id, deltas, comment?}. Apply each entry

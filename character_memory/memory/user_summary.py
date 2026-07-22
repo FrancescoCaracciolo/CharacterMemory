@@ -151,7 +151,7 @@ class UserSummaryMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
         added: list[MemoryItem] = []
         for item in value or []:
             uid = str(item.get("user_id") or user_id)

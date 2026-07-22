@@ -1,6 +1,6 @@
 """User facts: structured, multi-user memory with confidence/importance + decay."""
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from ..config import ContradictionPolicy
 from .base import ExtractionSpec, MemoryItem
@@ -24,6 +24,9 @@ class UserFactMemory(StructuredMemory):
         "type": "TEXT NOT NULL DEFAULT 'general'",
         "content": "TEXT NOT NULL",
         "confidence": "REAL NOT NULL DEFAULT 0.5",
+        # The chat a fact was learned in (NULL ⇒ legacy / single-user). Used
+        # by the knowledge graph to link facts and episodes of the same chat.
+        "chat_id": "TEXT",
     }
     text_column = "content"
 
@@ -35,6 +38,7 @@ class UserFactMemory(StructuredMemory):
         type: str = "general",
         importance: float = 0.5,
         confidence: float = 0.5,
+        chat_id: Optional[str] = None,
     ) -> int:
         return self.add(
             user_id,
@@ -42,6 +46,7 @@ class UserFactMemory(StructuredMemory):
             type=type,
             content=content,
             confidence=confidence,
+            chat_id=chat_id,
         )
 
     def row_text(self, row: dict[str, Any]) -> str:
@@ -86,7 +91,7 @@ class UserFactMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
         added: list[MemoryItem] = []
         for f in value or []:
             content = (f.get("content") or "").strip()
@@ -103,6 +108,7 @@ class UserFactMemory(StructuredMemory):
                 type=str(f.get("type", "general")),
                 importance=self._clip(f.get("importance", 0.5)),
                 confidence=self._clip(f.get("confidence", 0.5)),
+                chat_id=chat_id,
             )
             row = self.get_row(row_id)
             if row is not None:

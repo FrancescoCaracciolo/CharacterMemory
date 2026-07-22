@@ -1,6 +1,6 @@
 """Episodic memory: things that happened, decayed + weighted by emotional shift."""
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 from ..config import ContradictionPolicy
 from .decay import decay_score, age_seconds
 from .base import ExtractionSpec, MemoryItem
@@ -21,6 +21,9 @@ class EpisodicMemory(StructuredMemory):
     extra_columns = {
         "summary": "TEXT NOT NULL",
         "emotional_shift": "REAL NOT NULL DEFAULT 0.0",
+        # The chat an episode was learned in (NULL ⇒ legacy / single-user).
+        # Used by the knowledge graph to link facts and episodes of the same chat.
+        "chat_id": "TEXT",
     }
     text_column = "summary"
 
@@ -31,12 +34,14 @@ class EpisodicMemory(StructuredMemory):
         *,
         importance: float = 0.5,
         emotional_shift: float = 0.0,
+        chat_id: Optional[str] = None,
     ) -> int:
         return self.add(
             user_id,
             importance,
             summary=summary,
             emotional_shift=float(emotional_shift),
+            chat_id=chat_id,
         )
 
     def _effective(self, row: dict[str, Any]) -> float:
@@ -92,7 +97,7 @@ class EpisodicMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
         added: list[MemoryItem] = []
         for e in value or []:
             summary = (e.get("summary") or "").strip()
@@ -107,6 +112,7 @@ class EpisodicMemory(StructuredMemory):
                 summary,
                 importance=self._clip(e.get("importance", 0.5)),
                 emotional_shift=emotional_shift,
+                chat_id=chat_id,
             )
             row = self.get_row(row_id)
             if row is not None:

@@ -79,6 +79,7 @@ class Character:
         user_id: str = "default",
         llm: Optional[LLMClient] = None,
         participants: Optional[list[str]] = None,
+        chat_id: Optional[str] = None,
     ) -> Optional[dict]:
         """Run extraction over `turns`.
 
@@ -88,6 +89,11 @@ class Character:
         transcript labelling + a ``user_id`` enum on per-user fields, each item
         attributed to the participant it is about). With one or no participant
         the legacy single-user path runs unchanged.
+
+        ``chat_id`` (optional) identifies the conversation extraction ran over;
+        chat-scoped memories (``user_facts``, ``episodic``) stamp it onto their
+        rows so the knowledge graph can link facts and episodes of the same
+        chat. ``None`` ⇒ legacy / single-user behaviour.
         """
         if llm is None:
             llm = self.llm
@@ -109,7 +115,7 @@ class Character:
         extracted = Extractor(llm).extract(turns, schema=schema, instruction=instruction, context=context)
         added: dict[str, list[MemoryItem]] = {}
         for mem, spec in participating:
-            items = mem.apply_extraction(extracted.get(spec.field), user_id)
+            items = mem.apply_extraction(extracted.get(spec.field), user_id, chat_id=chat_id)
             if items:
                 added[mem.name] = items
         # Carry the freshly-added items so the caller (e.g. a deduplicator)

@@ -43,6 +43,7 @@ from .ingest import (
     ingest_summaries,
     ingest_wiki,
     ingest_wiki_llm,
+    wire_chat_edges,
 )
 from .nodes import Node
 from .persistence import has_persisted, load_graph, save_graph
@@ -173,6 +174,8 @@ class KnowledgeGraphRetriever:
         # a name/alias. Runs after every ingest so an extraction slip never
         # leaves a duplicate node behind. No LLM cost.
         self._dedup_persons()
+        # Link facts and episodes learned in the same chat (low-weight bridges).
+        wire_chat_edges(self.graph)
         # Keep the node-text hybrid index in sync with whatever we just built.
         self._rebuild_index()
         return self
@@ -252,6 +255,9 @@ class KnowledgeGraphRetriever:
                 rows = [r for r in ep_mem.store.select(ep_mem.table) if int(r.get("id") or -1) in ids]
                 ingest_episodes(self.graph, ep_mem, rows=rows)
         self._dedup_persons()
+        # Re-link same-chat facts/episodes across the whole graph: a freshly
+        # ingested fact should bridge to pre-existing episodes of that chat.
+        wire_chat_edges(self.graph)
         self._rebuild_index()
         return self
 

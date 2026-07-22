@@ -50,6 +50,7 @@ from ..memory.episodic import EpisodicMemory
 from ..memory.user_facts import UserFactMemory
 from ..memory.user_summary import UserSummaryMemory
 from .edges import (
+    ChatEdge,
     CoOccurrenceEdge,
     EpisodeEdge,
     FactEdge,
@@ -396,6 +397,7 @@ def ingest_facts(
             # Seed the ACT-R practice history with the creation event so a
             # fresh fact has a meaningful (positive) base-level activation.
             practice_times=[created_at],
+            chat_id=r.get("chat_id"),
         )
         graph.add_node(fact_node)
         created_fact_ids.append(fid)
@@ -510,6 +512,7 @@ def ingest_episodes(
             created_at=ts,
             source=f"episodic:{r.get('id')}",
             practice_times=[ts],
+            chat_id=r.get("chat_id"),
         )
         graph.add_node(ep_node)
         created.append(eid)
@@ -551,6 +554,35 @@ def _wire_co_occurrence(
             pb = participants_by_node[b]
             if pa & pb:
                 graph.add_co_occurrence(a, b, co_create=co_create, weight=0.15)
+
+
+# --------------------------------------------------------------------- chat edges
+def wire_chat_edges(graph: KnowledgeGraph, *, weight: float = 0.1) -> None:
+    """Add ChatEdges between the facts and episodes of the same conversation.
+
+    Nodes whose ``chat_id`` is set (i.e. learned in a chat) are grouped by it
+    and every pair within a group is linked with a low, fixed-weight
+    ``ChatEdge``. Wiki-derived nodes carry no ``chat_id`` and are skipped, so
+    the wiki subgraph is left untouched.
+
+    Idempotent: ``upsert_edge`` merges by the canonical id, so re-running this
+    over a graph that already has the edges is a no-op (weight is merged by
+    ``max``, never duplicated).
+    """
+    # Group node ids by chat_id, keeping only facts and episodes.
+    by_chat: dict[str, list[str]] = {}
+    for node in graph.nodes.values():
+        if not isinstance(node, (FactNode, EpisodeNode)):
+            continue
+        cid = node.chat_id
+        if cid:
+            by_chat.setdefault(cid, []).append(node.id)
+    for cid, node_ids in by_chat.items():
+        for i, a in enumerate(node_ids):
+            for b in node_ids[i + 1 :]:
+                graph.upsert_edge(
+                    ChatEdge(id="", kind="chat", src=a, dst=b, weight=weight)
+                )
 
 
 # ----------------------------------------------------------------------- wiki

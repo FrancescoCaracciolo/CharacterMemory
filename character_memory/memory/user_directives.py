@@ -1,7 +1,7 @@
 """User directives: per-user standing instructions with importance + keywords."""
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from .base import ExtractionSpec, MemoryItem
 from .structured import StructuredMemory
@@ -106,7 +106,7 @@ class UserDirectiveMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
         added: list[MemoryItem] = []
         for d in value or []:
             content = (d.get("content") or "").strip()

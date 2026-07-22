@@ -129,6 +129,9 @@ class FactNode(Node, _NodeMixin):
     type: str = "general"
     confidence: float = 0.5
     importance: float = 0.5
+    #: The chat this fact was learned in (NULL ⇒ legacy / single-user / wiki).
+    #: Pairs facts and episodes of the same chat via `ChatEdge`.
+    chat_id: Optional[str] = None
 
     def _extra_fields(self) -> dict[str, Any]:
         return {
@@ -136,6 +139,7 @@ class FactNode(Node, _NodeMixin):
             "type": self.type,
             "confidence": self.confidence,
             "importance": self.importance,
+            "chat_id": self.chat_id,
         }
 
 
@@ -149,6 +153,9 @@ class EpisodeNode(Node, _NodeMixin):
     importance: float = 0.5
     timestamp: float = 0.0
     participants: list[str] = field(default_factory=list)
+    #: The chat this episode was learned in (NULL ⇒ legacy / single-user / wiki).
+    #: Pairs facts and episodes of the same chat via `ChatEdge`.
+    chat_id: Optional[str] = None
 
     def _extra_fields(self) -> dict[str, Any]:
         return {
@@ -157,6 +164,7 @@ class EpisodeNode(Node, _NodeMixin):
             "importance": self.importance,
             "timestamp": self.timestamp,
             "participants": list(self.participants),
+            "chat_id": self.chat_id,
         }
 
 

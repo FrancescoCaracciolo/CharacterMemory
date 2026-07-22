@@ -164,18 +164,34 @@ class CoOccurrenceEdge(Edge):
         }
 
 
+@dataclass
+class ChatEdge(Edge):
+    """any <-> any (facts + episodes learned in the same conversation).
+
+    A fixed, low-weight bridge that ties together the facts and episodes a
+    single chat produced, so recalling one can spread to the others of that
+    conversation. It carries only the generic ``weight`` (no per-kind dims), so
+    ``_edge_strength`` leaves it low; and the Hebbian co-recall step only grows
+    ``co_occurrence`` edges, so a ``ChatEdge`` stays at its low weight — it is
+    a stable "same chat" tag, not a learned association.
+    """
+
+    kind: str = "chat"
+
+
 EDGE_CLASSES: dict[str, type[Edge]] = {
     "relation": RelationEdge,
     "fact": FactEdge,
     "transition": TransitionEdge,
     "episode": EpisodeEdge,
     "co_occurrence": CoOccurrenceEdge,
+    "chat": ChatEdge,
 }
 
 #: Edge kinds the graph treats as undirected when walking neighbours. A
 #: transition between A and B is stored once; both A and B see each other as
 #: neighbours regardless of which is `src`.
-SYMMETRIC_KINDS: set[str] = {"transition", "co_occurrence"}
+SYMMETRIC_KINDS: set[str] = {"transition", "co_occurrence", "chat"}
 
 
 def edge_from_dict(data: dict[str, Any]) -> Edge:
@@ -196,6 +212,7 @@ __all__ = [
     "TransitionEdge",
     "EpisodeEdge",
     "CoOccurrenceEdge",
+    "ChatEdge",
     "EDGE_CLASSES",
     "SYMMETRIC_KINDS",
     "edge_from_dict",

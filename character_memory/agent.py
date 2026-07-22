@@ -946,6 +946,7 @@ class CharacterAgent:
         rows: list[dict[str, Any]],
         user_id: str,
         participants: Optional[list[str]] = None,
+        chat_id: Optional[str] = None,
     ) -> None:
         """Run extraction over a batch of message rows.
 
@@ -953,6 +954,10 @@ class CharacterAgent:
         more than one) drives multi-user extraction: each turn is labelled with
         its real speaker and per-user items are attributed per participant.
         Speaker is read from each row's ``user_id`` (NULL ⇒ the chat owner).
+
+        ``chat_id`` (optional) identifies the conversation; chat-scoped memories
+        (``user_facts``, ``episodic``) stamp it onto their rows so the knowledge
+        graph can link facts and episodes of the same chat.
         """
         assert self.character is not None
         if not rows:
@@ -967,7 +972,7 @@ class CharacterAgent:
         ]
         ids = [int(r["id"]) for r in rows]
         result = self.character.extract(
-            turns, user_id=user_id, participants=participants
+            turns, user_id=user_id, participants=participants, chat_id=chat_id
         )
         if result is not None:
             added = result.pop("__added__", {})
@@ -997,7 +1002,7 @@ class CharacterAgent:
         if not rows:
             return
         self._extract_messages(
-            rows[-window:], chat.user_id, participants=chat.participants()
+            rows[-window:], chat.user_id, participants=chat.participants(), chat_id=chat.id
         )
 
     def _update_knowledge_graph(self, added: dict[str, list]) -> None:
@@ -1106,6 +1111,7 @@ class CharacterAgent:
                 chat_rows[-window:],
                 chat.user_id,
                 participants=chat.participants(),
+                chat_id=chat_id,
             )
 
     def close(self) -> None:

@@ -281,7 +281,9 @@ class Memory(ABC):
         """
         return None
 
-    def apply_extraction(self, value: Any, user_id: str) -> list[MemoryItem]:
+    def apply_extraction(
+        self, value: Any, user_id: str, *, chat_id: Optional[str] = None
+    ) -> list[MemoryItem]:
         """Consume this memory's portion of an extraction result.
 
         `value` is whatever the LLM produced under this memory's `field`
@@ -293,5 +295,10 @@ class Memory(ABC):
         own ``user_id``; per-user memories honour ``item['user_id']`` and fall
         back to the caller's ``user_id`` when it is absent. ``user_id`` here is
         the chat's default (the owner / current speaker).
+
+        ``chat_id`` (optional) is the conversation the extraction ran over.
+        Memories that are chat-scoped (``user_facts``, ``episodic``) stamp it
+        onto their rows so the knowledge graph can link facts and episodes
+        learned in the same chat; other memories accept and ignore it.
         """
         return []
