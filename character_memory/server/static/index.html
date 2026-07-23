@@ -3,30 +3,55 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Character Memory Browser</title>
-  <link rel="stylesheet" href="/gui/static/styles.css">
+  <meta name="theme-color" content="#fff8e8">
+  <title>Mnemosyne — Character Memory</title>
+  <script>
+    (() => {
+      let saved = null;
+      try { saved = localStorage.getItem("cm_theme"); } catch (error) { /* storage may be disabled */ }
+      const theme = saved === "light" || saved === "dark"
+        ? saved
+        : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.style.colorScheme = theme;
+    })();
+  </script>
+  <link rel="stylesheet" href="/gui/static/styles.css?v=clubhouse-1">
   <!-- The knowledge-graph view is a self-contained canvas force-renderer (no CDN). -->
 </head>
 <body>
   <div class="app">
     <header class="topbar">
-      <div class="brand"><span class="logo">◆</span> Character Memory</div>
+      <div class="brand">
+        <span class="logo" aria-hidden="true">M</span>
+        <span class="brand-copy"><b>Mnemosyne</b><small>character memory clubhouse</small></span>
+      </div>
       <nav class="tabbar" role="tablist" aria-label="View">
-        <button id="tab-browse" class="tab active" role="tab" aria-selected="true">Browse</button>
-        <button id="tab-configure" class="tab" role="tab" aria-selected="false">Configure</button>
+        <button id="tab-browse" class="tab active" role="tab" aria-selected="true"><span>01</span> Memory shelf</button>
+        <button id="tab-configure" class="tab" role="tab" aria-selected="false"><span>02</span> Character studio</button>
       </nav>
       <div class="topbar-actions">
         <label class="char-picker">
           <span>Character</span>
           <select id="character" title="Switch character"></select>
         </label>
+        <label class="theme-switch" title="Switch between light and dark themes">
+          <span class="theme-switch-label" aria-hidden="true">Theme</span>
+          <input id="theme-toggle" type="checkbox" role="switch" aria-label="Use dark theme">
+          <span class="theme-track" aria-hidden="true">
+            <span class="theme-sun">☀</span>
+            <span class="theme-moon">☾</span>
+            <span class="theme-knob"></span>
+          </span>
+        </label>
         <button id="refresh" class="btn icon-btn" title="Reload overview" aria-label="Reload overview">↻</button>
-        <a class="btn ghost" href="/" title="JSON index">{ }</a>
+        <a class="btn ghost api-link" href="/" title="JSON index">API</a>
       </div>
     </header>
 
     <div class="main">
       <aside class="sidebar">
+        <div class="side-label"><span>Memory drawers</span><span id="memory-total">—</span></div>
         <div class="side-head">
           <input id="memory-filter" class="filter-input" placeholder="Filter memories…" autocomplete="off">
         </div>
@@ -42,6 +67,7 @@
             <span id="mem-disabled" class="chip warn-chip hidden">disabled</span>
           </div>
           <div class="tools">
+            <button id="add-memory" class="btn primary add-memory hidden" type="button">＋ Add memory</button>
             <div class="search">
               <span class="search-ico">⌕</span>
               <input id="q" placeholder="Search this memory…" autocomplete="off" spellcheck="false">
@@ -140,6 +166,28 @@
         <div id="status" class="status hidden"></div>
       </section>
     </div>
+
+    <!-- Schema-driven editor for structured memories and emotion state. -->
+    <div id="memory-editor" class="memory-editor hidden" role="dialog" aria-modal="true" aria-labelledby="memory-editor-title">
+      <form id="memory-form" class="memory-editor-card">
+        <header class="memory-editor-head">
+          <div>
+            <div id="memory-editor-eyebrow" class="modal-eyebrow">New record</div>
+            <h2 id="memory-editor-title">Add memory</h2>
+          </div>
+          <button id="memory-editor-close" class="modal-close" type="button" aria-label="Close">×</button>
+        </header>
+        <p id="memory-editor-note" class="memory-editor-note"></p>
+        <div id="memory-fields" class="memory-fields"></div>
+        <p id="memory-editor-error" class="form-error hidden"></p>
+        <footer class="memory-editor-foot">
+          <button id="memory-editor-cancel" class="btn ghost" type="button">Cancel</button>
+          <span class="modal-spacer"></span>
+          <button id="memory-editor-save" class="btn primary" type="submit">Save memory</button>
+        </footer>
+      </form>
+    </div>
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
     <!-- ================================================================ -->
     <!-- Configure tab: character list + editor (persona / files / chat). -->
@@ -328,7 +376,7 @@
       </div>
     </div>
   </div>
-  <script src="/gui/static/app.js"></script>
-  <script src="/gui/static/config.js"></script>
+  <script src="/gui/static/app.js?v=clubhouse-1"></script>
+  <script src="/gui/static/config.js?v=clubhouse-1"></script>
 </body>
 </html>

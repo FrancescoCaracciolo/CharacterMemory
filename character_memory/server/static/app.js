@@ -25,6 +25,8 @@ const state = {
   q: "",
   cache: new Map(),        // `${memory}|${user}|${q}` -> Map(page -> data)
   inflight: null,          // AbortController for the active page fetch
+  editor: { editable: false, fields: [], description: "" },
+  editing: null,
   graph: { data: null, q: "", user: "", full: false, _gv: null, _wired: false }, // KG viz state
 };
 
@@ -47,6 +49,42 @@ const el = (tag, attrs = {}, children = []) => {
 };
 const clear = (n) => { while (n && n.firstChild) n.removeChild(n.firstChild); };
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ---------------------------------------------------------------- theme
+const THEME_KEY = "cm_theme";
+function applyTheme(theme, { persist = true } = {}) {
+  const next = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  document.documentElement.style.colorScheme = next;
+  const toggle = $("theme-toggle");
+  if (toggle) {
+    toggle.checked = next === "dark";
+    toggle.setAttribute("aria-label", `Dark theme ${toggle.checked ? "on" : "off"}`);
+  }
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = next === "dark" ? "#19162b" : "#fff8e8";
+  if (persist) {
+    try { localStorage.setItem(THEME_KEY, next); } catch (error) { /* storage may be disabled */ }
+  }
+}
+
+function wireThemeToggle() {
+  const toggle = $("theme-toggle");
+  if (!toggle) return;
+  applyTheme(document.documentElement.dataset.theme, { persist: false });
+  toggle.addEventListener("change", () => {
+    const next = toggle.checked ? "dark" : "light";
+    const change = () => applyTheme(next);
+    const canAnimate = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (document.startViewTransition && canAnimate) document.startViewTransition(change);
+    else change();
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === THEME_KEY && (event.newValue === "light" || event.newValue === "dark")) {
+      applyTheme(event.newValue, { persist: false });
+    }
+  });
+}
 
 // ---------------------------------------------------------------- time helpers
 function relTime(epoch) {
@@ -156,8 +194,18 @@ function markdown(text) {
 function wrapCard(children, rec) {
   const head = el("div", { class: "card-tags" }, []);
   const pill = scorePill(rec);
+  const actions = state.editor && state.editor.editable
+    ? el("div", { class: "card-actions" }, [
+        el("button", { class: "card-action", type: "button", title: "Edit memory", onclick: (event) => {
+          event.stopPropagation(); openMemoryEditor(rec);
+        } }, "Edit"),
+        el("button", { class: "card-action danger", type: "button", title: "Delete memory", onclick: (event) => {
+          event.stopPropagation(); removeMemory(rec);
+        } }, "Delete"),
+      ])
+    : null;
   const card = el("div", { class: "card" }, [
-    el("div", { class: "card-head" }, [head, pill ? el("div", {}, [pill]) : null]),
+    el("div", { class: "card-head" }, [head, el("div", { class: "card-head-end" }, [pill, actions])]),
     el("div", { class: "card-body" }, children),
     metaRow(rec),
   ]);
@@ -194,9 +242,14 @@ function renderDirective(rec) {
 function renderEpisode(rec) {
   const f = rec.fields || {};
   const card = wrapCard([el("div", { class: "text" }, f.summary || rec.text)], rec);
-  const shift = Number(f.emotional_shift || 0);
-  addTag(card, chip(shift >= 0 ? "positive" : "negative", shift >= 0 ? "kind-chip" : "warn-chip"));
-  card.appendChild(signedBar("emotional shift", shift));
+  const shift = f.emotional_shift && typeof f.emotional_shift === "object" ? f.emotional_shift : {};
+  const axes = Object.entries(shift).filter(([, value]) => Number(value) > 0);
+  for (const [axis, value] of axes)
+    addTag(card, chip(`${axis} ${Number(value).toFixed(2)}`, "kind-chip"));
+  if (rec.meta && rec.meta.raw_emotional_impact != null)
+    card.appendChild(fieldBar("emotional impact", rec.meta.raw_emotional_impact, { klass: "warn" }));
+  if (rec.meta && rec.meta.emotion_similarity != null)
+    card.appendChild(fieldBar("mood similarity", rec.meta.emotion_similarity, { klass: "good" }));
   card.appendChild(fieldBar("importance", f.importance));
   if (rec.meta && rec.meta.effective != null)
     card.appendChild(fieldBar("effective", rec.meta.effective, { klass: "warn" }));
@@ -306,6 +359,17 @@ async function getJSON(url, signal) {
   return r.json();
 }
 
+async function sendJSON(url, { method = "POST", body } = {}) {
+  const response = await fetch(url, {
+    method,
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+  return data;
+}
+
 async function loadCharacters() {
   const data = await getJSON(`${API}/`);
   state.characters = data.characters || [];
@@ -391,6 +455,7 @@ function renderSidebar() {
   clear(nav);
   const filter = ($("memory-filter").value || "").toLowerCase();
   const items = state.memories.filter((m) => !filter || m.title.toLowerCase().includes(filter) || m.name.includes(filter));
+  if ($("memory-total")) $("memory-total").textContent = `${state.memories.length} active`;
   if (!items.length) { nav.appendChild(el("div", { class: "empty" }, "No memories.")); return; }
   for (const m of items) {
     // Show how many distinct users a per-user memory knows about. More than
@@ -417,6 +482,7 @@ function renderHeader() {
   const kind = $("mem-kind"); clear(kind); kind.appendChild(document.createTextNode(m.kind || ""));
   $("mem-count").textContent = m.count != null ? `${m.count} records` : "";
   $("mem-disabled").classList.toggle("hidden", m.enabled !== false);
+  $("add-memory").classList.toggle("hidden", !(state.editor && state.editor.editable));
 }
 
 function renderUserFilter(users) {
@@ -442,9 +508,15 @@ function renderExtra(extra) {
     el("div", { class: "banner-title" }, "Baseline (resting state)"),
     ...inner,
   ]));
+  const current = Object.entries(extra.current_mood || {});
+  if (current.length) box.appendChild(el("div", { class: "banner" }, [
+    el("div", { class: "banner-title" }, "Current mood"),
+    ...current.map(([k, v]) => fieldBar(k, v, { klass: "good" })),
+  ]));
 }
 
 function renderPage(data) {
+  state.editor = data.editor || { editable: false, fields: [], description: "" };
   renderHeader();
   renderUserFilter(data.users);
   renderExtra(data.extra);
@@ -526,10 +598,144 @@ function showError(msg) {
   s.classList.remove("hidden");
 }
 
+let toastTimer = null;
+function toast(message, bad = false) {
+  const node = $("toast");
+  clearTimeout(toastTimer);
+  node.textContent = message;
+  node.classList.remove("hidden", "bad");
+  node.classList.toggle("bad", bad);
+  toastTimer = setTimeout(() => node.classList.add("hidden"), 2600);
+}
+
+function recordValue(rec, field) {
+  if (!rec) {
+    if (field.name === "user_id" && state.user) return state.user;
+    return field.default != null ? field.default : "";
+  }
+  if (field.name === "user_id") return rec.user_id || rec.id || "";
+  const fields = rec.fields || {};
+  if (fields[field.name] != null) return fields[field.name];
+  if (fields.state && fields.state[field.name] != null) return fields.state[field.name];
+  return field.default != null ? field.default : "";
+}
+
+function makeMemoryField(field, rec) {
+  let value = recordValue(rec, field);
+  if (field.type === "tags" && typeof value === "string") {
+    try { value = JSON.parse(value || "[]"); } catch (e) { value = value.split(","); }
+    value = Array.isArray(value) ? value.join(", ") : "";
+  }
+  const attrs = {
+    id: `mf-${field.name}`,
+    name: field.name,
+    required: !!field.required,
+    placeholder: field.placeholder || "",
+    disabled: !!(rec && field.readonly_on_edit),
+  };
+  let input;
+  if (field.type === "textarea" || field.type === "json") {
+    input = el("textarea", { ...attrs, rows: "4", class: "memory-input memory-textarea" });
+    input.value = field.type === "json" && typeof value !== "string"
+      ? JSON.stringify(value || {}, null, 2) : value;
+  } else if (field.type === "select") {
+    input = el("select", { ...attrs, class: "memory-input" }, (field.options || []).map((option) =>
+      el("option", { value: option }, option)));
+    input.value = value;
+  } else if (field.type === "range") {
+    const output = el("output", { class: "range-output", for: attrs.id }, Number(value).toFixed(2));
+    input = el("input", {
+      ...attrs, type: "range", class: "memory-range", value,
+      min: field.min, max: field.max, step: field.step || 0.05,
+      oninput: () => { output.value = Number(input.value).toFixed(2); },
+    });
+    return el("label", { class: "memory-field range-field", for: attrs.id }, [
+      el("span", { class: "memory-field-label" }, [field.label, field.required ? el("i", {}, "required") : null]),
+      el("div", { class: "range-wrap" }, [input, output]),
+    ]);
+  } else {
+    input = el("input", { ...attrs, type: field.type === "number" ? "number" : "text", class: "memory-input", value });
+  }
+  return el("label", { class: "memory-field", for: attrs.id }, [
+    el("span", { class: "memory-field-label" }, [field.label, field.required ? el("i", {}, "required") : null]),
+    input,
+    field.type === "tags" ? el("small", {}, "Separate values with commas") : null,
+    field.type === "json" ? el("small", {}, "JSON object of emotion axis → intensity") : null,
+  ]);
+}
+
+function openMemoryEditor(rec = null) {
+  if (!state.editor || !state.editor.editable) return;
+  state.editing = rec;
+  $("memory-editor-eyebrow").textContent = rec ? `Record ${rec.id}` : "New record";
+  $("memory-editor-title").textContent = `${rec ? "Edit" : "Add"} ${$("mem-title").textContent}`;
+  $("memory-editor-note").textContent = state.editor.description || "";
+  $("memory-editor-error").classList.add("hidden");
+  const fields = $("memory-fields"); clear(fields);
+  for (const field of state.editor.fields || []) fields.appendChild(makeMemoryField(field, rec));
+  $("memory-editor-save").textContent = rec ? "Save changes" : "Add to memory";
+  $("memory-editor").classList.remove("hidden");
+  document.body.classList.add("modal-open");
+  const first = fields.querySelector("input:not(:disabled), textarea:not(:disabled), select:not(:disabled)");
+  if (first) setTimeout(() => first.focus(), 0);
+}
+
+function closeMemoryEditor() {
+  $("memory-editor").classList.add("hidden");
+  document.body.classList.remove("modal-open");
+  state.editing = null;
+}
+
+function gatherMemoryValues() {
+  const values = {};
+  for (const field of state.editor.fields || []) {
+    const input = $(`mf-${field.name}`);
+    if (!input || input.disabled) continue;
+    if (field.type === "tags") values[field.name] = input.value.split(",").map((v) => v.trim()).filter(Boolean);
+    else if (field.type === "json") values[field.name] = JSON.parse(input.value || "{}");
+    else if (field.type === "range" || field.type === "number") values[field.name] = Number(input.value);
+    else values[field.name] = input.value;
+  }
+  return values;
+}
+
+async function saveMemory(event) {
+  event.preventDefault();
+  const button = $("memory-editor-save");
+  const error = $("memory-editor-error");
+  const wasEditing = !!state.editing;
+  button.disabled = true; button.textContent = "Saving…"; error.classList.add("hidden");
+  const base = `${API}/api/memories/${encodeURIComponent(state.character)}/${encodeURIComponent(state.memory)}`;
+  const url = state.editing ? `${base}/${encodeURIComponent(state.editing.id)}` : base;
+  try {
+    await sendJSON(url, { method: state.editing ? "PUT" : "POST", body: { values: gatherMemoryValues() } });
+    closeMemoryEditor();
+    toast(wasEditing ? "Memory updated" : "Memory added");
+    await loadOverview();
+  } catch (e) {
+    error.textContent = e.message; error.classList.remove("hidden");
+  } finally {
+    button.disabled = false;
+    button.textContent = wasEditing ? "Save changes" : "Add to memory";
+  }
+}
+
+async function removeMemory(rec) {
+  if (!confirm(`Delete memory ${rec.id}? This cannot be undone.`)) return;
+  const url = `${API}/api/memories/${encodeURIComponent(state.character)}/${encodeURIComponent(state.memory)}/${encodeURIComponent(rec.id)}`;
+  try {
+    await sendJSON(url, { method: "DELETE" });
+    toast("Memory deleted");
+    state.page = 1;
+    await loadOverview();
+  } catch (e) { toast(e.message, true); }
+}
+
 // ---------------------------------------------------------------- actions
 function selectMemory(name) {
   if (state.memory === name) return;
   state.memory = name;
+  state.editor = { editable: false, fields: [], description: "" };
   state.page = 1;
   state.user = "";
   state.q = "";
@@ -843,6 +1049,8 @@ function createGraphViz(canvas, opts) {
 
   // -------------------------------------------------------------- render
   function draw(dt) {
+    const lightTheme = document.documentElement.dataset.theme === "light";
+    const graphInk = lightTheme ? "48,41,71" : "255,255,255";
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     applyCamera();
@@ -857,8 +1065,8 @@ function createGraphViz(canvas, opts) {
       if (dimMode) {
         const both = a.retrieved && b.retrieved;
         if (both) { baseA = 0.25 + 0.6 * e.w; lw *= 1.6; }
-        else if (a.retrieved || b.retrieved) { baseA = 0.08 + 0.18 * e.w; col = "#55607d"; }
-        else { baseA = 0.04 + 0.06 * e.w; col = "#3a4257"; }
+        else if (a.retrieved || b.retrieved) { baseA = 0.08 + 0.18 * e.w; col = lightTheme ? "#9990aa" : "#55607d"; }
+        else { baseA = 0.04 + 0.06 * e.w; col = lightTheme ? "#c9c1d5" : "#3a4257"; }
       }
       const aA = (activeId && !e._hot) ? baseA * 0.45 : baseA;
       ctx.strokeStyle = hexA(col, aA);
@@ -888,7 +1096,7 @@ function createGraphViz(canvas, opts) {
 
     // node halos (additive bloom) — skipped for grayed (non-retrieved) nodes and
     // skipped entirely on big graphs (gradient allocation is the heaviest cost).
-    const GRAYC = "#5b647e";
+    const GRAYC = lightTheme ? "#92899f" : "#5b647e";
     const drawHalos = nodes.length <= HALO_NODE_CAP;
     if (drawHalos) for (const a of nodes) {
       const isGray = dimMode && !a.retrieved;
@@ -914,15 +1122,15 @@ function createGraphViz(canvas, opts) {
       ctx.fillStyle = hexA(col, na);
       ctx.beginPath(); ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2); ctx.fill();
       if (a.kind === "self") {
-        ctx.lineWidth = 2.5; ctx.strokeStyle = `rgba(255,255,255,${na})`;
+        ctx.lineWidth = 2.5; ctx.strokeStyle = `rgba(${graphInk},${na})`;
         ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 2.5, 0, Math.PI * 2); ctx.stroke();
       } else if ((a._hot || (dimMode && a.retrieved)) && a._e > 0.05) {
-        ctx.lineWidth = 2; ctx.strokeStyle = `rgba(255,255,255,${0.4 + 0.5 * a._e})`;
+        ctx.lineWidth = 2; ctx.strokeStyle = `rgba(${graphInk},${0.4 + 0.5 * a._e})`;
         ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 2, 0, Math.PI * 2); ctx.stroke();
       }
       // Persistent ring on the clicked (selected) node so the click is obvious.
       if (selectedId === a.id) {
-        ctx.lineWidth = 3; ctx.strokeStyle = "rgba(255,255,255,0.95)";
+        ctx.lineWidth = 3; ctx.strokeStyle = `rgba(${graphInk},0.95)`;
         ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 4, 0, Math.PI * 2); ctx.stroke();
       }
     }
@@ -939,8 +1147,11 @@ function createGraphViz(canvas, opts) {
       const show = showAll || isActive || (hoveredNeighbors && hoveredNeighbors.has(a.id));
       if (!show) continue;
       const txt = a.label.length > 22 ? a.label.slice(0, 21) + "…" : a.label;
-      ctx.fillStyle = `rgba(230,233,242,${isActive ? 0.95 : 0.6})`;
-      ctx.shadowColor = "rgba(8,10,16,0.95)"; ctx.shadowBlur = 4;
+      ctx.fillStyle = lightTheme
+        ? `rgba(48,41,71,${isActive ? 0.95 : 0.72})`
+        : `rgba(244,241,255,${isActive ? 0.95 : 0.68})`;
+      ctx.shadowColor = lightTheme ? "rgba(255,251,239,0.98)" : "rgba(8,10,16,0.95)";
+      ctx.shadowBlur = lightTheme ? 6 : 4;
       ctx.fillText(txt, a.x, a.y + a.r + 3);
       ctx.shadowBlur = 0;
     }
@@ -1335,7 +1546,11 @@ function renderNodeDetail(node) {
   if (raw.confidence != null) box.appendChild(fieldBar("confidence", raw.confidence, { klass: "good" }));
   if (raw.importance != null) box.appendChild(fieldBar("importance", raw.importance));
   if (node.act != null) box.appendChild(fieldBar("activation", node.act, { klass: "warn" }));
-  if (raw.emotional_shift != null) box.appendChild(signedBar("emotional shift", Number(raw.emotional_shift)));
+  if (raw.emotional_shift && typeof raw.emotional_shift === "object") {
+    for (const [axis, value] of Object.entries(raw.emotional_shift)) {
+      if (Number(value) > 0) box.appendChild(fieldBar(`emotion · ${axis}`, Number(value)));
+    }
+  }
   let aliases = [];
   try { aliases = Array.isArray(raw.aliases) ? raw.aliases : JSON.parse(raw.aliases || "[]"); } catch (e) { aliases = []; }
   if (aliases.length) box.appendChild(el("div", { class: "kw-chips" }, aliases.map(kwChip)));
@@ -1353,10 +1568,19 @@ function renderNodeDetail(node) {
 
 // ---------------------------------------------------------------- wire up
 async function init() {
+  wireThemeToggle();
   $("refresh").addEventListener("click", () => loadOverview());
+  $("add-memory").addEventListener("click", () => openMemoryEditor());
+  $("memory-form").addEventListener("submit", saveMemory);
+  $("memory-editor-close").addEventListener("click", closeMemoryEditor);
+  $("memory-editor-cancel").addEventListener("click", closeMemoryEditor);
+  $("memory-editor").addEventListener("mousedown", (event) => {
+    if (event.target === $("memory-editor")) closeMemoryEditor();
+  });
   $("character").addEventListener("change", (e) => {
     state.character = e.target.value;
     state.memory = null; state.page = 1; state.q = ""; state.user = "";
+    state.editor = { editable: false, fields: [], description: "" };
     // Tear down the previous renderer when switching characters.
     if (state.graph._gv) { try { state.graph._gv.destroy(); } catch (err) {} }
     state.graph = { data: null, q: "", user: "", _gv: null, _wired: false };
@@ -1381,7 +1605,8 @@ async function init() {
     if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
       e.preventDefault(); $("q").focus();
     } else if (e.key === "Escape") {
-      if ($("q").value) { $("q").value = ""; onSearchInput(); }
+      if (!$("memory-editor").classList.contains("hidden")) closeMemoryEditor();
+      else if ($("q").value) { $("q").value = ""; onSearchInput(); }
     }
   });
   // Refit the canvas renderer when the window resizes (the viz also watches
