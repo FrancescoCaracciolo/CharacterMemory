@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse, Response
 
 from ..agent import CharacterAgent
 from ..chunking import Chunk
+from ..emotion_vectors import emotion_vector, encode_emotion_vector
 from .adapters import overview as memory_overview, read_graph, read_memory
 from ..memory.character_base import RAGMemory
 from ..memory.emotion import EmotionStatus
@@ -494,7 +495,10 @@ def _tool_add_episode(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     row_id = mem.add_episode(
         user_id=user_id, summary=summary,
         importance=_clip(_args(args, "importance", 0.5)),
-        emotional_shift=_clip(_args(args, "emotional_shift", 0.0), -1.0, 1.0, 0.0),
+        emotional_shift=emotion_vector(
+            _args(args, "emotional_shift", {}),
+            allowed_axes=getattr(mem, "emotion_baseline", None),
+        ),
     )
     _persist_after_write(agent, mem)
     return {"id": row_id, "memory": mem.name}
@@ -515,7 +519,10 @@ def _tool_update_episode(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     if _args(args, "importance", None) is not None:
         row["importance"] = _clip(args["importance"])
     if _args(args, "emotional_shift", None) is not None:
-        row["emotional_shift"] = _clip(args["emotional_shift"], -1.0, 1.0, 0.0)
+        row["emotional_shift"] = encode_emotion_vector(
+            args["emotional_shift"],
+            allowed_axes=getattr(mem, "emotion_baseline", None),
+        )
     mem.update_row(row)
     _persist_after_write(agent, mem)
     return {"id": row_id, "memory": mem.name, "updated": True}
@@ -617,6 +624,7 @@ def _tool_set_user_emotion(agent: CharacterAgent, mem: Any, args: dict) -> dict:
         return _json_error("user_id is required.")
     deltas = _args(args, "deltas", None)
     comment = _args(args, "comment", None)
+    current_mood = _args(args, "current_mood", None)
     if isinstance(deltas, str):
         try:
             deltas = json.loads(deltas)
@@ -626,9 +634,12 @@ def _tool_set_user_emotion(agent: CharacterAgent, mem: Any, args: dict) -> dict:
         mem.update(user_id, {k: float(v) for k, v in deltas.items() if k in mem.user_dims})
     if isinstance(comment, str) and comment.strip():
         mem.set_user_comment(user_id, comment)
+    if current_mood is not None:
+        mem.set_current_mood(current_mood)
     return {
         "user_id": user_id,
         "state": mem.get_user_state(user_id),
+        "current_mood": mem.get_current_mood(),
         "comment": mem.get_user_comment(user_id),
     }
 
@@ -642,6 +653,7 @@ def _tool_get_user_emotion(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     return {
         "user_id": user_id,
         "baseline": dict(mem.baseline),
+        "current_mood": mem.get_current_mood(),
         "state": mem.get_user_state(user_id),
         "comment": mem.get_user_comment(user_id),
     }
@@ -928,8 +940,8 @@ _register(
 _register(
     "add_episode",
     "Add a memory of what happened to `episodic`. `emotional_shift` is a "
-    "signed float in [-1, 1] capturing how the event moved the character's "
-    "feelings toward the user. `importance` (0..1) is the base importance.",
+    "sparse object mapping configured emotion axes to 0..1 intensities. "
+    "`importance` (0..1) is the base importance.",
     {
         "type": "object",
         "properties": {
@@ -937,7 +949,11 @@ _register(
             "user_id": {"type": "string"},
             "summary": {"type": "string"},
             "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
-            "emotional_shift": {"type": "number", "minimum": -1, "maximum": 1, "default": 0.0},
+            "emotional_shift": {
+                "type": "object",
+                "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1},
+                "default": {},
+            },
         },
         "required": ["memory", "user_id", "summary"],
     },
@@ -953,7 +969,10 @@ _register(
             "id": {"type": "integer"},
             "summary": {"type": "string"},
             "importance": {"type": "number", "minimum": 0, "maximum": 1},
-            "emotional_shift": {"type": "number", "minimum": -1, "maximum": 1},
+            "emotional_shift": {
+                "type": "object",
+                "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1},
+            },
         },
         "required": ["memory", "id"],
     },
@@ -1053,6 +1072,11 @@ _register(
                 "additionalProperties": {"type": "number"},
             },
             "comment": {"type": "string", "description": "Relationship label (e.g. \"colleague\")."},
+            "current_mood": {
+                "type": "object",
+                "description": "Absolute character-wide mood over configured baseline axes.",
+                "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1},
+            },
         },
         "required": ["memory", "user_id"],
     },
@@ -1061,7 +1085,7 @@ _register(
 _register(
     "get_user_emotion",
     "Return the user's emotion state (numeric dims + relationship comment) "
-    "and the character's baseline.",
+    "and the character's baseline and current mood.",
     {
         "type": "object",
         "properties": {"memory": {"type": "string"}, "user_id": {"type": "string"}},

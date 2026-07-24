@@ -12,6 +12,13 @@ This lets a client use its own LLM/model and only rely on the server for
 memory recall and learning. The core library does **not** depend on FastAPI;
 `fastapi` and `uvicorn` are pulled in only by the optional `server` extra.
 
+The bundled WebUI at **`/gui`** is also a memory observatory and character
+workshop. SQLite-backed memories (`user_facts`, `user_directives`, `episodic`,
+`heartbeat`, `user_summary`) and per-user emotion state can be added, edited,
+and deleted directly from the Archive view. RAG chunks and the knowledge graph
+are intentionally read-only because their source of truth is the character's
+files; edit those under Workshop → Files and rebuild the indexes instead.
+
 ---
 
 ## Install
@@ -104,6 +111,19 @@ or `all`), which also works when launching through uvicorn directly.
 ---
 
 ## Endpoints
+
+### Memory browser and editor
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/memories/{character}` | List memory systems, counts, users, and editability. |
+| `GET` | `/api/memories/{character}/{memory}` | Page/search records and return the WebUI form schema. |
+| `POST` | `/api/memories/{character}/{memory}` | Add a record using `{ "values": { ... } }`. |
+| `PUT` | `/api/memories/{character}/{memory}/{record_id}` | Update the submitted fields on a record. |
+| `DELETE` | `/api/memories/{character}/{memory}/{record_id}` | Remove a record. |
+
+Structured-memory writes refresh and persist the hybrid retrieval index. The
+API returns `405` for derived/read-only memories.
 
 ### `GET /`
 
@@ -471,15 +491,15 @@ register themselves at module import.
 | `add_directive`         | `user_directives` | `user_id`, `content`, `importance`, `keywords`.                            |
 | `update_directive`      | `user_directives` | `id`, plus any subset.                                                       |
 | `delete_directive`      | `user_directives` | `id`.                                                                       |
-| `add_episode`           | `episodic`        | `user_id`, `summary`, `importance`, `emotional_shift` ∈ [-1, 1].            |
+| `add_episode`           | `episodic`        | `user_id`, `summary`, `importance`, sparse vector `emotional_shift` (configured axes, `0..1`). |
 | `update_episode`        | `episodic`        | `id`, plus any subset.                                                       |
 | `delete_episode`        | `episodic`        | `id`.                                                                       |
 | `add_heartbeat`         | `heartbeat`       | `summary`, `kind` (`discovery` \| `action`), `importance`.                  |
 | `update_heartbeat`      | `heartbeat`       | `id`, plus any subset.                                                       |
 | `delete_heartbeat`      | `heartbeat`       | `id`.                                                                       |
 | `set_user_summary`      | `user_summary`    | `user_id`, `summary`, optional `name`, `aliases`, `importance`.              |
-| `set_user_emotion`      | `emotion`         | `user_id`, optional `deltas` object + optional `comment` string.             |
-| `get_user_emotion`      | `emotion`         | `user_id`. Returns baseline + per-user dims + relationship comment.         |
+| `set_user_emotion`      | `emotion`         | `user_id`, optional signed `deltas`, absolute `current_mood`, and optional `comment`. |
+| `get_user_emotion`      | `emotion`         | `user_id`. Returns baseline + current mood + per-user dims + relationship comment. |
 | `add_character_info`    | `character_info`  | `text`, optional `source`. Session-scoped — see caveat below.               |
 | `add_dialogue`          | `dialogue_style`  | Same caveat as `add_character_info`.                                         |
 

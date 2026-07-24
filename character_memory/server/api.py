@@ -56,6 +56,7 @@ from character_memory import (
 from .adapters import overview as memory_overview
 from .adapters import read_graph as read_graph_view
 from .adapters import read_memory as read_memory_page
+from .editor import create_record, delete_record, edit_schema, update_record
 
 # MCP (Model Context Protocol) endpoint: JSON-RPC 2.0 over the Streamable
 # HTTP transport, JSON-only. Mounted at /mcp with ``?character=<name>``
@@ -222,6 +223,12 @@ class SaveResponse(BaseModel):
     )
 
 
+class MemoryMutationRequest(BaseModel):
+    """Fields submitted by the browser's schema-driven memory editor."""
+
+    values: dict = Field(default_factory=dict)
+
+
 # --------------------------------------------------------------------------- #
 # App + handlers.
 # --------------------------------------------------------------------------- #
@@ -348,7 +355,10 @@ def gui() -> HTMLResponse:
 def list_memories(character: str) -> dict:
     """Sidebar overview: every memory with its record count + known users."""
     agent = _get_agent(character)
-    return {"character": character, "memories": memory_overview(agent)}
+    rows = memory_overview(agent)
+    for row in rows:
+        row["editable"] = bool(edit_schema(agent.memories[row["name"]])["editable"])
+    return {"character": character, "memories": rows}
 
 
 @app.get("/api/memories/{character}/{memory}")
@@ -363,7 +373,9 @@ def read_memories(
     """One page of records for a memory, with optional search + user filter."""
     agent = _get_agent(character)
     try:
-        return read_memory_page(agent, memory, page=page, size=size, user=user, q=q)
+        payload = read_memory_page(agent, memory, page=page, size=size, user=user, q=q)
+        payload["editor"] = edit_schema(agent.memories[memory])
+        return payload
     except KeyError:
         raise HTTPException(
             status_code=404,
@@ -372,6 +384,64 @@ def read_memories(
                 f"Available: {sorted(agent.memories)}."
             ),
         )
+
+
+def _memory_for_edit(character: str, memory: str):
+    agent = _get_agent(character)
+    mem = agent.memories.get(memory)
+    if mem is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown memory {memory!r} for {character!r}.",
+        )
+    if not edit_schema(mem)["editable"]:
+        raise HTTPException(status_code=405, detail=edit_schema(mem)["description"])
+    return agent, mem
+
+
+@app.post("/api/memories/{character}/{memory}", status_code=201)
+def add_memory_record(character: str, memory: str, req: MemoryMutationRequest) -> dict:
+    """Add one editable memory record and refresh its retrieval index."""
+    agent, mem = _memory_for_edit(character, memory)
+    try:
+        record_id = create_record(agent, mem, req.values)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "id": record_id, "memory": memory}
+
+
+@app.put("/api/memories/{character}/{memory}/{record_id}")
+def edit_memory_record(
+    character: str, memory: str, record_id: str, req: MemoryMutationRequest
+) -> dict:
+    """Edit one memory record without disturbing its decay bookkeeping."""
+    agent, mem = _memory_for_edit(character, memory)
+    try:
+        updated_id = update_record(agent, mem, record_id, req.values)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Memory record {record_id!r} does not exist.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "id": updated_id, "memory": memory}
+
+
+@app.delete("/api/memories/{character}/{memory}/{record_id}")
+def remove_memory_record(character: str, memory: str, record_id: str) -> dict:
+    """Delete one editable memory record and refresh its retrieval index."""
+    agent, mem = _memory_for_edit(character, memory)
+    try:
+        deleted_id = delete_record(agent, mem, record_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Memory record {record_id!r} does not exist.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "id": deleted_id, "memory": memory}
 
 
 @app.get("/api/graph/{character}")

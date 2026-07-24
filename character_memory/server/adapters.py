@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from character_memory import EmotionStatus, Memory, StructuredMemory
+from character_memory.emotion_vectors import emotion_similarity, emotional_impact
 from character_memory.memory.character_base import RAGMemory
 from character_memory.memory.knowledge_graph_memory import KnowledgeGraphMemory
 
@@ -118,19 +119,31 @@ class StructuredAdapter(MemoryAdapter):
     def _record(self, row: dict[str, Any], score: Optional[float] = None) -> MemoryRecord:
         # Use the memory's own effective-importance (episodic weights in emotion).
         eff = self._safe_effective(row)
+        fields = dict(row)
+        meta = {
+            "effective": eff,
+            "importance": row.get("importance"),
+            "recall_count": row.get("recall_count"),
+            "created_at": row.get("created_at"),
+            "last_recalled": row.get("last_recalled"),
+        }
+        if self.m.name == "episodic":
+            try:
+                item = self.m.row_item(row, eff or 0.0)
+                fields["emotional_shift"] = item.metadata["emotional_shift"]
+                meta["raw_emotional_impact"] = item.metadata["raw_emotional_impact"]
+                meta["emotion_similarity"] = item.metadata["emotion_similarity"]
+                meta["impact"] = item.metadata["impact"]
+                meta["similarity"] = item.metadata["similarity"]
+            except Exception:
+                pass
         return MemoryRecord(
             id=row.get("id"),
             user_id=row.get("user_id"),
             text=self.m.row_text(row),
             score=score if score is not None else eff,
-            fields=dict(row),
-            meta={
-                "effective": eff,
-                "importance": row.get("importance"),
-                "recall_count": row.get("recall_count"),
-                "created_at": row.get("created_at"),
-                "last_recalled": row.get("last_recalled"),
-            },
+            fields=fields,
+            meta=meta,
         )
 
     def _safe_effective(self, row: dict[str, Any]) -> Optional[float]:
@@ -306,6 +319,12 @@ class EmotionAdapter(MemoryAdapter):
         except Exception:
             return {}
 
+    def current_mood(self) -> dict[str, float]:
+        try:
+            return self.m.get_current_mood()
+        except Exception:
+            return {}
+
     def _record(self, row: dict) -> MemoryRecord:
         try:
             blob = json.loads(row.get("state") or "{}")
@@ -395,10 +414,18 @@ class KnowledgeGraphAdapter(MemoryAdapter):
         fields: dict[str, Any] = {}
         for k in ("name", "aliases", "user_id", "content", "type", "confidence",
                   "importance", "summary", "emotional_shift", "timestamp",
-                  "participants", "kind_label", "baseline"):
+                  "participants", "kind_label", "baseline", "current_mood"):
             v = getattr(node, k, None)
             if v is not None:
                 fields[k] = v
+        shift = getattr(node, "emotional_shift", None)
+        if isinstance(shift, dict):
+            self_node = self.m.retriever.graph.nodes.get(self.m.retriever.graph.SELF_ID)
+            current = getattr(self_node, "current_mood", {}) if self_node else {}
+            meta["raw_emotional_impact"] = emotional_impact(shift)
+            meta["emotion_similarity"] = emotion_similarity(shift, current or {})
+            meta["impact"] = meta["raw_emotional_impact"]
+            meta["similarity"] = meta["emotion_similarity"]
         return MemoryRecord(
             id=getattr(node, "id", None),
             user_id=getattr(node, "user_id", None),
@@ -577,6 +604,7 @@ def read_memory(
     extra: dict[str, Any] = {}
     if isinstance(adapter, EmotionAdapter):
         extra["baseline"] = adapter.baseline()
+        extra["current_mood"] = adapter.current_mood()
 
     return {
         "character": agent.character_name,
@@ -717,10 +745,18 @@ def read_graph(
         }
         for k in ("name", "user_id", "aliases", "content", "type", "confidence",
                   "importance", "summary", "emotional_shift", "timestamp",
-                  "kind_label", "baseline", "comment"):
+                  "kind_label", "baseline", "current_mood", "comment"):
             v = getattr(node, k, None)
             if v is not None and v != "":
                 d[k] = v
+        shift = getattr(node, "emotional_shift", None)
+        if isinstance(shift, dict):
+            self_node = retriever.graph.nodes.get(retriever.graph.SELF_ID)
+            current = getattr(self_node, "current_mood", {}) if self_node else {}
+            d["raw_emotional_impact"] = emotional_impact(shift)
+            d["emotion_similarity"] = emotion_similarity(shift, current or {})
+            d["impact"] = d["raw_emotional_impact"]
+            d["similarity"] = d["emotion_similarity"]
         nodes.append(d)
     # Edges: only between kept nodes, skip co_occurrence unless asked, cap the
     # count. Prefer higher-weight / structural edges over weak ones.
