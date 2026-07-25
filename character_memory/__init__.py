@@ -27,6 +27,7 @@ from .config import (
     LLMConfig,
     MemoryConfig,
 )
+from .emotion_vectors import emotion_similarity, emotion_vector, emotional_impact
 from .llm import (
     EmbeddingProvider,
     LLMClient,
@@ -89,6 +90,9 @@ __all__ = [
     "ContradictionPolicy",
     "KnowledgeGraphConfig",
     "MemoryConfig",
+    "emotion_vector",
+    "emotional_impact",
+    "emotion_similarity",
     "DedupConfig",
     "PromptConfig",
     "CharacterManifest",
@@ -140,4 +144,3 @@ __all__ = [
     "Deduplicator",
     "DedupReport",
 ]
-

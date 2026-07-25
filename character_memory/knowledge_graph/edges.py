@@ -15,6 +15,8 @@ import dataclasses as _dc
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..emotion_vectors import emotion_vector
+
 
 @dataclass
 class Edge:
@@ -123,16 +125,19 @@ class TransitionEdge(Edge):
 class EpisodeEdge(Edge):
     """Person <-> Episode. One person's participation in an episode.
 
-    Carries the per-participation `timestamp`, `emotional_shift` (signed) and
-    `importance`, plus a `recall` flag set when this episode has been
+    Carries the per-participation `timestamp`, sparse vector
+    `emotional_shift` and `importance`, plus a `recall` flag set when this episode has been
     surfaced to the prompt at least once.
     """
 
     kind: str = "episode"
     timestamp: float = 0.0
-    emotional_shift: float = 0.0
+    emotional_shift: dict[str, float] = field(default_factory=dict)
     importance: float = 0.5
     recall: bool = False
+
+    def __post_init__(self) -> None:
+        self.emotional_shift = emotion_vector(self.emotional_shift)
 
     def _extra_fields(self) -> dict[str, Any]:
         return {

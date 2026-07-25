@@ -19,10 +19,12 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional
 
+from ..emotion_vectors import emotion_vector
 from .edges import (
     SYMMETRIC_KINDS,
     CoOccurrenceEdge,
     Edge,
+    EpisodeEdge,
     edge_from_dict,
 )
 from .nodes import (
@@ -93,12 +95,20 @@ class KnowledgeGraph:
         self._adj.pop(node_id, None)
         del self.nodes[node_id]
 
-    def ensure_self(self, baseline: Optional[dict] = None) -> SelfNode:
+    def ensure_self(
+        self,
+        baseline: Optional[dict] = None,
+        current_mood: Optional[dict] = None,
+    ) -> SelfNode:
         """Return the singular SelfNode, creating it with `baseline` if absent."""
         node = self.nodes.get(self.SELF_ID)
         if isinstance(node, SelfNode):
             if baseline:
-                node.baseline.update({k: float(v) for k, v in baseline.items()})
+                node.baseline = emotion_vector({**node.baseline, **baseline})
+            if current_mood is not None:
+                node.current_mood = emotion_vector(
+                    current_mood, allowed_axes=node.baseline or None
+                )
             return node
         import time as _time
         now = _time.time()
@@ -107,6 +117,7 @@ class KnowledgeGraph:
             kind="self",
             text="self",
             baseline=dict(baseline or {}),
+            current_mood=dict(current_mood or {}),
             created_at=now,
             practice_times=[now],
         )
@@ -501,6 +512,10 @@ class KnowledgeGraph:
             # accumulate co_recall_count here. Only the Hebbian step (a real
             # co-recall event) increments it; take the max for safety.
             existing.co_recall_count = max(existing.co_recall_count, new.co_recall_count)
+        if isinstance(existing, EpisodeEdge) and isinstance(new, EpisodeEdge):
+            # The vector is source-of-truth data, not a monotonic strength.
+            # Re-ingestion must refresh it when an episodic row is edited.
+            existing.emotional_shift = dict(new.emotional_shift)
 
     def get_edge_between(self, kind: str, src: str, dst: str) -> Optional[Edge]:
         return self.edges.get(self.edge_id(kind, src, dst))

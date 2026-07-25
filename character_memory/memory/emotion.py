@@ -1,10 +1,11 @@
-"""Emotion status: a user-independent baseline plus configurable per-user dims."""
+"""Emotion status: baseline/current mood plus configurable per-user dims."""
 
 import json
 from typing import TYPE_CHECKING, Any, Optional
 
 from .base import ExtractionSpec, Memory, MemoryItem, MemoryScope
 from ..chunking import Chunk
+from ..emotion_vectors import decode_emotion_vector, emotion_vector, encode_emotion_vector
 from .store import SQLiteStore
 
 if TYPE_CHECKING:  # avoid circular import at runtime
@@ -15,7 +16,8 @@ class EmotionStatus(Memory):
     """Tracks how the character feels.
 
     A fixed `baseline` (user-independent: `joy`, `sadness`…) describes the
-    character's resting state. On top of that, a set of per-user dimensions
+    character's resting state. A persisted `current_mood` uses the same axes
+    and is replaced by each extraction pass. On top of that, per-user dimensions
     (default `affection`, `valence`, `trust` - configurable) tracks how
     the character feels *toward each user*, plus a per-user `comment`: a short
     relationship descriptor (colleague / friend / conflicting / …). The
@@ -39,10 +41,17 @@ class EmotionStatus(Memory):
         self.baseline = dict(baseline or {"neutral": 0.5, "joy": 0.2, "sadness": 0.1, "anger": 0, "anxiety": 0})
         self.user_dims = dict(user_dims or {"affection": 0.0, "valence": 0.0, "trust": 0.0})
         self.table = "emotion"
+        self.state_table = "emotion_state"
         self.store.create_table(
             self.table,
             {"user_id": "TEXT PRIMARY KEY", "state": "TEXT NOT NULL"},
         )
+        self.store.create_table(
+            self.state_table,
+            {"key": "TEXT PRIMARY KEY", "state": "TEXT NOT NULL"},
+        )
+        if not self.store.select(self.state_table, {"key": "current_mood"}):
+            self.set_current_mood(self.baseline)
 
     # State
     # The per-user state is one JSON blob per user holding the numeric dims
@@ -109,12 +118,36 @@ class EmotionStatus(Memory):
         self.set_user_state(user_id, current)
         return current
 
+    def get_current_mood(self) -> dict[str, float]:
+        """Return the persisted character-wide mood, or the baseline initially."""
+        rows = self.store.select(self.state_table, {"key": "current_mood"})
+        if not rows:
+            return emotion_vector(self.baseline, allowed_axes=self.baseline)
+        clean = decode_emotion_vector(rows[0]["state"], allowed_axes=self.baseline)
+        return {axis: float(clean.get(axis, 0.0)) for axis in self.baseline}
+
+    def set_current_mood(self, mood: dict[str, float]) -> dict[str, float]:
+        """Replace the character-wide mood with an absolute snapshot."""
+        clean = emotion_vector(mood, allowed_axes=self.baseline)
+        # An absolute snapshot has every configured axis; omissions mean zero.
+        full = {axis: float(clean.get(axis, 0.0)) for axis in self.baseline}
+        self.store.upsert(
+            self.state_table,
+            {
+                "key": "current_mood",
+                "state": encode_emotion_vector(full, allowed_axes=self.baseline),
+            },
+            pk="key",
+        )
+        return full
+
     # Recall
     def recall(self, query: str, user_id: str, limit: int, state_changing: bool = True) -> list[MemoryItem]:
         # Emotion recall never mutates state; `state_changing` is accepted
         # for interface symmetry but has no effect.
         state = self.get_user_state(user_id)
-        parts = [f"{k}={v:.2f}" for k, v in self.baseline.items()]
+        parts = [f"baseline.{k}={v:.2f}" for k, v in self.baseline.items()]
+        parts += [f"current.{k}={v:.2f}" for k, v in self.get_current_mood().items()]
         parts += [f"{k}(toward {user_id})={v:.2f}" for k, v in state.items()]
         comment = self.get_user_comment(user_id)
         if comment:
@@ -138,11 +171,16 @@ class EmotionStatus(Memory):
         if len(participants) == 1:
             return self.recall(query, participants[0], limit, state_changing=state_changing)
         items: list[MemoryItem] = []
-        # Baseline once.
+        # Baseline and current mood once.
         for k, v in self.baseline.items():
             items.append(
-                MemoryItem(text=f"{k}={v:.2f}", score=1.0, kind=self.name,
+                MemoryItem(text=f"baseline.{k}={v:.2f}", score=1.0, kind=self.name,
                            metadata={"emotion": "baseline"})
+            )
+        for k, v in self.get_current_mood().items():
+            items.append(
+                MemoryItem(text=f"current.{k}={v:.2f}", score=1.0, kind=self.name,
+                           metadata={"emotion": "current"})
             )
         # Each participant's per-user dims + relationship comment, tagged with
         # the user for grouping.
@@ -225,89 +263,93 @@ class EmotionStatus(Memory):
 
     def extraction_spec(self, context: "ExtractionContext | None" = None) -> ExtractionSpec:
         dims = ", ".join(self.user_dims) or "affection, valence, trust"
+        mood_axes = list(self.baseline)
         char = context.character_name if context else "the character"
         user = context.user_name if context else "the user"
         participants = getattr(context, "participants", None) or []
-        if participants and len(participants) > 1:
-            # Group chat: one signed-delta object (+ optional comment) per
-            # participant. The ``user_id`` enum is injected by the extractor
-            # builder.
-            return ExtractionSpec(
-                field="emotion_deltas",
-                per_user=True,
-                schema={
-                    "type": "array",
-                    "description": (
-                        f"Signed adjustments to {char}'s per-user emotion dims, "
-                        f"one entry per participant. Allowed dims: {dims}."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "user_id": {"type": "string"},
-                            "deltas": {
-                                "type": "object",
-                                "additionalProperties": {"type": "number"},
-                            },
-                            "comment": {"type": "string"},
-                        },
-                        "required": ["user_id", "deltas"],
-                    },
-                },
-                instruction=(
-                    f"- emotion_deltas: small signed adjustments to {char}'s feelings "
-                    f"toward each of the participants ({', '.join(participants)}), based "
-                    f"on what just happened. One entry per participant the exchange was "
-                    f"about; omit participants with no shift. Allowed dims: {dims}. "
-                    + self._COMMENT_NOTE.format(who="a participant")
-                ),
-            )
+        users = participants or [user]
+        mood_properties = {
+            axis: {"type": "number", "minimum": 0, "maximum": 1}
+            for axis in mood_axes
+        }
         return ExtractionSpec(
             field="emotion_deltas",
             schema={
                 "type": "object",
                 "description": (
-                    f"Signed adjustments to {char}'s per-user emotion dims "
-                    f"(any of: {dims}), plus an optional relationship `comment`."
+                    f"{char}'s absolute current mood plus per-user relationship deltas."
                 ),
                 "properties": {
-                    "comment": {"type": "string"},
+                    "current_mood": {
+                        "type": "object",
+                        "properties": mood_properties,
+                        "required": mood_axes,
+                        "additionalProperties": False,
+                    },
+                    "users": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "user_id": {"type": "string", "enum": users},
+                                "deltas": {
+                                    "type": "object",
+                                    "properties": {
+                                        dim: {"type": "number"} for dim in self.user_dims
+                                    },
+                                    "additionalProperties": False,
+                                },
+                                "comment": {"type": "string"},
+                            },
+                            "required": ["user_id", "deltas"],
+                            "additionalProperties": False,
+                        },
+                    },
                 },
-                "additionalProperties": {"type": "number"},
+                "required": ["current_mood", "users"],
+                "additionalProperties": False,
             },
             instruction=(
-                f"- emotion_deltas: small signed adjustments to {char}'s feelings "
-                f"toward {user}, based on what just happened. Allowed dims: {dims}. "
-                + self._COMMENT_NOTE.format(who=user)
+                f"- emotion_deltas: set current_mood to {char}'s complete absolute mood "
+                f"after this exchange using 0..1 axes: {', '.join(mood_axes)}. In users, "
+                f"include only people whose relationship state shifted, with small signed "
+                f"adjustments on: {dims}. "
+                + self._COMMENT_NOTE.format(who="that user")
             ),
         )
 
     def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
         if not value:
             return []
-        # Multi-user: a list of {user_id, deltas, comment?}. Apply each entry
-        # to its own user; the comment is written only when provided (a stable
-        # label is otherwise preserved).
-        if isinstance(value, list):
-            for entry in value:
-                if not isinstance(entry, dict):
-                    continue
-                uid = str(entry.get("user_id") or user_id)
-                deltas = entry.get("deltas")
-                if isinstance(deltas, dict):
-                    self.update(uid, deltas)
-                comment = entry.get("comment")
-                if isinstance(comment, str) and comment.strip():
-                    self.set_user_comment(uid, comment)
+        if not isinstance(value, dict):
             return []
-        # Single-user: a {dim: delta, comment?} object applied to the caller's
-        # user. `update` preserves the comment; the comment is written only
-        # when present.
-        if isinstance(value, dict):
-            comment = value.get("comment")
-            deltas = {k: v for k, v in value.items() if k != "comment"}
-            if deltas:
-                self.update(user_id, deltas)
+        mood = value.get("current_mood")
+        changed = False
+        if isinstance(mood, dict):
+            self.set_current_mood(mood)
+            changed = True
+        changed_users: list[str] = []
+        for entry in value.get("users") or []:
+            if not isinstance(entry, dict):
+                continue
+            uid = str(entry.get("user_id") or user_id)
+            deltas = entry.get("deltas")
+            if isinstance(deltas, dict) and deltas:
+                self.update(uid, deltas)
+                changed = True
+            comment = entry.get("comment")
             if isinstance(comment, str) and comment.strip():
-                self.set_user_comment(user_id, comment)
-        return []
+                self.set_user_comment(uid, comment)
+                changed = True
+            if uid not in changed_users:
+                changed_users.append(uid)
+        if not changed:
+            return []
+        return [
+            MemoryItem(
+                text="emotion state updated",
+                score=1.0,
+                kind=self.name,
+                metadata={"users": changed_users, "current_mood": self.get_current_mood()},
+            )
+        ]

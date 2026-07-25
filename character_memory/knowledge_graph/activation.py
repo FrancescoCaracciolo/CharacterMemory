@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+from ..emotion_vectors import emotion_similarity, emotional_impact
 from .edges import Edge, EpisodeEdge, FactEdge, RelationEdge
 from .graph import KnowledgeGraph
 from .nodes import Node
@@ -75,8 +76,8 @@ def _node_strength(node: Node) -> float:
             s = max(s, float(v) * scale + 0.2)
     # Episodic / emotional magnitude boosts retention (mirrors decay.py).
     shift = getattr(node, "emotional_shift", None)
-    if isinstance(shift, (int, float)):
-        s += 0.2 * abs(float(shift))
+    if isinstance(shift, dict):
+        s += 0.2 * emotional_impact(shift)
     return min(1.5, s)
 
 
@@ -84,8 +85,8 @@ def _edge_strength(edge: Edge) -> float:
     """The `u->v` edge weight in [0, 1]."""
     base = float(getattr(edge, "weight", 0.5) or 0.5)
     base = max(0.0, min(1.0, base))
-    # Strong signed signals (relation/episode dims) push the weight up or
-    # down from the centre.
+    # Strong relationship signals and episode-vector impact push the weight
+    # up from the centre.
     for attr in ("trust", "affection", "importance", "confidence"):
         v = getattr(edge, attr, None)
         if isinstance(v, (int, float)):
@@ -95,7 +96,10 @@ def _edge_strength(edge: Edge) -> float:
         magnitude = max(abs(edge.valence), abs(edge.trust), abs(edge.affection))
         base = max(base, min(1.0, 0.4 + 0.6 * magnitude))
     if isinstance(edge, EpisodeEdge):
-        base = max(base, min(1.0, 0.3 + 0.5 * abs(edge.emotional_shift)))
+        base = max(
+            base,
+            min(1.0, 0.3 + 0.5 * emotional_impact(edge.emotional_shift)),
+        )
     if isinstance(edge, FactEdge):
         base = max(base, min(1.0, 0.3 + 0.5 * edge.confidence))
     return base
@@ -175,8 +179,14 @@ def combined_activation(
         seeds[graph.SELF_ID] = 0.5
     spread = spread_activation(graph, seeds, gain=gain, hops=hops)
     out: dict[str, float] = {}
-    for nid in graph.nodes:
-        out[nid] = base_weight * bll.get(nid, 0.0) + spread_weight * spread.get(nid, 0.0)
+    self_node = graph.nodes.get(graph.SELF_ID)
+    current_mood = getattr(self_node, "current_mood", {}) or {}
+    for nid, node in graph.nodes.items():
+        score = base_weight * bll.get(nid, 0.0) + spread_weight * spread.get(nid, 0.0)
+        shift = getattr(node, "emotional_shift", None)
+        if score > 0.0 and isinstance(shift, dict):
+            score *= 1.0 + emotion_similarity(shift, current_mood)
+        out[nid] = score
     return out
 
 

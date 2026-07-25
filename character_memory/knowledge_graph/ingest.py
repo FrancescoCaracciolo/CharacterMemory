@@ -45,6 +45,7 @@ import time
 from typing import Any, Callable, Iterable, Optional
 
 from ..llm.base import LLMClient
+from ..emotion_vectors import decode_emotion_vector, emotional_impact
 from ..memory.emotion import EmotionStatus
 from ..memory.episodic import EpisodicMemory
 from ..memory.user_facts import UserFactMemory
@@ -295,7 +296,10 @@ def ingest_emotion(
     + aliases) seeds the SelfNode's searchable text so the character is one
     node, queryable by any of their names.
     """
-    self_node = graph.ensure_self(baseline=getattr(emotion, "baseline", {}) or {})
+    self_node = graph.ensure_self(
+        baseline=getattr(emotion, "baseline", {}) or {},
+        current_mood=emotion.get_current_mood(),
+    )
     self_node.text = _self_node_text(character)
     for uid in known_users or []:
         if not uid:
@@ -303,7 +307,8 @@ def ingest_emotion(
         graph.ensure_person(uid)  # make sure the node exists even w/o a summary
         state = emotion.get_user_state(uid)
         comment = emotion.get_user_comment(uid)
-        # Strength of the relationship = mean magnitude of the signed dims.
+        # Strength of the relationship = mean magnitude of the signed
+        # per-user relationship dimensions.
         magnitude = (
             sum(abs(float(v)) for v in state.values()) / max(1, len(state))
             if state
@@ -320,7 +325,16 @@ def ingest_emotion(
             affection=float(state.get("affection", 0.0)),
             comment=comment or "",
         )
-        graph.upsert_edge(edge)
+        stored = graph.upsert_edge(edge)
+        # Relationship state is mutable source data. Unlike learned edge
+        # strengths, a refresh must also propagate decreases and comment
+        # changes rather than merging by max.
+        if isinstance(stored, RelationEdge):
+            stored.weight = edge.weight
+            stored.valence = edge.valence
+            stored.trust = edge.trust
+            stored.affection = edge.affection
+            stored.comment = edge.comment
 
 
 # -------------------------------------------------------------------- summaries
@@ -506,7 +520,10 @@ def ingest_episodes(
             kind="episode",
             text=summary,
             summary=summary,
-            emotional_shift=_clip(r.get("emotional_shift", 0.0), -1.0, 1.0, 0.0),
+            emotional_shift=decode_emotion_vector(
+                r.get("emotional_shift", "{}"),
+                allowed_axes=episodic.emotion_baseline,
+            ),
             importance=_clip(r.get("importance", 0.5)),
             timestamp=ts,
             created_at=ts,
@@ -527,7 +544,15 @@ def ingest_episodes(
                 kind="episode",
                 src=f"person:{owner}" if owner else graph.SELF_ID,
                 dst=eid,
-                weight=max(0.3, min(1.0, 0.3 + 0.7 * abs(ep_node.emotional_shift) + 0.3 * ep_node.importance)),
+                weight=max(
+                    0.3,
+                    min(
+                        1.0,
+                        0.3
+                        + 0.7 * emotional_impact(ep_node.emotional_shift)
+                        + 0.3 * ep_node.importance,
+                    ),
+                ),
                 timestamp=ts,
                 emotional_shift=ep_node.emotional_shift,
                 importance=ep_node.importance,
@@ -919,7 +944,7 @@ def ingest_wiki_llm(
                 kind="episode",
                 text=summary,
                 summary=summary,
-                emotional_shift=0.0,
+                emotional_shift={},
                 importance=0.6,
                 timestamp=now,
                 created_at=now,
@@ -938,7 +963,7 @@ def ingest_wiki_llm(
                         dst=eid,
                         weight=0.5,
                         timestamp=now,
-                        emotional_shift=0.0,
+                        emotional_shift={},
                         importance=0.6,
                         recall=False,
                     )

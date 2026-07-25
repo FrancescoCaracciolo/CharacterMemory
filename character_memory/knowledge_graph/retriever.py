@@ -25,6 +25,11 @@ from typing import Any, Callable, Iterable, Optional
 
 from ..llm.base import LLMClient
 from ..llm.embedding_base import EmbeddingProvider
+from ..emotion_vectors import (
+    decode_emotion_vector,
+    emotion_similarity,
+    emotional_impact,
+)
 from ..memory.base import MemoryItem
 from ..memory.dedup import DedupReport
 from ..memory.emotion import EmotionStatus
@@ -34,7 +39,7 @@ from ..memory.user_facts import UserFactMemory
 from ..memory.user_summary import UserSummaryMemory
 from ..rag.hybrid import HybridSearch
 from .activation import combined_activation
-from .edges import CoOccurrenceEdge
+from .edges import CoOccurrenceEdge, EpisodeEdge
 from .graph import KnowledgeGraph
 from .ingest import (
     ingest_emotion,
@@ -151,6 +156,14 @@ class KnowledgeGraphRetriever:
 
         emotion = mems.get("emotion")
         if isinstance(emotion, EmotionStatus):
+            known_users = list(dict.fromkeys([
+                *known_users,
+                *[
+                    str(r.get("user_id") or "")
+                    for r in emotion.store.select(emotion.table)
+                    if r.get("user_id")
+                ],
+            ]))
             # Make sure every known user has a node before wiring relations.
             for uid in known_users:
                 self.graph.ensure_person(uid)
@@ -218,6 +231,7 @@ class KnowledgeGraphRetriever:
         facts_items = extracted_items.get("user_facts") or []
         episodes_items = extracted_items.get("episodic") or []
         summary_items = extracted_items.get("user_summary") or []
+        emotion_items = extracted_items.get("emotion") or []
         # Summaries upsert PersonNodes directly.
         if summary_items:
             for it in summary_items:
@@ -236,6 +250,21 @@ class KnowledgeGraphRetriever:
                     p.text = it.text or p.text
                     if uid not in self._known_users:
                         self._known_users.append(uid)
+        # Emotion is mutable state rather than append-only rows. A change
+        # marker tells us to re-read the authoritative current mood and
+        # relationship blobs, then upsert Self/Relation graph data.
+        emotion_mem = self._source_memory_for("emotion")
+        if emotion_items and isinstance(emotion_mem, EmotionStatus):
+            for row in emotion_mem.store.select(emotion_mem.table):
+                uid = str(row.get("user_id") or "")
+                if uid and uid not in self._known_users:
+                    self._known_users.append(uid)
+            ingest_emotion(
+                self.graph,
+                emotion_mem,
+                known_users=self._known_users,
+                character=self.character,
+            )
         # Facts: filter to rows the items reference, then ingest.
         facts_mem = self._source_memory_for("user_facts")
         if facts_mem is not None and facts_items:
@@ -333,8 +362,14 @@ class KnowledgeGraphRetriever:
                 node.importance = float(row.get("importance") or 0.5)  # type: ignore[attr-defined]
             elif mem_name == "episodic":
                 node.summary = str(row.get("summary") or getattr(node, "summary", ""))  # type: ignore[attr-defined]
-                node.emotional_shift = float(row.get("emotional_shift") or 0.0)  # type: ignore[attr-defined]
+                node.emotional_shift = decode_emotion_vector(  # type: ignore[attr-defined]
+                    row.get("emotional_shift", "{}"),
+                    allowed_axes=getattr(src, "emotion_baseline", None),
+                )
                 node.importance = float(row.get("importance") or 0.5)  # type: ignore[attr-defined]
+                for edge in self.graph.edges.values():
+                    if isinstance(edge, EpisodeEdge) and edge.dst == node.id:
+                        edge.emotional_shift = dict(node.emotional_shift)  # type: ignore[attr-defined]
             elif mem_name == "user_summary":
                 aliases = row.get("aliases")
                 if isinstance(aliases, str):
@@ -417,6 +452,32 @@ class KnowledgeGraphRetriever:
             node.activation = float(act.get(nid, 0.0))
         return act
 
+    def test_activation_details(
+        self, query: str, *, user_id: Optional[str] = None
+    ) -> dict[str, dict[str, float]]:
+        """Read-only activation trace with episode emotion components."""
+        activation = self.test_activation(query, user_id=user_id)
+        self_node = self.graph.nodes.get(self.graph.SELF_ID)
+        current_mood = getattr(self_node, "current_mood", {}) or {}
+        details: dict[str, dict[str, float]] = {}
+        for nid, score in activation.items():
+            node = self.graph.nodes[nid]
+            shift = getattr(node, "emotional_shift", None)
+            impact = emotional_impact(shift) if isinstance(shift, dict) else 0.0
+            similarity = (
+                emotion_similarity(shift, current_mood)
+                if isinstance(shift, dict)
+                else 0.0
+            )
+            details[nid] = {
+                "activation": float(score),
+                "raw_emotional_impact": impact,
+                "emotion_similarity": similarity,
+                "impact": impact,
+                "similarity": similarity,
+            }
+        return details
+
     def retrieve(
         self,
         query: str,
@@ -486,8 +547,7 @@ class KnowledgeGraphRetriever:
                 edge.weight = min(1.0, float(edge.weight) + lr)
 
     # --------------------------------------------------------------- rendering
-    @staticmethod
-    def _node_to_item(node: Node, activation: float) -> MemoryItem:
+    def _node_to_item(self, node: Node, activation: float) -> MemoryItem:
         """Render a node into a prompt-friendly MemoryItem."""
         kind = node.kind
         if kind == "self":
@@ -503,11 +563,31 @@ class KnowledgeGraphRetriever:
             text = f"{getattr(node, 'name', node.text)} ({getattr(node, 'kind_label', 'thing')})"
         else:
             text = node.text or node.id
+        metadata: dict[str, Any] = {
+            "node_id": node.id,
+            "node_kind": kind,
+            "activation": float(activation),
+        }
+        shift = getattr(node, "emotional_shift", None)
+        if isinstance(shift, dict):
+            self_node = self.graph.nodes.get(self.graph.SELF_ID)
+            current_mood = getattr(self_node, "current_mood", {}) or {}
+            impact = emotional_impact(shift)
+            similarity = emotion_similarity(shift, current_mood)
+            metadata.update(
+                {
+                    "emotional_shift": dict(shift),
+                    "raw_emotional_impact": impact,
+                    "emotion_similarity": similarity,
+                    "impact": impact,
+                    "similarity": similarity,
+                }
+            )
         return MemoryItem(
             text=text,
             score=float(activation),
             kind="knowledge_graph",
-            metadata={"node_id": node.id, "node_kind": kind, "activation": float(activation)},
+            metadata=metadata,
         )
 
     # --------------------------------------------------------------- persistence

@@ -82,15 +82,13 @@ def save_graph(
     store.execute(f"DELETE FROM {NODES_TABLE}")
     store.execute(f"DELETE FROM {EDGES_TABLE}")
 
-    # Build hybrid-index chunks in the same pass so the index matches the
-    # rows exactly. Skip the bare SelfNode (text is "self"); it is always
-    # seeded with activation at retrieval time and contributes nothing to
-    # lexical/dense matching.
+    # Persist every node (including SelfNode, whose baseline/current mood is
+    # character state). Build hybrid-index chunks in the same pass, omitting
+    # only nodes with no searchable text; SelfNode is always seeded at
+    # retrieval time and contributes nothing to lexical/dense matching.
     chunks: list[Chunk] = []
     for node in graph.nodes.values():
         text = (node.text or "").strip()
-        if not text:
-            continue
         d = node.to_dict()
         store.upsert(
             NODES_TABLE,
@@ -108,13 +106,14 @@ def save_graph(
                 "source": node.source or "",
             },
         )
-        chunks.append(
-            Chunk(
-                text=text,
-                source=node.kind,
-                metadata={"id": node.id, "kind": node.kind},
+        if text:
+            chunks.append(
+                Chunk(
+                    text=text,
+                    source=node.kind,
+                    metadata={"id": node.id, "kind": node.kind},
+                )
             )
-        )
 
     for edge in graph.edges.values():
         store.upsert(

@@ -7,8 +7,8 @@ last recalled, how often it has been recalled and the emotional impact of that m
         effective = base * E * exp(-age / (half_life * D)) * (1 + log1p(recall))
 
     where:
-        E = 1 + |emotion|      (boost: both positive & negative emotions strengthen)
-        D = 1 + max(0, emotion) (decay resistance: only positive valence slows forgetting)
+        E = 1 + impact         (emotionally intense memories are stronger)
+        D = 1 + impact         (emotionally intense memories decay more slowly)
 
 So frequently-recalled, recently-used facts stay strong, while unused ones
 fade. `base` alone decides stickiness (always-in-prompt) so a deliberately
@@ -27,10 +27,11 @@ def decay_score(
     emotion_impact: Optional[float] = None,
 ) -> float:
     """Return a non-negative effective importance."""
-    # Simulate amigdala behavior with emotion boost
+    # Emotion impact is a non-negative magnitude derived from a vector.
     if emotion_impact is not None:
-        emotion_boost = 1.0 + abs(emotion_impact)
-        decay_resistance = 1.0 + max(0, emotion_impact)
+        impact = max(0.0, min(1.0, float(emotion_impact)))
+        emotion_boost = 1.0 + impact
+        decay_resistance = 1.0 + impact
     else:
         emotion_boost = 1  
         decay_resistance = 1

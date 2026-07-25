@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from ..emotion_vectors import emotion_vector
+
 
 def _now(clock: Optional[Callable[[], float]] = None) -> float:
     return (clock or time.time)()
@@ -98,9 +100,24 @@ class SelfNode(Node, _NodeMixin):
 
     kind: str = "self"
     baseline: dict[str, float] = field(default_factory=dict)
+    current_mood: dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.baseline = emotion_vector(self.baseline)
+        if not self.current_mood:
+            self.current_mood = dict(self.baseline)
+        self.current_mood = emotion_vector(
+            self.current_mood, allowed_axes=self.baseline or None
+        )
+        self.current_mood = {
+            axis: float(self.current_mood.get(axis, 0.0)) for axis in self.baseline
+        }
 
     def _extra_fields(self) -> dict[str, Any]:
-        return {"baseline": dict(self.baseline)}
+        return {
+            "baseline": dict(self.baseline),
+            "current_mood": dict(self.current_mood),
+        }
 
 
 @dataclass
@@ -149,13 +166,16 @@ class EpisodeNode(Node, _NodeMixin):
 
     kind: str = "episode"
     summary: str = ""
-    emotional_shift: float = 0.0
+    emotional_shift: dict[str, float] = field(default_factory=dict)
     importance: float = 0.5
     timestamp: float = 0.0
     participants: list[str] = field(default_factory=list)
     #: The chat this episode was learned in (NULL ⇒ legacy / single-user / wiki).
     #: Pairs facts and episodes of the same chat via `ChatEdge`.
     chat_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.emotional_shift = emotion_vector(self.emotional_shift)
 
     def _extra_fields(self) -> dict[str, Any]:
         return {

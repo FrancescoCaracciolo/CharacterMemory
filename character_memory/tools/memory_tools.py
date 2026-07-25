@@ -193,7 +193,7 @@ class _GetUserEmotion(Tool):
     description = (
         "Return how the character currently feels toward a user: the numeric "
         "emotion dimensions (e.g. affection, valence, trust) and the "
-        "relationship descriptor, plus the baseline."
+        "relationship descriptor, plus the baseline and current mood."
     )
     parameters = {
         "type": "object",
@@ -211,9 +211,16 @@ class _GetUserEmotion(Tool):
         if not isinstance(mem, EmotionStatus):
             return "emotion memory is not available."
         baseline = ", ".join(f"{k}={v:.2f}" for k, v in mem.baseline.items())
+        current = ", ".join(
+            f"{k}={v:.2f}" for k, v in mem.get_current_mood().items()
+        )
         state = ", ".join(f"{k}={v:.2f}" for k, v in mem.get_user_state(user_id).items())
         comment = mem.get_user_comment(user_id)
-        parts = [f"baseline: {baseline}", f"toward {user_id}: {state}"]
+        parts = [
+            f"baseline: {baseline}",
+            f"current mood: {current}",
+            f"toward {user_id}: {state}",
+        ]
         if comment:
             parts.append(f"relationship: {comment}")
         return "; ".join(parts)

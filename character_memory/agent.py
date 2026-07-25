@@ -297,18 +297,21 @@ class CharacterAgent:
             self.store, hybrid(), enabled=m.is_enabled("user_directives"),
             half_life=half, sticky_threshold=sticky,
         )
+        emotion = EmotionStatus(
+            self.store, enabled=m.is_enabled("emotion"),
+            baseline=m.emotion_baseline, user_dims=m.emotion_user_dims,
+        )
         self.memories["episodic"] = EpisodicMemory(
             self.store, hybrid(), enabled=m.is_enabled("episodic"),
             half_life=half, sticky_threshold=sticky,
+            emotion_baseline=m.emotion_baseline,
+            current_mood=(emotion.get_current_mood if emotion.enabled else lambda: {}),
         )
         self.memories["heartbeat"] = HeartbeatJournal(
             self.store, hybrid(), enabled=m.is_enabled("heartbeat"),
             half_life=half, sticky_threshold=sticky,
         )
-        self.memories["emotion"] = EmotionStatus(
-            self.store, enabled=m.is_enabled("emotion"),
-            baseline=m.emotion_baseline, user_dims=m.emotion_user_dims,
-        )
+        self.memories["emotion"] = emotion
         self.memories["user_summary"] = UserSummaryMemory(
             self.store, hybrid(), enabled=m.is_enabled("user_summary"),
             half_life=half, sticky_threshold=sticky,
