@@ -37,6 +37,7 @@ from ..memory.episodic import EpisodicMemory
 from ..memory.store import SQLiteStore
 from ..memory.user_facts import UserFactMemory
 from ..memory.user_summary import UserSummaryMemory
+from ..rag.base import as_queries
 from ..rag.hybrid import HybridSearch
 from .activation import combined_activation
 from .edges import CoOccurrenceEdge, EpisodeEdge
@@ -406,7 +407,10 @@ class KnowledgeGraphRetriever:
         seeds: dict[str, float] = {}
         if self.graph.SELF_ID in self.graph.nodes:
             seeds[self.graph.SELF_ID] = self.config.self_seed
-        if self.hybrid is None or not query.strip():
+        # `query` may be a bare string or a list of (text, weight) pairs
+        # (history-aware retrieval). Skip only when there is no usable text at
+        # all; hybrid.search already fuses the weighted list itself.
+        if self.hybrid is None or not as_queries(query):
             return seeds
         try:
             hits = self.hybrid.search(query, k=max(10, self.config.hops * 8))

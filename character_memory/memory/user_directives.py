@@ -3,6 +3,7 @@
 import json
 from typing import TYPE_CHECKING, Any, Optional
 
+from ..rag.base import as_queries
 from .base import ExtractionSpec, MemoryItem
 from .structured import StructuredMemory
 
@@ -56,8 +57,11 @@ class UserDirectiveMemory(StructuredMemory):
     ) -> list[MemoryItem]:
         items = super().recall(query, user_id, limit, sticky_limit, state_changing=state_changing)
         # Keyword boost: directives whose keywords appear in the query are
-        # surfaced even if hybrid recall missed them.
-        ql = query.lower()
+        # surfaced even if hybrid recall missed them. `query` may be a single
+        # string or a list of ``(text, weight)`` pairs (history-aware
+        # retrieval); join every weighted text so a directive is boosted when
+        # its keyword shows up in any recent message.
+        ql = " ".join(q for q, _ in as_queries(query)).lower()
         rows_by_id = {r["id"]: r for r in self.store.select(self.table, {"user_id": user_id})}
         have = {int(it.metadata["id"]) for it in items}
         boosted = []
