@@ -17,7 +17,8 @@ Stable node IDs:
 from __future__ import annotations
 
 import re
-from typing import Iterable, Optional
+from contextlib import contextmanager
+from typing import Callable, Iterable, Iterator, Optional
 
 from ..emotion_vectors import emotion_vector
 from .edges import (
@@ -53,6 +54,9 @@ class KnowledgeGraph:
     def __init__(self) -> None:
         self.nodes: dict[str, Node] = {}
         self.edges: dict[str, Edge] = {}
+        # Transient observer used only while a bulk build is running. It is
+        # deliberately not part of the serialized graph state.
+        self._on_node_added: Optional[Callable[[Node], None]] = None
         # `adj[u]` = list of edge ids whose src or dst is u. Symmetric kinds
         # appear under both endpoints even when stored once.
         self._adj: dict[str, list[str]] = {}
@@ -72,7 +76,21 @@ class KnowledgeGraph:
             return existing
         self.nodes[node.id] = node
         self._adj.setdefault(node.id, [])
+        if self._on_node_added is not None:
+            self._on_node_added(node)
         return node
+
+    @contextmanager
+    def _observe_node_additions(
+        self, callback: Optional[Callable[[Node], None]]
+    ) -> Iterator[None]:
+        """Temporarily notify ``callback`` after each real node insertion."""
+        previous = self._on_node_added
+        self._on_node_added = callback
+        try:
+            yield
+        finally:
+            self._on_node_added = previous
 
     def upsert_node(self, node: Node) -> Node:
         """Insert or replace `node` by id (refresh in place if present)."""

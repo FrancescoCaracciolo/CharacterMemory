@@ -65,6 +65,10 @@ from .nodes import EpisodeNode, FactNode, Node
 # "relevant to the character". Either field may be empty.
 CharacterContext = dict[str, str]
 
+# The agent/retriever use the same value when calculating the exact number of
+# structured LLM calls a bulk knowledge-graph build will make.
+_WIKI_BATCH_SIZE = 6
+
 
 def _now(clock: Optional[Callable[[], float]] = None) -> float:
     return (clock or time.time)()
@@ -229,6 +233,7 @@ def _extract_fact_subjects(
     *,
     graph: KnowledgeGraph,
     character: Optional[CharacterContext] = None,
+    _on_llm_request_done: Optional[Callable[[], None]] = None,
 ) -> dict[int, dict[str, Any]]:
     """Run the batched fact-extraction call. Falls back to heuristic on failure.
 
@@ -252,6 +257,9 @@ def _extract_fact_subjects(
         result = llm.chat_structured(messages, _FACT_EXTRACTION_SCHEMA)
     except Exception:
         return fallback
+    finally:
+        if _on_llm_request_done is not None:
+            _on_llm_request_done()
     out: dict[int, dict[str, Any]] = {}
     for entry in result.get("facts", []) or []:
         try:
@@ -368,6 +376,7 @@ def ingest_facts(
     known_users: Optional[list[str]] = None,
     rows: Optional[list[dict[str, Any]]] = None,
     character: Optional[CharacterContext] = None,
+    _on_llm_request_done: Optional[Callable[[], None]] = None,
 ) -> list[str]:
     """FactNodes + FactEdges + EntityNodes for every row.
 
@@ -381,7 +390,12 @@ def ingest_facts(
         return []
     # Resolve subjects + entities in one LLM call over the whole batch.
     subjects = _extract_fact_subjects(
-        llm, rows, list(known_users or []), graph=graph, character=character
+        llm,
+        rows,
+        list(known_users or []),
+        graph=graph,
+        character=character,
+        _on_llm_request_done=_on_llm_request_done,
     )
 
     created_fact_ids: list[str] = []
@@ -770,6 +784,7 @@ def _extract_wiki_batch(
     *,
     graph: KnowledgeGraph,
     character: Optional[CharacterContext] = None,
+    _on_llm_request_done: Optional[Callable[[], None]] = None,
 ) -> dict[int, dict[str, Any]]:
     """LLM-extract persons/entities/events for one batch of (index, text)."""
     empty = {i: {"is_event": False, "persons": [], "entities": []} for i, _ in batch}
@@ -785,6 +800,9 @@ def _extract_wiki_batch(
         result = llm.chat_structured(messages, _WIKI_EXTRACTION_SCHEMA)
     except Exception:
         return empty
+    finally:
+        if _on_llm_request_done is not None:
+            _on_llm_request_done()
     out: dict[int, dict[str, Any]] = {}
     for entry in result.get("sections", []) or []:
         try:
@@ -827,8 +845,9 @@ def ingest_wiki_llm(
     llm: LLMClient,
     sections: Iterable[dict[str, Any]],
     *,
-    batch_size: int = 6,
+    batch_size: int = _WIKI_BATCH_SIZE,
     character: Optional[CharacterContext] = None,
+    _on_llm_request_done: Optional[Callable[[], None]] = None,
 ) -> list[str]:
     """LLM wiki ingest: sections -> FactNodes + PersonNodes + EntityNodes + EpisodeNodes.
 
@@ -853,6 +872,7 @@ def ingest_wiki_llm(
             _extract_wiki_batch(
                 llm, [(i, sec.get("text", "")) for i, sec in sub],
                 graph=graph, character=character,
+                _on_llm_request_done=_on_llm_request_done,
             )
         )
 

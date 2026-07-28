@@ -20,7 +20,7 @@ thin orchestrator over :mod:`ingest`, :mod:`activation`, and
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
 from ..llm.base import LLMClient
@@ -43,6 +43,7 @@ from .activation import combined_activation
 from .edges import CoOccurrenceEdge, EpisodeEdge
 from .graph import KnowledgeGraph
 from .ingest import (
+    _WIKI_BATCH_SIZE,
     ingest_emotion,
     ingest_episodes,
     ingest_facts,
@@ -53,6 +54,35 @@ from .ingest import (
 )
 from .nodes import Node
 from .persistence import has_persisted, load_graph, save_graph
+
+
+_NodeAddedCallback = Callable[[Node], None]
+_LLMProgressCallback = Callable[[int, int], None]
+
+
+class _BuildProgress:
+    """Transient callback state shared by both bulk-ingestion phases."""
+
+    def __init__(
+        self,
+        total: int,
+        *,
+        on_node_added: Optional[_NodeAddedCallback],
+        on_llm_progress: Optional[_LLMProgressCallback],
+    ) -> None:
+        self.completed = 0
+        self.total = total
+        self.on_node_added = on_node_added
+        self.on_llm_progress = on_llm_progress
+
+    def start(self) -> None:
+        if self.on_llm_progress is not None:
+            self.on_llm_progress(0, self.total)
+
+    def request_done(self) -> None:
+        self.completed += 1
+        if self.on_llm_progress is not None:
+            self.on_llm_progress(self.completed, self.total)
 
 
 @dataclass
@@ -139,7 +169,12 @@ class KnowledgeGraphRetriever:
         return self
 
     # --------------------------------------------------------------- ingestion
-    def ingest(self, memories: Iterable[Any]) -> "KnowledgeGraphRetriever":
+    def ingest(
+        self,
+        memories: Iterable[Any],
+        *,
+        _on_llm_request_done: Optional[Callable[[], None]] = None,
+    ) -> "KnowledgeGraphRetriever":
         """Full ingest from the given source memories.
 
         Reads each source memory via its public API and (re)builds the graph.
@@ -176,6 +211,7 @@ class KnowledgeGraphRetriever:
                 self.graph, facts, llm=self.llm,
                 known_users=known_users,
                 character=self.character,
+                _on_llm_request_done=_on_llm_request_done,
             )
 
         episodic = mems.get("episodic")
@@ -200,7 +236,12 @@ class KnowledgeGraphRetriever:
             (n.source or "").startswith("wiki:") for n in self.graph.nodes.values()
         )
 
-    def ingest_wiki(self, sections: Iterable[dict[str, Any]]) -> "KnowledgeGraphRetriever":
+    def ingest_wiki(
+        self,
+        sections: Iterable[dict[str, Any]],
+        *,
+        _on_llm_request_done: Optional[Callable[[], None]] = None,
+    ) -> "KnowledgeGraphRetriever":
         """Wiki ingest into the graph.
 
         With an LLM wired (``attach_backends``), extracts characters, entities
@@ -215,12 +256,66 @@ class KnowledgeGraphRetriever:
             if (node.source or "").startswith("wiki:") and node.kind in ("fact", "episode"):
                 self.graph.remove_node(node.id)
         if self.llm is not None:
-            ingest_wiki_llm(self.graph, self.llm, sections, character=self.character)
+            ingest_wiki_llm(
+                self.graph,
+                self.llm,
+                sections,
+                character=self.character,
+                _on_llm_request_done=_on_llm_request_done,
+            )
         else:
             ingest_wiki(self.graph, sections)
         self._dedup_persons()
         self._rebuild_index()
         return self
+
+    def _ingest_for_build(
+        self,
+        memories: Iterable[Any],
+        wiki_sections: Iterable[dict[str, Any]],
+        *,
+        on_node_added: Optional[_NodeAddedCallback] = None,
+        on_llm_progress: Optional[_LLMProgressCallback] = None,
+    ) -> "KnowledgeGraphRetriever":
+        """Run both bulk-ingestion phases with one exact progress counter."""
+        memory_list = list(memories)
+        section_list = list(wiki_sections)
+        total = self._build_llm_request_count(memory_list, section_list)
+        progress = _BuildProgress(
+            total,
+            on_node_added=on_node_added,
+            on_llm_progress=on_llm_progress,
+        )
+        progress.start()
+        with self.graph._observe_node_additions(progress.on_node_added):
+            self.ingest(
+                memory_list,
+                _on_llm_request_done=progress.request_done,
+            )
+            self.ingest_wiki(
+                section_list,
+                _on_llm_request_done=progress.request_done,
+            )
+        return self
+
+    def _build_llm_request_count(
+        self,
+        memories: list[Any],
+        wiki_sections: list[dict[str, Any]],
+    ) -> int:
+        """Return the structured LLM calls the matching bulk ingest will make."""
+        if self.llm is None:
+            return 0
+        mems = {getattr(memory, "name", None): memory for memory in memories}
+        facts = mems.get("user_facts")
+        fact_requests = int(
+            isinstance(facts, UserFactMemory)
+            and bool(facts.store.select(facts.table, limit=1))
+        )
+        wiki_requests = (
+            len(wiki_sections) + _WIKI_BATCH_SIZE - 1
+        ) // _WIKI_BATCH_SIZE
+        return fact_requests + wiki_requests
 
     def update(self, extracted_items: dict[str, list]) -> "KnowledgeGraphRetriever":
         """Incremental ingest for a freshly-extracted batch.
