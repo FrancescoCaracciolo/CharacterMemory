@@ -27,7 +27,7 @@ Prompt assembly and per-memory extraction are delegated to a
 
 import os
 import time
-from typing import Any, Iterable, Iterator, Optional, Union
+from typing import Any, Callable, Iterable, Iterator, Optional, Union
 
 from .chat import Chat, _ChatBackend
 from .chunking.registry import get_chunker
@@ -53,6 +53,7 @@ from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
 from .memory.user_summary import UserSummaryMemory
+from .knowledge_graph.nodes import Node
 from .character_config import load_from_character_dir
 from .prompts import PromptConfig
 from .rag.base import Query
@@ -425,8 +426,38 @@ class CharacterAgent:
             )
         return out
 
-    def build(self) -> "CharacterAgent":
-        """Load persisted indexes if present, otherwise build + persist them."""
+    def _ingest_knowledge_graph(
+        self,
+        kg: KnowledgeGraphMemory,
+        *,
+        reset: bool,
+        on_node_added: Optional[Callable[[Node], None]],
+        on_llm_progress: Optional[Callable[[int, int], None]],
+    ) -> None:
+        """Build and persist the KG through the shared monitored ingest path."""
+        if reset:
+            kg.retriever.reset()
+        kg.retriever._ingest_for_build(
+            list(self.memories.values()),
+            self._wiki_sections(),
+            on_node_added=on_node_added,
+            on_llm_progress=on_llm_progress,
+        )
+        kg.persist(os.path.join(self.save_directory, "kg_index"))
+
+    def build(
+        self,
+        *,
+        on_node_added: Optional[Callable[[Node], None]] = None,
+        on_llm_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> "CharacterAgent":
+        """Load persisted indexes if present, otherwise build + persist them.
+
+        During a fresh knowledge-graph build, ``on_node_added(node)`` is called
+        after each real node insertion and ``on_llm_progress(completed, total)``
+        is called initially and after every structured LLM request. Loading an
+        already-persisted graph reports ``(0, 0)`` and adds no nodes.
+        """
         self._require_loaded()
         assert self.store is not None
         # RAG memories: load if persisted, else index from the character dir.
@@ -466,18 +497,32 @@ class CharacterAgent:
             kg_path = os.path.join(self.save_directory, "kg_index")
             if kg.retriever.has_persisted(kg_path):
                 kg.load(kg_path)
+                if on_llm_progress is not None:
+                    on_llm_progress(0, 0)
             else:
-                kg.retriever.ingest(list(self.memories.values()))
                 # Wiki is folded into the graph as typed nodes (characters /
                 # entities / episodes) via an LLM pass. Expensive, so it only
                 # runs on a fresh build; re-running needs an explicit rebuild.
-                kg.retriever.ingest_wiki(self._wiki_sections())
-                kg.persist(kg_path)
+                self._ingest_knowledge_graph(
+                    kg,
+                    reset=False,
+                    on_node_added=on_node_added,
+                    on_llm_progress=on_llm_progress,
+                )
         self._built = True
         return self
 
-    def rebuild(self) -> "CharacterAgent":
-        """Force a full re-chunk + re-index, overwriting persisted indexes."""
+    def rebuild(
+        self,
+        *,
+        on_node_added: Optional[Callable[[Node], None]] = None,
+        on_llm_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> "CharacterAgent":
+        """Force a full re-chunk + re-index, overwriting persisted indexes.
+
+        The optional callbacks monitor the knowledge-graph phase only; they use
+        the same contract as :meth:`rebuild_knowledge_graph`.
+        """
         self._require_loaded()
         assert self.store is not None
         self._index_character()
@@ -490,14 +535,21 @@ class CharacterAgent:
         # Knowledge graph: rebuild from scratch and re-ingest.
         kg = self.memories.get(_KG_MEMORY)
         if isinstance(kg, KnowledgeGraphMemory):
-            kg.retriever.reset()
-            kg.retriever.ingest(list(self.memories.values()))
-            kg.retriever.ingest_wiki(self._wiki_sections())
-            kg.persist(os.path.join(self.save_directory, "kg_index"))
+            self._ingest_knowledge_graph(
+                kg,
+                reset=True,
+                on_node_added=on_node_added,
+                on_llm_progress=on_llm_progress,
+            )
         self._built = True
         return self
 
-    def rebuild_knowledge_graph(self) -> "CharacterAgent":
+    def rebuild_knowledge_graph(
+        self,
+        *,
+        on_node_added: Optional[Callable[[Node], None]] = None,
+        on_llm_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> "CharacterAgent":
         """Rebuild only the knowledge graph, leaving every other index alone.
 
         Cheaper and more targeted than :meth:`rebuild` (which re-chunks the
@@ -505,6 +557,11 @@ class CharacterAgent:
         is rebuilt from the existing source-memory rows in SQLite and the
         character's wiki sections, then persisted. Use this for a one-off KG
         refresh -- e.g. ``charactermemory-server --rebuild-kg kurisu``.
+
+        ``on_node_added(node)`` runs synchronously after each new node is
+        inserted. ``on_llm_progress(completed, total)`` runs once before the
+        first structured LLM request and after each attempt; the number still
+        remaining is ``total - completed``.
         """
         self._require_loaded()
         assert self.store is not None
@@ -514,10 +571,12 @@ class CharacterAgent:
                 f"Character {self.character_name!r} does not have the "
                 f"knowledge_graph memory enabled; nothing to rebuild."
             )
-        kg.retriever.reset()
-        kg.retriever.ingest(list(self.memories.values()))
-        kg.retriever.ingest_wiki(self._wiki_sections())
-        kg.persist(os.path.join(self.save_directory, "kg_index"))
+        self._ingest_knowledge_graph(
+            kg,
+            reset=True,
+            on_node_added=on_node_added,
+            on_llm_progress=on_llm_progress,
+        )
         return self
 
     def persist_structured(self) -> None:
@@ -704,6 +763,7 @@ class CharacterAgent:
         tools: Optional[ToolsArg] = None,
         max_tool_iterations: int = 8,
         tool_choice: Optional[Any] = None,
+        auto_extract: bool = True,
     ) -> Union[str, Iterator[Any]]:
         """Generate an assistant reply for `target`.
 
@@ -737,6 +797,12 @@ class CharacterAgent:
         chat. Intermediate tool-call / tool-result messages stay in memory for
         the loop and are never persisted, so chat history and extraction stay
         clean.
+
+        ``auto_extract=False`` persists the assistant reply but skips the
+        automatic extraction pass — useful when the caller wants the reply back
+        as soon as it's generated and will run :meth:`extract` / extraction on
+        its own (e.g. on a background thread). The reply row is still written,
+        so conversation history stays intact.
         """
         self._require_loaded()
         assert self.llm is not None
@@ -753,9 +819,9 @@ class CharacterAgent:
         # No tools → legacy single-shot path, bit-for-bit unchanged.
         if tools is None:
             if stream:
-                return self._stream_answer(messages, chat, save, uid)
+                return self._stream_answer(messages, chat, save, uid, auto_extract)
             reply = self.llm.chat(messages)
-            self._after_generate(chat, save, reply)
+            self._after_generate(chat, save, reply, auto_extract)
             return reply
 
         registry = _as_registry(tools)
@@ -763,21 +829,22 @@ class CharacterAgent:
             # Empty tool set is equivalent to no tools; don't insist on a
             # tool-calling client for it.
             if stream:
-                return self._stream_answer(messages, chat, save, uid)
+                return self._stream_answer(messages, chat, save, uid, auto_extract)
             reply = self.llm.chat(messages)
-            self._after_generate(chat, save, reply)
+            self._after_generate(chat, save, reply, auto_extract)
             return reply
 
         if stream:
             return self._stream_answer_with_tools(
                 messages, registry, chat, save, uid,
                 max_tool_iterations=max_tool_iterations, tool_choice=tool_choice,
+                auto_extract=auto_extract,
             )
         reply = self._generate_with_tools(
             messages, registry,
             max_tool_iterations=max_tool_iterations, tool_choice=tool_choice,
         )
-        self._after_generate(chat, save, reply)
+        self._after_generate(chat, save, reply, auto_extract)
         return reply
 
     # ------------------------------------------------------------------ #
@@ -834,6 +901,7 @@ class CharacterAgent:
         *,
         max_tool_iterations: int,
         tool_choice: Optional[Any],
+        auto_extract: bool = True,
     ) -> Iterator[Any]:
         """Streaming model↔tool loop.
 
@@ -867,7 +935,7 @@ class CharacterAgent:
             if not has_calls:
                 # Plain-text reply (streamed above); done.
                 if save and chat is not None:
-                    self._after_generate(chat, True, "".join(collected))
+                    self._after_generate(chat, True, "".join(collected), auto_extract)
                 return
             # The ToolCallEvent carried the completed calls; use them to extend
             # the transcript and execute the tools (one ToolResultEvent each).
@@ -889,7 +957,7 @@ class CharacterAgent:
                 collected.append(ev.text)
                 yield ev
         if save and chat is not None:
-            self._after_generate(chat, True, "".join(collected))
+            self._after_generate(chat, True, "".join(collected), auto_extract)
 
     @staticmethod
     def _assistant_tool_message(content: str, calls: list[ToolCall]) -> dict:
@@ -928,6 +996,7 @@ class CharacterAgent:
         chat: Optional[Chat],
         save: bool,
         user_id: str,
+        auto_extract: bool = True,
     ) -> Iterator[str]:
         assert self.llm is not None
         collected: list[str] = []
@@ -935,13 +1004,20 @@ class CharacterAgent:
             collected.append(chunk)
             yield chunk
         if save and chat is not None:
-            self._after_generate(chat, True, "".join(collected))
+            self._after_generate(chat, True, "".join(collected), auto_extract)
 
-    def _after_generate(self, chat: Optional[Chat], save: bool, reply: str) -> None:
+    def _after_generate(
+        self, chat: Optional[Chat], save: bool, reply: str, auto_extract: bool = True
+    ) -> None:
         if chat is None or not save:
             return
         chat.add_message("assistant", reply)
-        self._maybe_auto_extract(chat)
+        # Auto-extraction (a second LLM call on the configured interval) can be
+        # deferred by the caller when it wants the reply back the instant the
+        # answer is generated — e.g. the configurator's mini-chat, which runs
+        # extraction on a background thread so the user isn't blocked on it.
+        if auto_extract:
+            self._maybe_auto_extract(chat)
 
     # Extraction
     def _extract_messages(
