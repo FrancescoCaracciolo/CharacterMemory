@@ -20,9 +20,9 @@ thin orchestrator over :mod:`ingest`, :mod:`activation`, and
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
+from ..config import KnowledgeGraphConfig
 from ..llm.base import LLMClient
 from ..llm.embedding_base import EmbeddingProvider
 from ..emotion_vectors import (
@@ -43,7 +43,11 @@ from .activation import combined_activation
 from .edges import CoOccurrenceEdge, EpisodeEdge
 from .graph import KnowledgeGraph
 from .ingest import (
+    _EXTRACTION_TOKEN_LIMIT,
+    _FACT_BATCH_SIZE,
+    _EPISODE_BATCH_SIZE,
     _WIKI_BATCH_SIZE,
+    _batch_by_limits,
     ingest_emotion,
     ingest_episodes,
     ingest_facts,
@@ -83,39 +87,6 @@ class _BuildProgress:
         self.completed += 1
         if self.on_llm_progress is not None:
             self.on_llm_progress(self.completed, self.total)
-
-
-@dataclass
-class KnowledgeGraphConfig:
-    """Tunables for retrieval. Defaults are conservative."""
-
-    #: ACT-R BLL decay parameter (d). Higher -> faster forgetting.
-    decay: float = 0.5
-    #: When > 0, an extra recency factor on top of BLL (seconds half-life).
-    decay_half_life: float = 60 * 60 * 24 * 7  # one week
-    #: Spreading activation gain (how much of `A_u` flows to neighbours).
-    gain: float = 0.35
-    #: Spreading hops. The design pins this at 2.
-    hops: int = 2
-    #: Per-hop attenuation.
-    hop_decay: float = 0.6
-    #: Weight of the BLL term in the combined score.
-    base_weight: float = 1.0
-    #: Weight of the spreading term in the combined score.
-    spread_weight: float = 1.2
-    #: Activation floor; nodes below this are not returned.
-    min_activation: float = 0.0
-    #: Hebbian: nodes both above this activation reinforce their co-edge.
-    hebbian_threshold: float = 0.15
-    #: Hebbian: how much a co-recall strengthens the edge weight.
-    hebbian_lr: float = 0.05
-    #: SelfNode seed activation.
-    self_seed: float = 0.8
-    #: Fixed activation base added per query match (rank-scaled). Makes matched
-    #: nodes clearly outrank unmatched ones; RRF scores alone are too small.
-    match_base: float = 4.0
-    #: RRF-style multiplier on the hybrid score when seeding matches.
-    match_gain: float = 3.0
 
 
 def _default_clock() -> float:
@@ -211,12 +182,25 @@ class KnowledgeGraphRetriever:
                 self.graph, facts, llm=self.llm,
                 known_users=known_users,
                 character=self.character,
+                batch_size=getattr(self.config, "fact_batch_size", _FACT_BATCH_SIZE),
+                token_limit=getattr(
+                    self.config, "extraction_token_limit", _EXTRACTION_TOKEN_LIMIT
+                ),
                 _on_llm_request_done=_on_llm_request_done,
             )
 
         episodic = mems.get("episodic")
         if isinstance(episodic, EpisodicMemory):
-            ingest_episodes(self.graph, episodic)
+            ingest_episodes(
+                self.graph,
+                episodic,
+                batch_size=getattr(
+                    self.config, "episode_batch_size", _EPISODE_BATCH_SIZE
+                ),
+                token_limit=getattr(
+                    self.config, "extraction_token_limit", _EXTRACTION_TOKEN_LIMIT
+                ),
+            )
 
         self._known_users = known_users or [n.user_id for n in self.graph.nodes_of_kind("person")]
         # Deterministic self-healing: collapse any person node that is actually
@@ -260,6 +244,10 @@ class KnowledgeGraphRetriever:
                 self.graph,
                 self.llm,
                 sections,
+                batch_size=getattr(self.config, "wiki_batch_size", _WIKI_BATCH_SIZE),
+                token_limit=getattr(
+                    self.config, "extraction_token_limit", _EXTRACTION_TOKEN_LIMIT
+                ),
                 character=self.character,
                 _on_llm_request_done=_on_llm_request_done,
             )
@@ -308,13 +296,36 @@ class KnowledgeGraphRetriever:
             return 0
         mems = {getattr(memory, "name", None): memory for memory in memories}
         facts = mems.get("user_facts")
-        fact_requests = int(
-            isinstance(facts, UserFactMemory)
-            and bool(facts.store.select(facts.table, limit=1))
+        fact_rows = (
+            facts.store.select(facts.table)
+            if isinstance(facts, UserFactMemory)
+            else []
         )
-        wiki_requests = (
-            len(wiki_sections) + _WIKI_BATCH_SIZE - 1
-        ) // _WIKI_BATCH_SIZE
+        token_limit = getattr(
+            self.config, "extraction_token_limit", _EXTRACTION_TOKEN_LIMIT
+        )
+        fact_requests = len(
+            _batch_by_limits(
+                fact_rows,
+                max_items=getattr(
+                    self.config, "fact_batch_size", _FACT_BATCH_SIZE
+                ),
+                max_tokens=token_limit,
+                text_of=lambda row: str(
+                    row.get("content") or row.get("text") or ""
+                ),
+            )
+        )
+        wiki_requests = len(
+            _batch_by_limits(
+                list(enumerate(wiki_sections)),
+                max_items=getattr(
+                    self.config, "wiki_batch_size", _WIKI_BATCH_SIZE
+                ),
+                max_tokens=token_limit,
+                text_of=lambda item: str(item[1].get("text") or ""),
+            )
+        )
         return fact_requests + wiki_requests
 
     def update(self, extracted_items: dict[str, list]) -> "KnowledgeGraphRetriever":
@@ -371,6 +382,14 @@ class KnowledgeGraphRetriever:
                     self.graph, facts_mem, llm=self.llm,
                     known_users=self._known_users, rows=rows,
                     character=self.character,
+                    batch_size=getattr(
+                        self.config, "fact_batch_size", _FACT_BATCH_SIZE
+                    ),
+                    token_limit=getattr(
+                        self.config,
+                        "extraction_token_limit",
+                        _EXTRACTION_TOKEN_LIMIT,
+                    ),
                 )
         # Episodes: same pattern.
         ep_mem = self._source_memory_for("episodic")
@@ -378,7 +397,19 @@ class KnowledgeGraphRetriever:
             ids = [int((it.metadata or {}).get("id")) for it in episodes_items if (it.metadata or {}).get("id") is not None]
             if ids:
                 rows = [r for r in ep_mem.store.select(ep_mem.table) if int(r.get("id") or -1) in ids]
-                ingest_episodes(self.graph, ep_mem, rows=rows)
+                ingest_episodes(
+                    self.graph,
+                    ep_mem,
+                    rows=rows,
+                    batch_size=getattr(
+                        self.config, "episode_batch_size", _EPISODE_BATCH_SIZE
+                    ),
+                    token_limit=getattr(
+                        self.config,
+                        "extraction_token_limit",
+                        _EXTRACTION_TOKEN_LIMIT,
+                    ),
+                )
         self._dedup_persons()
         # Re-link same-chat facts/episodes across the whole graph: a freshly
         # ingested fact should bridge to pre-existing episodes of that chat.

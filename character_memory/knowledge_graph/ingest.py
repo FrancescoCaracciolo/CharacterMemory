@@ -10,7 +10,7 @@ Ingestion drivers, one per source memory family:
 - :func:`ingest_emotion` — SelfNode baseline + one RelationEdge per known user.
 - :func:`ingest_summaries` — one PersonNode per `user_summary` row.
 - :func:`ingest_facts` — one FactNode per `user_facts` row plus entities
-  extracted by a single batched LLM call, with FactEdges from each fact's
+  extracted by bounded batched LLM calls, with FactEdges from each fact's
   subject (Person / Entity / Self) to the fact.
 - :func:`ingest_episodes` — one EpisodeNode per `episodic` row plus
   EpisodeEdges to every participant.
@@ -65,9 +65,64 @@ from .nodes import EpisodeNode, FactNode, Node
 # "relevant to the character". Either field may be empty.
 CharacterContext = dict[str, str]
 
-# The agent/retriever use the same value when calculating the exact number of
-# structured LLM calls a bulk knowledge-graph build will make.
-_WIKI_BATCH_SIZE = 6
+# Default batch limits. The retriever passes the configured values explicitly;
+# these defaults keep the direct ingestion functions convenient and backwards
+# compatible for callers that use them without a retriever.
+_FACT_BATCH_SIZE = 50
+_EPISODE_BATCH_SIZE = 50
+_WIKI_BATCH_SIZE = 3
+_EXTRACTION_TOKEN_LIMIT = 10_000
+
+
+def _token_counter() -> Callable[[str], int]:
+    """Return a token counter, with a dependency-free approximation fallback."""
+    try:
+        import tiktoken
+
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return lambda text: len(encoding.encode(text))
+    except Exception:  # pragma: no cover - defensive fallback
+        return lambda text: (len(text) + 3) // 4
+
+
+_count_tokens = _token_counter()
+
+
+def _batch_by_limits(
+    items: Iterable[Any],
+    *,
+    max_items: int,
+    max_tokens: int,
+    text_of: Callable[[Any], str],
+) -> list[list[Any]]:
+    """Split ``items`` by both item count and aggregate source-text tokens.
+
+    An individual item larger than ``max_tokens`` is emitted alone: silently
+    dropping or truncating a stored memory would make the graph incomplete.
+    Invalid zero/negative limits are clamped to one so hand-edited config
+    cannot create an infinite loop.
+    """
+    item_limit = max(1, int(max_items))
+    token_limit = max(1, int(max_tokens))
+    batches: list[list[Any]] = []
+    current: list[Any] = []
+    current_tokens = 0
+
+    for item in items:
+        item_tokens = _count_tokens(str(text_of(item) or ""))
+        if current and (
+            len(current) >= item_limit
+            or current_tokens + item_tokens > token_limit
+        ):
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(item)
+        current_tokens += item_tokens
+
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _now(clock: Optional[Callable[[], float]] = None) -> float:
@@ -100,8 +155,8 @@ def _char_clause(character: Optional[CharacterContext]) -> str:
 # ===========================================================================
 # Fact extraction (user_facts)
 # ===========================================================================
-# JSON schema for the batched fact-extraction LLM call. One call over all
-# facts at once keeps ingestion cheap; the LLM decides, per fact, whose fact
+# JSON schema for a batched fact-extraction LLM call. The LLM decides, per fact,
+# whose fact
 # it is and which entities (places / objects / organizations / concepts) it
 # mentions. `thing` is deliberately NOT a kind: the model must pick a real
 # category or omit the entity — this kills the lazy "everything is a thing"
@@ -376,6 +431,8 @@ def ingest_facts(
     known_users: Optional[list[str]] = None,
     rows: Optional[list[dict[str, Any]]] = None,
     character: Optional[CharacterContext] = None,
+    batch_size: int = _FACT_BATCH_SIZE,
+    token_limit: int = _EXTRACTION_TOKEN_LIMIT,
     _on_llm_request_done: Optional[Callable[[], None]] = None,
 ) -> list[str]:
     """FactNodes + FactEdges + EntityNodes for every row.
@@ -388,86 +445,97 @@ def ingest_facts(
     rows = rows if rows is not None else facts_mem.store.select(facts_mem.table)
     if not rows:
         return []
-    # Resolve subjects + entities in one LLM call over the whole batch.
-    subjects = _extract_fact_subjects(
-        llm,
-        rows,
-        list(known_users or []),
-        graph=graph,
-        character=character,
-        _on_llm_request_done=_on_llm_request_done,
-    )
-
     created_fact_ids: list[str] = []
     # Track entities per fact so we can wire co-occurrence between them.
     fact_participants: dict[str, set[str]] = {}
-
-    for i, r in enumerate(rows):
-        content = str(r.get("content") or "").strip()
-        if not content:
-            continue
-        info = subjects.get(i) or {"subject": str(r.get("user_id") or "self"), "entities": []}
-        subject = info["subject"]
-        entities = info.get("entities") or []
-
-        fid = graph.next_id("fact")
-        created_at = float(r.get("created_at") or 0.0) or _now()
-        fact_node = FactNode(
-            id=fid,
-            kind="fact",
-            text=content,
-            content=content,
-            type=str(r.get("type") or "general"),
-            confidence=_clip(r.get("confidence", 0.5)),
-            importance=_clip(r.get("importance", 0.5)),
-            created_at=created_at,
-            source=f"user_facts:{r.get('id')}",
-            # Seed the ACT-R practice history with the creation event so a
-            # fresh fact has a meaningful (positive) base-level activation.
-            practice_times=[created_at],
-            chat_id=r.get("chat_id"),
+    known_user_ids = list(known_users or [])
+    batches = _batch_by_limits(
+        rows,
+        max_items=batch_size,
+        max_tokens=token_limit,
+        text_of=lambda row: str(row.get("content") or row.get("text") or ""),
+    )
+    for batch in batches:
+        subjects = _extract_fact_subjects(
+            llm,
+            batch,
+            known_user_ids,
+            graph=graph,
+            character=character,
+            _on_llm_request_done=_on_llm_request_done,
         )
-        graph.add_node(fact_node)
-        created_fact_ids.append(fid)
-        ts = float(r.get("created_at") or 0.0) or fact_node.created_at
-        confidence = _clip(r.get("confidence", 0.5))
-        importance = _clip(r.get("importance", 0.5))
 
-        # Resolve the subject endpoint and link it to the fact. A named person
-        # subject becomes a PersonNode (the "someone else relevant" rule); a
-        # place/object stays in `entities` and never reaches here.
-        subj_id = _resolve_subject(graph, subject, known_users or [], character)
-        graph.upsert_edge(
-            FactEdge(
-                id="",
+        for i, r in enumerate(batch):
+            content = str(r.get("content") or "").strip()
+            if not content:
+                continue
+            info = subjects.get(i) or {
+                "subject": str(r.get("user_id") or "self"),
+                "entities": [],
+            }
+            subject = info["subject"]
+            entities = info.get("entities") or []
+
+            fid = graph.next_id("fact")
+            created_at = float(r.get("created_at") or 0.0) or _now()
+            fact_node = FactNode(
+                id=fid,
                 kind="fact",
-                src=subj_id,
-                dst=fid,
-                weight=max(0.3, min(1.0, 0.3 + 0.7 * importance)),
-                confidence=confidence,
-                importance=importance,
-                timestamp=ts,
+                text=content,
+                content=content,
+                type=str(r.get("type") or "general"),
+                confidence=_clip(r.get("confidence", 0.5)),
+                importance=_clip(r.get("importance", 0.5)),
+                created_at=created_at,
+                source=f"user_facts:{r.get('id')}",
+                # Seed the ACT-R practice history with the creation event so a
+                # fresh fact has a meaningful (positive) base-level activation.
+                practice_times=[created_at],
+                chat_id=r.get("chat_id"),
             )
-        )
-        participants: set[str] = {subj_id}
+            graph.add_node(fact_node)
+            created_fact_ids.append(fid)
+            ts = float(r.get("created_at") or 0.0) or fact_node.created_at
+            confidence = _clip(r.get("confidence", 0.5))
+            importance = _clip(r.get("importance", 0.5))
 
-        # Entities the fact mentions become EntityNodes linked to the fact.
-        for e in entities:
-            ent = graph.ensure_entity(e["name"], kind_label=e.get("kind", "thing"))
+            # Resolve the subject endpoint and link it to the fact. A named
+            # person subject becomes a PersonNode; places/objects stay in
+            # `entities` and never reach here.
+            subj_id = _resolve_subject(graph, subject, known_user_ids, character)
             graph.upsert_edge(
                 FactEdge(
                     id="",
                     kind="fact",
-                    src=ent.id,
+                    src=subj_id,
                     dst=fid,
-                    weight=0.4,
+                    weight=max(0.3, min(1.0, 0.3 + 0.7 * importance)),
                     confidence=confidence,
                     importance=importance,
                     timestamp=ts,
                 )
             )
-            participants.add(ent.id)
-        fact_participants[fid] = participants
+            participants: set[str] = {subj_id}
+
+            # Entities the fact mentions become EntityNodes linked to the fact.
+            for e in entities:
+                ent = graph.ensure_entity(
+                    e["name"], kind_label=e.get("kind", "thing")
+                )
+                graph.upsert_edge(
+                    FactEdge(
+                        id="",
+                        kind="fact",
+                        src=ent.id,
+                        dst=fid,
+                        weight=0.4,
+                        confidence=confidence,
+                        importance=importance,
+                        timestamp=ts,
+                    )
+                )
+                participants.add(ent.id)
+            fact_participants[fid] = participants
 
     _wire_co_occurrence(graph, fact_participants, co_create=True)
     return created_fact_ids
@@ -517,63 +585,77 @@ def ingest_episodes(
     episodic: EpisodicMemory,
     *,
     rows: Optional[list[dict[str, Any]]] = None,
+    batch_size: int = _EPISODE_BATCH_SIZE,
+    token_limit: int = _EXTRACTION_TOKEN_LIMIT,
 ) -> list[str]:
-    """EpisodeNodes + EpisodeEdges per participant. Returns episode node ids."""
+    """EpisodeNodes + EpisodeEdges per participant. Returns episode node ids.
+
+    Episode ingestion is deterministic and makes no LLM request. The shared
+    limits still bound each processing batch and keep the API consistent with
+    facts and wiki sections.
+    """
     rows = rows if rows is not None else episodic.store.select(episodic.table)
     created: list[str] = []
     participants_by_ep: dict[str, set[str]] = {}
-    for r in rows:
-        summary = str(r.get("summary") or "").strip()
-        if not summary:
-            continue
-        owner = str(r.get("user_id") or "")
-        ts = float(r.get("created_at") or 0.0) or _now()
-        eid = graph.next_id("episode")
-        ep_node = EpisodeNode(
-            id=eid,
-            kind="episode",
-            text=summary,
-            summary=summary,
-            emotional_shift=decode_emotion_vector(
-                r.get("emotional_shift", "{}"),
-                allowed_axes=episodic.emotion_baseline,
-            ),
-            importance=_clip(r.get("importance", 0.5)),
-            timestamp=ts,
-            created_at=ts,
-            source=f"episodic:{r.get('id')}",
-            practice_times=[ts],
-            chat_id=r.get("chat_id"),
-        )
-        graph.add_node(ep_node)
-        created.append(eid)
-        # The owner is always a participant; surface them as a PersonNode.
-        participants: set[str] = set()
-        if owner:
-            graph.ensure_person(owner)
-            participants.add(f"person:{owner}")
-        graph.upsert_edge(
-            EpisodeEdge(
-                id="",
+    batches = _batch_by_limits(
+        rows,
+        max_items=batch_size,
+        max_tokens=token_limit,
+        text_of=lambda row: str(row.get("summary") or ""),
+    )
+    for batch in batches:
+        for r in batch:
+            summary = str(r.get("summary") or "").strip()
+            if not summary:
+                continue
+            owner = str(r.get("user_id") or "")
+            ts = float(r.get("created_at") or 0.0) or _now()
+            eid = graph.next_id("episode")
+            ep_node = EpisodeNode(
+                id=eid,
                 kind="episode",
-                src=f"person:{owner}" if owner else graph.SELF_ID,
-                dst=eid,
-                weight=max(
-                    0.3,
-                    min(
-                        1.0,
-                        0.3
-                        + 0.7 * emotional_impact(ep_node.emotional_shift)
-                        + 0.3 * ep_node.importance,
-                    ),
+                text=summary,
+                summary=summary,
+                emotional_shift=decode_emotion_vector(
+                    r.get("emotional_shift", "{}"),
+                    allowed_axes=episodic.emotion_baseline,
                 ),
+                importance=_clip(r.get("importance", 0.5)),
                 timestamp=ts,
-                emotional_shift=ep_node.emotional_shift,
-                importance=ep_node.importance,
-                recall=False,
+                created_at=ts,
+                source=f"episodic:{r.get('id')}",
+                practice_times=[ts],
+                chat_id=r.get("chat_id"),
             )
-        )
-        participants_by_ep[eid] = participants
+            graph.add_node(ep_node)
+            created.append(eid)
+            # The owner is always a participant; surface them as a PersonNode.
+            participants: set[str] = set()
+            if owner:
+                graph.ensure_person(owner)
+                participants.add(f"person:{owner}")
+            graph.upsert_edge(
+                EpisodeEdge(
+                    id="",
+                    kind="episode",
+                    src=f"person:{owner}" if owner else graph.SELF_ID,
+                    dst=eid,
+                    weight=max(
+                        0.3,
+                        min(
+                            1.0,
+                            0.3
+                            + 0.7 * emotional_impact(ep_node.emotional_shift)
+                            + 0.3 * ep_node.importance,
+                        ),
+                    ),
+                    timestamp=ts,
+                    emotional_shift=ep_node.emotional_shift,
+                    importance=ep_node.importance,
+                    recall=False,
+                )
+            )
+            participants_by_ep[eid] = participants
     _wire_co_occurrence(graph, participants_by_ep, co_create=True)
     return created
 
@@ -846,6 +928,7 @@ def ingest_wiki_llm(
     sections: Iterable[dict[str, Any]],
     *,
     batch_size: int = _WIKI_BATCH_SIZE,
+    token_limit: int = _EXTRACTION_TOKEN_LIMIT,
     character: Optional[CharacterContext] = None,
     _on_llm_request_done: Optional[Callable[[], None]] = None,
 ) -> list[str]:
@@ -866,8 +949,13 @@ def ingest_wiki_llm(
     if not items:
         return []
     extractions: dict[int, dict[str, Any]] = {}
-    for b in range(0, len(items), max(1, batch_size)):
-        sub = items[b : b + batch_size]
+    batches = _batch_by_limits(
+        items,
+        max_items=batch_size,
+        max_tokens=token_limit,
+        text_of=lambda item: str(item[1].get("text") or ""),
+    )
+    for sub in batches:
         extractions.update(
             _extract_wiki_batch(
                 llm, [(i, sec.get("text", "")) for i, sec in sub],

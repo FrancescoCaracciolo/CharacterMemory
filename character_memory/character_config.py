@@ -40,7 +40,9 @@ default, unknown keys are ignored so the format is forward-compatible)::
       knowledge_graph: { decay, decay_half_life, gain, hops, hop_decay,
                          base_weight, spread_weight, min_activation,
                          hebbian_threshold, hebbian_lr, self_seed,
-                         match_base, match_gain }
+                         match_base, match_gain, fact_batch_size,
+                         episode_batch_size, wiki_batch_size,
+                         extraction_token_limit }
     prompts:
       system, emotion_note, section_template, *_header, *_header_multi,
       extraction_*, dedup_*, section_order

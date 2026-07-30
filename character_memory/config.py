@@ -141,6 +141,10 @@ class KnowledgeGraphConfig:
       (pinned at 2 by design), and per-hop attenuation.
     - `hebbian_threshold` / `hebbian_lr`: nodes co-activating above the
       threshold reinforce their co-occurrence edge by `hebbian_lr`.
+    - `fact_batch_size` / `episode_batch_size` / `wiki_batch_size`: maximum
+      source items handled in one KG extraction/ingestion batch.
+    - `extraction_token_limit`: maximum source-text tokens in one batch. The
+      prompt, JSON schema, and generated response add their own overhead.
     """
 
     decay: float = 0.5
@@ -156,6 +160,10 @@ class KnowledgeGraphConfig:
     self_seed: float = 0.8
     match_base: float = 4.0
     match_gain: float = 3.0
+    fact_batch_size: int = 50
+    episode_batch_size: int = 50
+    wiki_batch_size: int = 3
+    extraction_token_limit: int = 10_000
 
 
 @dataclass
