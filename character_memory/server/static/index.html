@@ -92,14 +92,14 @@
             <button id="graph-freeze" class="btn ghost" title="Pause / resume physics (space)">❚❚ freeze</button>
             <button id="graph-fit" class="btn ghost" title="Fit graph to view">⤢ fit</button>
             <button id="graph-repel" class="btn ghost" title="Re-run layout">↻ relayout</button>
-            <button id="graph-settings-btn" class="btn ghost" title="Graph settings">⚙ settings</button>
+            <button id="graph-settings-btn" class="btn ghost" type="button" title="Graph settings" aria-controls="graph-settings" aria-expanded="false">⚙ settings</button>
           </div>
           <div class="graph-split">
             <div class="graph-canvas-wrap">
               <canvas id="cy" class="graph-cy"></canvas>
               <div id="graph-overlay" class="graph-overlay"></div>
-              <div id="graph-settings" class="graph-settings">
-                <div class="gs-title">Graph settings <button id="gs-close" class="gs-close" title="Hide panel">×</button></div>
+              <div id="graph-settings" class="graph-settings hidden" role="region" aria-label="Graph settings" aria-hidden="true">
+                <div class="gs-title">Graph settings <button id="gs-close" class="gs-close" type="button" title="Hide panel" aria-label="Close graph settings">×</button></div>
                 <label class="gs-row">
                   <span class="gs-label">Repulsion</span>
                   <span class="gs-val" id="gs-repulsion-val">3200</span>

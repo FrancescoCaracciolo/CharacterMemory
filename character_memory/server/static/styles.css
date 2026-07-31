@@ -1389,3 +1389,67 @@ select option { background: var(--input); color: var(--text); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
 }
+
+/* Graph-specific final overrides: viewport-bound, inked, and theme-derived. */
+:root,
+:root[data-theme="light"] {
+  --graph-node-self: #ff715e; --graph-node-person: #408adf; --graph-node-fact: #3eae7b;
+  --graph-node-episode: #ffc857; --graph-node-entity: #625a78; --graph-node-default: #408adf;
+  --graph-edge-relation: #408adf; --graph-edge-fact: #3eae7b; --graph-edge-episode: #e89521;
+  --graph-edge-transition: #ff715e; --graph-edge-cooccurrence: #81798f; --graph-edge-default: #81798f;
+  --graph-ink: #302947; --graph-label: #302947; --graph-label-shadow: #fff9e9;
+  --graph-muted: #a69caf; --graph-muted-edge: #81798f;
+}
+:root[data-theme="dark"] {
+  --graph-node-self: #ff8876; --graph-node-person: #74b6ff; --graph-node-fact: #65d19c;
+  --graph-node-episode: #ffd166; --graph-node-entity: #e8d7b9; --graph-node-default: #74b6ff;
+  --graph-edge-relation: #74b6ff; --graph-edge-fact: #65d19c; --graph-edge-episode: #ffd166;
+  --graph-edge-transition: #ff8876; --graph-edge-cooccurrence: #9d93b2; --graph-edge-default: #9d93b2;
+  --graph-ink: #fff8e9; --graph-label: #fff8e9; --graph-label-shadow: #171426;
+  --graph-muted: #9d93b2; --graph-muted-edge: #706883;
+}
+.topbar::after {
+  bottom: -6px; height: 3px; opacity: 1; border: 0;
+  background: linear-gradient(90deg, var(--accent) 0 46%, var(--accent-2) 46% 54%, var(--accent) 54% 100%);
+  box-shadow: 0 2px 0 var(--outline);
+}
+.graph-view { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 12px 20px 10px; }
+.graph-controls, .graph-legend { flex: 0 0 auto; }
+.graph-split {
+  flex: 1 1 auto; min-height: 0; height: auto; overflow: auto;
+  grid-template-rows: minmax(0, 1fr); background: var(--surface); border: 2px solid var(--outline); border-radius: 18px;
+}
+.graph-canvas-wrap, .graph-cy { min-height: 0; }
+.graph-cy {
+  background:
+    radial-gradient(circle at 16px 16px, var(--grid-dot) 1.5px, transparent 2px) 0 0 / 32px 32px,
+    radial-gradient(900px 620px at 25% 18%, color-mix(in srgb, var(--accent-2) 16%, transparent), transparent 65%),
+    linear-gradient(145deg, var(--graph-a), var(--graph-b));
+}
+.graph-side, .graph-settings { background: color-mix(in srgb, var(--surface-alt) 96%, transparent); }
+.graph-side { border-left: 2px solid var(--outline); }
+.graph-settings {
+  max-height: calc(100% - 20px); overflow-y: auto; border: 2px solid var(--outline);
+  border-radius: 15px; box-shadow: var(--shadow-sm);
+}
+.dot-self { background: var(--graph-node-self); }
+.dot-person { background: var(--graph-node-person); }
+.dot-fact { background: var(--graph-node-fact); }
+.dot-episode { background: var(--graph-node-episode); }
+.dot-entity { background: var(--graph-node-entity); }
+@media (max-width: 760px) {
+  /* The page shell stays fixed; the content pane is the deliberate mobile
+     scroller so a graph below the compact header is still reachable. */
+  .content { overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
+  .graph-view { flex: 0 0 390px; height: 390px; min-height: 390px; max-height: 390px; }
+  .graph-view { padding: 10px 12px 8px; gap: 7px; }
+  .graph-controls { gap: 6px; }
+  .graph-controls .search { flex: 1 1 180px; }
+  .graph-controls .search input { width: 100%; min-width: 0; }
+  .graph-ctl-spacer { display: none; }
+  .graph-split { flex: 1 1 0; grid-template-columns: 1fr; grid-template-rows: minmax(150px, 1fr) minmax(0, 30%); }
+  .graph-canvas-wrap { min-height: 150px; }
+  .graph-side { min-height: 92px; border-left: 0; border-top: 2px solid var(--outline); }
+  .graph-detail { max-height: 44%; }
+  .graph-tip { margin-left: 0; }
+}

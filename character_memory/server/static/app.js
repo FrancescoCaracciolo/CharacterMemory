@@ -157,21 +157,31 @@ function scorePill(rec) {
 // ---------------------------------------------------------------- minimal markdown
 function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function inlineMd(s) {
-  return esc(s)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  // Escape the text, but keep inline-code spans verbatim: their content must
+  // not be mangled by `**`/`*`/`[..](..)` substitution. Escape happens once
+  // here — callers feed the RAW text (escaping twice turns `'` into `&#39;`
+  // into the literal text `&#39;`).
+  const parts = String(s).split(/(`[^`]+`)/);
+  return parts.map((part) => {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      const inner = esc(part.slice(1, -1));
+      return `<code>${inner}</code>`;
+    }
+    return esc(part)
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  }).join("");
 }
 function markdown(text) {
-  const lines = esc(text).split("\n");
+  const lines = String(text).split("\n");
   let html = "";
   let inUl = false, inOl = false, inCode = false, codeBuf = [];
   const closeLists = () => { if (inUl) { html += "</ul>"; inUl = false; } if (inOl) { html += "</ol>"; inOl = false; } };
   for (const raw of lines) {
     const line = raw;
     if (line.trim().startsWith("```")) {
-      if (inCode) { html += `<pre><code>${codeBuf.join("\n")}</code></pre>`; codeBuf = []; inCode = false; }
+      if (inCode) { html += `<pre><code>${esc(codeBuf.join("\n"))}</code></pre>`; codeBuf = []; inCode = false; }
       else { closeLists(); inCode = true; }
       continue;
     }
@@ -185,7 +195,7 @@ function markdown(text) {
     closeLists();
     html += `<p>${inlineMd(line)}</p>`;
   }
-  if (inCode) html += `<pre><code>${codeBuf.join("\n")}</code></pre>`;
+  if (inCode) html += `<pre><code>${esc(codeBuf.join("\n"))}</code></pre>`;
   closeLists();
   return html;
 }
@@ -769,16 +779,18 @@ function onSearchInput() {
 // with no external dependencies. Glowing nodes coloured by kind, light
 // "particles" flowing along edges, a continuously settling physics sim, and
 // pan / zoom / node-drag with neighbour highlighting on hover.
+// Names resolve through the theme's CSS custom properties.  Keeping the canvas
+// palette here as tokens lets the light/dark clubhouse themes stay in charge.
 const GRAPH_KIND_COLOR = {
-  self: "#e8c35a", person: "#8b8df0", fact: "#5cc88f",
-  episode: "#6fb7ef", entity: "#b07bf0",
+  self: "graph-node-self", person: "graph-node-person", fact: "graph-node-fact",
+  episode: "graph-node-episode", entity: "graph-node-entity",
 };
 const GRAPH_KIND_LABEL = {
   self: "self", person: "person", fact: "fact", episode: "episode", entity: "entity",
 };
 const GRAPH_EDGE_COLOR = {
-  relation: "#8b8df0", fact: "#5cc88f", episode: "#6fb7ef",
-  transition: "#b07bf0", co_occurrence: "#67708d",
+  relation: "graph-edge-relation", fact: "graph-edge-fact", episode: "graph-edge-episode",
+  transition: "graph-edge-transition", co_occurrence: "graph-edge-cooccurrence",
 };
 const GRAPH_FONT = '"JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace';
 
@@ -807,10 +819,16 @@ function loadGraphUI() {
     const o = JSON.parse(raw);
     if (o.settings) Object.assign(GRAPH_SETTINGS, o.settings);
     if (o.full != null) state.graph.full = !!o.full;
-    const panel = $("graph-settings");
-    if (o.panel === "open") panel.classList.remove("hidden");
-    else if (o.panel === "closed") panel.classList.add("hidden");
+    setGraphSettingsOpen(o.panel === "open");
   } catch (e) { /* ignore */ }
+}
+function setGraphSettingsOpen(open, { persist = false } = {}) {
+  const panel = $("graph-settings"), trigger = $("graph-settings-btn");
+  if (!panel || !trigger) return;
+  panel.classList.toggle("hidden", !open);
+  panel.setAttribute("aria-hidden", open ? "false" : "true");
+  trigger.setAttribute("aria-expanded", open ? "true" : "false");
+  if (persist) saveGraphUI();
 }
 function saveGraphUI() {
   try {
@@ -852,6 +870,11 @@ function hexA(hex, a) {
   return `rgba(${r},${g},${b},${clamp(a, 0, 1)})`;
 }
 
+function graphCssColor(token, fallback) {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(`--${token}`).trim();
+  return /^#[0-9a-f]{6}$/i.test(value) ? value : fallback;
+}
+
 // Build one renderer bound to a <canvas>. The returned object exposes a small
 // imperative API used by the rest of the app (setData / fit / focus / freeze).
 function createGraphViz(canvas, opts) {
@@ -862,6 +885,7 @@ function createGraphViz(canvas, opts) {
 
   let nodes = [], edges = [], byId = new Map(), adj = new Map();
   const prevPos = new Map();           // id -> {x,y} across reloads (stable layout)
+  const spatialBins = new Map();       // reused by bounded large-graph repulsion
   const view = { scale: 1, panX: 0, panY: 0, w: 0, h: 0 };
   const target = { scale: 1, panX: 0, panY: 0 };
   let alpha = 1;                        // simulation temperature
@@ -875,6 +899,9 @@ function createGraphViz(canvas, opts) {
   const mouse = { x: 0, y: 0, inside: false };
   let lastT = performance.now();
   let raf = 0;
+  let paletteTheme = "";
+  let palette = null;
+  let fitWhenSettled = false;
 
   // DOM tooltip living inside the overlay (sibling of the canvas).
   const tip = el("div", { class: "graph-tip-box" });
@@ -889,7 +916,35 @@ function createGraphViz(canvas, opts) {
   // up as the graph "disappearing" after a few seconds. Drop them past a threshold.
   const HALO_NODE_CAP = 150;
   const PARTICLE_EDGE_CAP = 500;
-  const WARMUP_NODE_CAP = 1200;       // synchronous settle before first fit
+  const EXACT_REPULSION_CAP = 220;    // exact pairs for small, tactile subgraphs
+  const MAX_REPULSION_NEIGHBORS = 48; // hard bound per node for large graphs
+  const REPULSION_CELL = 170;
+
+  function refreshPalette() {
+    const theme = document.documentElement.dataset.theme || "light";
+    if (theme === paletteTheme && palette) return false;
+    paletteTheme = theme;
+    const nodeColors = {}, edgeColors = {};
+    for (const token of Object.values(GRAPH_KIND_COLOR)) nodeColors[token] = graphCssColor(token, "#408adf");
+    for (const token of Object.values(GRAPH_EDGE_COLOR)) edgeColors[token] = graphCssColor(token, "#81798f");
+    palette = {
+      ink: graphCssColor("graph-ink", "#302947"),
+      label: graphCssColor("graph-label", "#302947"),
+      labelShadow: graphCssColor("graph-label-shadow", "#fff9e9"),
+      muted: graphCssColor("graph-muted", "#81798f"),
+      mutedEdge: graphCssColor("graph-muted-edge", "#9a91a7"),
+      nodeDefault: graphCssColor("graph-node-default", "#408adf"),
+      edgeDefault: graphCssColor("graph-edge-default", "#81798f"),
+      nodeColors, edgeColors,
+    };
+    applyPalette();
+    return true;
+  }
+
+  function applyPalette() {
+    for (const n of nodes) n.color = palette.nodeColors[n.colorKey] || palette.nodeDefault;
+    for (const e of edges) e.color = palette.edgeColors[e.colorKey] || palette.edgeDefault;
+  }
 
   // -------------------------------------------------------------- sizing
   function resize() {
@@ -920,7 +975,8 @@ function createGraphViz(canvas, opts) {
       next.push({
         id: n.id, kind: n.kind, label: graphNodeLabel(n), raw: n,
         act, r: 4 + 9 * act + (n.kind === "self" ? 4 : 0),
-        color: GRAPH_KIND_COLOR[n.kind] || "#9aa3bd",
+        colorKey: GRAPH_KIND_COLOR[n.kind] || "graph-node-default",
+        color: "#408adf",
         retrieved: n.retrieved !== false,
         x: pos.x, y: pos.y, vx: 0, vy: 0, _e: 1, _hot: true,
       });
@@ -933,7 +989,8 @@ function createGraphViz(canvas, opts) {
       const w = clamp(Number(e.weight) || 0, 0, 1);
       nextEdges.push({
         src: e.src, dst: e.dst, kind: e.kind, w,
-        color: GRAPH_EDGE_COLOR[e.kind] || "#67708d",
+        colorKey: GRAPH_EDGE_COLOR[e.kind] || "graph-edge-default",
+        color: "#81798f",
         p: Math.random(), _hot: true,
       });
       adj.get(e.src).add(e.dst);
@@ -942,16 +999,15 @@ function createGraphViz(canvas, opts) {
     prevPos.clear();
     for (const n of next) prevPos.set(n.id, { x: n.x, y: n.y });
     nodes = next; edges = nextEdges;
+    // Palette values are cached by theme, not by dataset.
+    if (!refreshPalette()) applyPalette();
     alpha = 1;
-    // Warm-start the force sim synchronously so the first fit frames the
-    // *settled* (expanded) layout, not the tight initial spiral. Without this,
-    // big graphs expand off-screen after load; with a delayed re-fit they
-    // jumped/drifted after a few seconds. Capped so huge graphs don't block.
-    if (nodes.length <= WARMUP_NODE_CAP) {
-      const iters = nodes.length <= 400 ? 180 : 90;
-      for (let i = 0; i < iters; i++) simulate();
-    }
-    alpha = 0.02;                    // sim is essentially settled; no post-fit drift
+    // A deliberately tiny warmup removes the worst initial overlap without
+    // holding the main thread.  The remaining settle happens over animation
+    // frames, and a final fit catches the expanded graph when it cools.
+    const warmup = nodes.length <= 80 ? 12 : nodes.length <= EXACT_REPULSION_CAP ? 6 : 2;
+    for (let i = 0; i < warmup; i++) simulate();
+    fitWhenSettled = true;
     resize();
     fitView(false);
   }
@@ -972,9 +1028,9 @@ function createGraphViz(canvas, opts) {
       minX = Math.min(minX, n.x); minY = Math.min(minY, n.y); maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y);
     }
     const w = Math.max(1, maxX - minX), h = Math.max(1, maxY - minY);
-    const pad = 70;
     const vw = view.w || canvas.clientWidth || 1, vh = view.h || canvas.clientHeight || 1;
-    const s = clamp(Math.min((vw - 2 * pad) / w, (vh - 2 * pad) / h), MIN_SCALE, 2.5);
+    const pad = Math.min(70, Math.max(18, Math.min(vw, vh) * 0.12));
+    const s = clamp(Math.min(Math.max(1, vw - 2 * pad) / w, Math.max(1, vh - 2 * pad) / h), MIN_SCALE, 2.5);
     const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
     const t = { scale: s, panX: vw / 2 - cx * s, panY: vh / 2 - cy * s };
     if (animate) Object.assign(target, t);
@@ -983,6 +1039,7 @@ function createGraphViz(canvas, opts) {
 
   function focusNode(id) {
     const n = byId.get(id); if (!n || !isFinite(n.x) || !isFinite(n.y)) return;
+    fitWhenSettled = false;
     selectedId = id;
     if (onSelect) onSelect(n);
     const w = view.w || canvas.clientWidth || 1;
@@ -992,26 +1049,71 @@ function createGraphViz(canvas, opts) {
     Object.assign(target, t);
   }
 
+  function relayout() {
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const spread = Math.max(26, settings.linkDistance * 0.68);
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i], angle = i * golden;
+      const radius = spread + Math.sqrt(i + 1) * spread;
+      n.x = Math.cos(angle) * radius;
+      n.y = Math.sin(angle) * radius;
+      n.vx = 0; n.vy = 0;
+      prevPos.set(n.id, { x: n.x, y: n.y });
+    }
+    frozen = false;
+    alpha = 1;
+    fitWhenSettled = true;
+    resize();
+    fitView(false);
+    return frozen;
+  }
+
   // -------------------------------------------------------------- physics
   function reheat(a) { if (!frozen) alpha = Math.max(alpha, a == null ? 0.7 : a); }
+
+  function applyRepulsion(a, b) {
+    let dx = a.x - b.x, dy = a.y - b.y;
+    let d2 = dx * dx + dy * dy;
+    if (d2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = dx * dx + dy * dy + 0.01; }
+    const d = Math.sqrt(d2), f = settings.repulsion / d2;
+    const fx = f * dx / d, fy = f * dy / d;
+    a.ax += fx; a.ay += fy; b.ax -= fx; b.ay -= fy;
+  }
+
+  function applyBoundedRepulsion() {
+    spatialBins.clear();
+    for (const a of nodes) {
+      const cx = Math.floor(a.x / REPULSION_CELL), cy = Math.floor(a.y / REPULSION_CELL);
+      a._cx = cx; a._cy = cy;
+      const key = cx * 1048576 + cy;
+      let bin = spatialBins.get(key);
+      if (!bin) { bin = []; spatialBins.set(key, bin); }
+      bin.push(a);
+    }
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i]; let checked = 0;
+      for (let ox = -1; ox <= 1 && checked < MAX_REPULSION_NEIGHBORS; ox++) {
+        for (let oy = -1; oy <= 1 && checked < MAX_REPULSION_NEIGHBORS; oy++) {
+          const bin = spatialBins.get((a._cx + ox) * 1048576 + a._cy + oy);
+          if (!bin || !bin.length) continue;
+          const start = i % bin.length;
+          for (let k = 0; k < bin.length && checked < MAX_REPULSION_NEIGHBORS; k++) {
+            const b = bin[(start + k) % bin.length];
+            if (b === a) continue;
+            applyRepulsion(a, b); checked++;
+          }
+        }
+      }
+    }
+  }
 
   function simulate() {
     if (alpha < 0.02 && !draggingId) return;
     const n = nodes.length;
     for (let i = 0; i < n; i++) { nodes[i].ax = 0; nodes[i].ay = 0; }
-    // O(n^2) repulsion — fine for the subgraph sizes this view serves.
-    for (let i = 0; i < n; i++) {
-      const a = nodes[i];
-      for (let j = i + 1; j < n; j++) {
-        const b = nodes[j];
-        let dx = a.x - b.x, dy = a.y - b.y;
-        let d2 = dx * dx + dy * dy;
-        if (d2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = dx * dx + dy * dy + 0.01; }
-        const d = Math.sqrt(d2);
-        const f = settings.repulsion / d2, fx = f * dx / d, fy = f * dy / d;
-        a.ax += fx; a.ay += fy; b.ax -= fx; b.ay -= fy;
-      }
-    }
+    if (n <= EXACT_REPULSION_CAP) {
+      for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) applyRepulsion(nodes[i], nodes[j]);
+    } else applyBoundedRepulsion();
     for (const e of edges) {
       const a = byId.get(e.src), b = byId.get(e.dst); if (!a || !b) continue;
       let dx = b.x - a.x, dy = b.y - a.y;
@@ -1049,8 +1151,7 @@ function createGraphViz(canvas, opts) {
 
   // -------------------------------------------------------------- render
   function draw(dt) {
-    const lightTheme = document.documentElement.dataset.theme === "light";
-    const graphInk = lightTheme ? "48,41,71" : "255,255,255";
+    refreshPalette();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     applyCamera();
@@ -1065,8 +1166,8 @@ function createGraphViz(canvas, opts) {
       if (dimMode) {
         const both = a.retrieved && b.retrieved;
         if (both) { baseA = 0.25 + 0.6 * e.w; lw *= 1.6; }
-        else if (a.retrieved || b.retrieved) { baseA = 0.08 + 0.18 * e.w; col = lightTheme ? "#9990aa" : "#55607d"; }
-        else { baseA = 0.04 + 0.06 * e.w; col = lightTheme ? "#c9c1d5" : "#3a4257"; }
+        else if (a.retrieved || b.retrieved) { baseA = 0.08 + 0.18 * e.w; col = palette.mutedEdge; }
+        else { baseA = 0.04 + 0.06 * e.w; col = palette.muted; }
       }
       const aA = (activeId && !e._hot) ? baseA * 0.45 : baseA;
       ctx.strokeStyle = hexA(col, aA);
@@ -1096,7 +1197,7 @@ function createGraphViz(canvas, opts) {
 
     // node halos (additive bloom) — skipped for grayed (non-retrieved) nodes and
     // skipped entirely on big graphs (gradient allocation is the heaviest cost).
-    const GRAYC = lightTheme ? "#92899f" : "#5b647e";
+    const GRAYC = palette.muted;
     const drawHalos = nodes.length <= HALO_NODE_CAP;
     if (drawHalos) for (const a of nodes) {
       const isGray = dimMode && !a.retrieved;
@@ -1122,15 +1223,15 @@ function createGraphViz(canvas, opts) {
       ctx.fillStyle = hexA(col, na);
       ctx.beginPath(); ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2); ctx.fill();
       if (a.kind === "self") {
-        ctx.lineWidth = 2.5; ctx.strokeStyle = `rgba(${graphInk},${na})`;
+        ctx.lineWidth = 2.5; ctx.strokeStyle = hexA(palette.ink, na);
         ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 2.5, 0, Math.PI * 2); ctx.stroke();
       } else if ((a._hot || (dimMode && a.retrieved)) && a._e > 0.05) {
-        ctx.lineWidth = 2; ctx.strokeStyle = `rgba(${graphInk},${0.4 + 0.5 * a._e})`;
+        ctx.lineWidth = 2; ctx.strokeStyle = hexA(palette.ink, 0.4 + 0.5 * a._e);
         ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 2, 0, Math.PI * 2); ctx.stroke();
       }
       // Persistent ring on the clicked (selected) node so the click is obvious.
       if (selectedId === a.id) {
-        ctx.lineWidth = 3; ctx.strokeStyle = `rgba(${graphInk},0.95)`;
+        ctx.lineWidth = 3; ctx.strokeStyle = hexA(palette.ink, 0.95);
         ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 4, 0, Math.PI * 2); ctx.stroke();
       }
     }
@@ -1147,11 +1248,9 @@ function createGraphViz(canvas, opts) {
       const show = showAll || isActive || (hoveredNeighbors && hoveredNeighbors.has(a.id));
       if (!show) continue;
       const txt = a.label.length > 22 ? a.label.slice(0, 21) + "…" : a.label;
-      ctx.fillStyle = lightTheme
-        ? `rgba(48,41,71,${isActive ? 0.95 : 0.72})`
-        : `rgba(244,241,255,${isActive ? 0.95 : 0.68})`;
-      ctx.shadowColor = lightTheme ? "rgba(255,251,239,0.98)" : "rgba(8,10,16,0.95)";
-      ctx.shadowBlur = lightTheme ? 6 : 4;
+      ctx.fillStyle = hexA(palette.label, isActive ? 0.95 : 0.72);
+      ctx.shadowColor = hexA(palette.labelShadow, 0.95);
+      ctx.shadowBlur = 5;
       ctx.fillText(txt, a.x, a.y + a.r + 3);
       ctx.shadowBlur = 0;
     }
@@ -1160,6 +1259,10 @@ function createGraphViz(canvas, opts) {
   function frame(now) {
     const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
     if (!frozen) simulate();
+    if (fitWhenSettled && (!frozen && alpha <= 0.025)) {
+      fitView(false);
+      fitWhenSettled = false;
+    }
     view.scale += (target.scale - view.scale) * 0.2;
     view.panX += (target.panX - view.panX) * 0.2;
     view.panY += (target.panY - view.panY) * 0.2;
@@ -1182,6 +1285,7 @@ function createGraphViz(canvas, opts) {
 
   // -------------------------------------------------------------- pointers
   function onDown(e) {
+    fitWhenSettled = false;
     const n = pick(e.offsetX, e.offsetY);
     if (n) {
       draggingId = n.id; down = { mode: "node" }; reheat(0.5);
@@ -1234,6 +1338,7 @@ function createGraphViz(canvas, opts) {
   }
   function onWheel(e) {
     e.preventDefault();
+    fitWhenSettled = false;
     const w = toWorld(e.offsetX, e.offsetY);
     const factor = Math.exp(-e.deltaY * 0.0015);
     const ns = clamp(view.scale * factor, MIN_SCALE, 4);
@@ -1270,7 +1375,7 @@ function createGraphViz(canvas, opts) {
   raf = requestAnimationFrame(frame);
 
   return {
-    setData, resize, fit: () => fitView(true), focus: focusNode,
+    setData, resize, fit: () => { fitWhenSettled = false; resize(); fitView(false); }, focus: focusNode, relayout,
     reheat, freeze: () => { frozen = !frozen; return frozen; },
     isFrozen: () => frozen,
     debugView: () => {
@@ -1335,7 +1440,7 @@ function applyGraphFilter() {
 }
 
 async function renderGraphView() {
-  if (!state.graph._wired) wireGraphControls();
+  if (!graphControlsWired) wireGraphControls();
   $("graph-user").value = state.user || "";
   state.graph.user = state.user || "";
   $("graph-q").value = state.graph.q || "";
@@ -1372,6 +1477,9 @@ async function renderGraphView() {
 // Bind one settings slider to GRAPH_SETTINGS. `live` sliders only reheat the
 // physics (no refetch); fetch sliders (node/edge limit) debounce a reload.
 let _sliderTimer = null;
+// These controls belong to the page, not a renderer instance. A character
+// change replaces only the canvas renderer, so this guard survives it.
+let graphControlsWired = false;
 function wireSlider(id, key, opts) {
   opts = opts || {};
   const input = $(id), val = $(id + "-val");
@@ -1418,6 +1526,8 @@ function syncCheckbox(id, key) {
 }
 
 function wireGraphControls() {
+  if (graphControlsWired) return;
+  graphControlsWired = true;
   state.graph._wired = true;
   let t = null;
   $("graph-q").addEventListener("input", (e) => {
@@ -1443,7 +1553,10 @@ function wireGraphControls() {
     renderGraphView();
   });
   $("graph-repel").addEventListener("click", () => {
-    if (state.graph._gv) { state.graph._gv.reheat(1); }
+    if (!state.graph._gv) return;
+    const frozen = state.graph._gv.relayout();
+    $("graph-freeze").classList.toggle("graph-freeze-on", frozen);
+    $("graph-freeze").textContent = frozen ? "▶ resume" : "❚❚ freeze";
   });
   $("graph-full").addEventListener("click", () => {
     state.graph.full = !state.graph.full;
@@ -1457,16 +1570,21 @@ function wireGraphControls() {
     renderGraphView();
   });
   $("graph-settings-btn").addEventListener("click", () => {
-    $("graph-settings").classList.toggle("hidden");
-    saveGraphUI();
+    const open = $("graph-settings").classList.contains("hidden");
+    setGraphSettingsOpen(open, { persist: true });
   });
-  $("gs-close").addEventListener("click", () => { $("graph-settings").classList.add("hidden"); saveGraphUI(); });
+  $("gs-close").addEventListener("click", () => setGraphSettingsOpen(false, { persist: true }));
   $("gs-reset").addEventListener("click", () => {
+    const limitsChanged = GRAPH_SETTINGS.nodeLimit !== GRAPH_SETTINGS_DEFAULTS.nodeLimit ||
+      GRAPH_SETTINGS.edgeLimit !== GRAPH_SETTINGS_DEFAULTS.edgeLimit;
     Object.assign(GRAPH_SETTINGS, GRAPH_SETTINGS_DEFAULTS);
     syncAllSliders();
+    saveGraphUI();
+    // Fetch limits change server-side graph selection. Refetch directly rather
+    // than doing a transient client-side filter on the stale larger dataset.
+    if (limitsChanged) { renderGraphView(); return; }
     applyGraphFilter();
     if (state.graph._gv) state.graph._gv.reheat(1);
-    saveGraphUI();
   });
   syncAllSliders();
   wireSlider("gs-repulsion", "repulsion", { live: true, fmt: (v) => String(v) });
@@ -1569,6 +1687,9 @@ function renderNodeDetail(node) {
 // ---------------------------------------------------------------- wire up
 async function init() {
   wireThemeToggle();
+  // The markup starts closed; this selectively restores a saved graph panel
+  // state and settings before the controls are first wired/rendered.
+  loadGraphUI();
   $("refresh").addEventListener("click", () => loadOverview());
   $("add-memory").addEventListener("click", () => openMemoryEditor());
   $("memory-form").addEventListener("submit", saveMemory);
@@ -1583,13 +1704,9 @@ async function init() {
     state.editor = { editable: false, fields: [], description: "" };
     // Tear down the previous renderer when switching characters.
     if (state.graph._gv) { try { state.graph._gv.destroy(); } catch (err) {} }
-    state.graph = { data: null, q: "", user: "", _gv: null, _wired: false };
-    // Reset the fetch-limit sliders (they get bumped when full mode is on).
-    GRAPH_SETTINGS.nodeLimit = 50; GRAPH_SETTINGS.edgeLimit = 300;
-    GRAPH_SETTINGS.hideSparse = false; GRAPH_SETTINGS.hideEpFact = false;
-    syncSlider("gs-nodes", "nodeLimit", 50); syncSlider("gs-edges", "edgeLimit", 300);
-    syncCheckbox("gs-hide-sparse", "hideSparse");
-    syncCheckbox("gs-hide-epfact", "hideEpFact");
+    // Controls and persisted graph settings outlive a character. In
+    // particular, do not keep Full mode while silently resetting its limits.
+    state.graph = { data: null, q: "", user: "", full: state.graph.full, _gv: null, _wired: graphControlsWired };
     $("q").value = "";
     $("graph-q").value = "";
     loadOverview();

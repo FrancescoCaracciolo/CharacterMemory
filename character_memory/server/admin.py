@@ -27,6 +27,7 @@ import shutil
 import threading
 import time
 import uuid
+import warnings
 from typing import Any, Optional
 
 from fastapi import (
@@ -561,8 +562,12 @@ def build_admin_router(
         """Generate a reply server-side (the configurator's mini-chat).
 
         Unlike the thin-client ``/context`` + ``/save`` flow, this runs the LLM
-        on the server. The user turn is persisted and the reply is stored +
-        (on the extract interval) extracted.
+        on the server. The user turn is persisted and the reply is stored
+        synchronously; memory extraction (a second LLM call on the extract
+        interval) is deferred to a background thread so the caller gets the
+        reply back the instant it's generated rather than after extraction +
+        persistence finish. The in-process ``MemorySync`` poller picks up the
+        learned rows on its next tick (≤ ``sync_interval``).
         """
         agent = _require_existing(name)
         if req.chat_id:
@@ -575,8 +580,30 @@ def build_admin_router(
         else:
             chat = agent.create_chat(req.user, title=req.message[:60])
         chat.add_message("user", req.message, user_id=req.user)
-        reply = agent.generate_answer(chat, save=True, user_id=req.user)
-        agent.persist_structured()
+        # auto_extract=False: persist the assistant reply row now, but skip the
+        # synchronous extraction pass — the thread below runs it instead.
+        reply = agent.generate_answer(
+            chat, save=True, user_id=req.user, auto_extract=False
+        )
+
+        def _extract_later(ag: CharacterAgent = agent, ch=chat) -> None:
+            # The captured agent is owned by this request; even if a concurrent
+            # create/config/rebuild swaps the registry entry via _reload_agent,
+            # this agent's SQLite connection stays live until its own close().
+            # Extraction is idempotent (processed rows are flagged), so a
+            # thread failure or a duplicated run is harmless.
+            try:
+                ag._maybe_auto_extract(ch)
+                ag.persist_structured()
+            except Exception as exc:  # noqa: BLE001 - never crash on bg work
+                warnings.warn(
+                    f"[charactermemory] background extraction failed for "
+                    f"{name!r}: {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=1,
+                )
+
+        threading.Thread(target=_extract_later, daemon=True).start()
         return {"chat_id": chat.id, "reply": reply}
 
     return router
