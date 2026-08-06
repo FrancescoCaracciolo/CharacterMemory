@@ -168,7 +168,51 @@ def combined_activation(
     Convenience wrapper used by the retriever. `seeds` is the RRF-derived
     seed map plus the SelfNode base; the BLL is added per-node so even a node
     the query did not match can surface if it is well-practiced and a
-    neighbour matched.
+    neighbour matched. For the per-factor decomposition use
+    :func:`combined_activation_breakdown`.
+    """
+    return {
+        nid: b["score"]
+        for nid, b in combined_activation_breakdown(
+            graph, seeds,
+            now=now, decay=decay, decay_half_life=decay_half_life,
+            gain=gain, hops=hops,
+            base_weight=base_weight, spread_weight=spread_weight,
+        ).items()
+    }
+
+
+def combined_activation_breakdown(
+    graph: KnowledgeGraph,
+    seeds: dict[str, float],
+    *,
+    now: float,
+    decay: float = 0.5,
+    decay_half_life: float = 0.0,
+    gain: float = 0.35,
+    hops: int = 2,
+    base_weight: float = 1.0,
+    spread_weight: float = 1.0,
+) -> dict[str, dict[str, float]]:
+    """Same fusion as :func:`combined_activation`, but with per-factor detail.
+
+    Returns ``{node_id: {bll, spread, seed, base, spread_w, emotion_mult, score}}``:
+
+    - ``bll``          — raw ACT-R base-level learning (may be negative).
+    - ``spread``       — raw spreading-activation contribution (includes the
+      node's own seed plus everything propagated to it).
+    - ``seed``         — the query/RRF + SelfNode seed this node started with
+      (the slice of ``spread`` that is not propagated from neighbours). Useful
+      to see "did this node match the query at all?".
+    - ``base``         — ``base_weight * bll`` (weighted BLL contribution).
+    - ``spread_w``     — ``spread_weight * spread`` (weighted spread contribution).
+    - ``emotion_mult`` — the multiplicative mood-alignment boost actually
+      applied (``1 + similarity`` when the node is emotional & the score is
+      positive, else ``1.0``).
+    - ``score``        — the final activation = ``base + spread_w`` then scaled
+      by ``emotion_mult``.
+
+    The GUI / `test_activation_details` use this to render a score-breakdown.
     """
     bll: dict[str, float] = {}
     for nid, node in graph.nodes.items():
@@ -178,15 +222,29 @@ def combined_activation(
     if graph.SELF_ID in graph.nodes and graph.SELF_ID not in seeds:
         seeds[graph.SELF_ID] = 0.5
     spread = spread_activation(graph, seeds, gain=gain, hops=hops)
-    out: dict[str, float] = {}
+    out: dict[str, dict[str, float]] = {}
     self_node = graph.nodes.get(graph.SELF_ID)
     current_mood = getattr(self_node, "current_mood", {}) or {}
     for nid, node in graph.nodes.items():
-        score = base_weight * bll.get(nid, 0.0) + spread_weight * spread.get(nid, 0.0)
+        bll_val = bll.get(nid, 0.0)
+        spread_val = spread.get(nid, 0.0)
+        base_term = base_weight * bll_val
+        spread_term = spread_weight * spread_val
+        score = base_term + spread_term
         shift = getattr(node, "emotional_shift", None)
+        emotion_mult = 1.0
         if score > 0.0 and isinstance(shift, dict):
-            score *= 1.0 + emotion_similarity(shift, current_mood)
-        out[nid] = score
+            emotion_mult = 1.0 + emotion_similarity(shift, current_mood)
+            score *= emotion_mult
+        out[nid] = {
+            "bll": float(bll_val),
+            "spread": float(spread_val),
+            "seed": float(seeds.get(nid, 0.0)),
+            "base": float(base_term),
+            "spread_w": float(spread_term),
+            "emotion_mult": float(emotion_mult),
+            "score": float(score),
+        }
     return out
 
 
@@ -194,4 +252,5 @@ __all__ = [
     "base_level_activation",
     "spread_activation",
     "combined_activation",
+    "combined_activation_breakdown",
 ]

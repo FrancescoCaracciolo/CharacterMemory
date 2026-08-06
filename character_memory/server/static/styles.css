@@ -344,6 +344,23 @@ select option { background: var(--bg-2); }
 .graph-detail .gd-meta { margin-top: 8px; color: var(--text-faint); font: 500 11px var(--mono); display: flex; gap: 10px; flex-wrap: wrap; }
 .graph-detail .field { margin-top: 8px; }
 .graph-detail .kw-chips { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+/* Activation score-breakdown (per-factor contribution to the final score). */
+.graph-detail .bd-block {
+  margin-top: 10px; padding: 8px 10px 9px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.graph-detail .bd-title {
+  font: 600 9.5px var(--mono); color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: .4px; margin-bottom: 4px;
+}
+.graph-detail .bd-block .field { margin-top: 5px; }
+.graph-detail .bd-block .bd-total .field-label,
+.graph-detail .bd-block .bd-total .field-val { color: var(--text); font-weight: 700; }
+.graph-detail .bd-block .bd-total .signed-track { height: 9px; }
+.graph-detail .bd-mult { gap: 8px; }
+.graph-detail .bd-mult .bd-mult-val {
+  width: auto; color: var(--warn); text-align: right;
+}
 .graph-list { margin: 0; padding: 6px 8px; overflow-y: auto; flex: 1; list-style: none; counter-reset: g; }
 .graph-list li {
   counter-increment: g; padding: 6px 8px 6px 26px; border-radius: var(--radius-sm);

@@ -39,7 +39,7 @@ from ..memory.user_facts import UserFactMemory
 from ..memory.user_summary import UserSummaryMemory
 from ..rag.base import as_queries
 from ..rag.hybrid import HybridSearch
-from .activation import combined_activation
+from .activation import combined_activation, combined_activation_breakdown
 from .edges import CoOccurrenceEdge, EpisodeEdge
 from .graph import KnowledgeGraph
 from .ingest import (
@@ -557,7 +557,10 @@ class KnowledgeGraphRetriever:
     def test_activation(self, query: str, *, user_id: Optional[str] = None) -> dict[str, float]:
         """Return the full `{node_id: activation}` trace for `query`.
 
-        Read-only: does not bump practice times or run the Hebbian step.
+        Read-only: does not bump practice times or run the Hebbian step. Also
+        stashes a per-node ``score_breakdown`` (BLL / spread / seed / emotion
+        multiplier / final) on every node for the GUI and for
+        :meth:`test_activation_details`.
         """
         if not self.graph.nodes:
             return {}
@@ -567,7 +570,7 @@ class KnowledgeGraphRetriever:
             pid = f"person:{user_id}"
             if pid in self.graph.nodes:
                 seeds[pid] = seeds.get(pid, 0.0) + self.config.self_seed * 0.6
-        act = combined_activation(
+        breakdown = combined_activation_breakdown(
             self.graph, seeds,
             now=self._now(),
             decay=self.config.decay,
@@ -579,8 +582,10 @@ class KnowledgeGraphRetriever:
         )
         # Stash on the nodes for the GUI / debugging.
         for nid, node in self.graph.nodes.items():
-            node.activation = float(act.get(nid, 0.0))
-        return act
+            comp = breakdown.get(nid, {})
+            node.activation = float(comp.get("score", 0.0))
+            node.score_breakdown = dict(comp)
+        return {nid: comp["score"] for nid, comp in breakdown.items()}
 
     def test_activation_details(
         self, query: str, *, user_id: Optional[str] = None
@@ -606,6 +611,12 @@ class KnowledgeGraphRetriever:
                 "impact": impact,
                 "similarity": similarity,
             }
+            # Per-factor decomposition of the activation score, stashed by
+            # test_activation. Forwarded verbatim so the GUI/MCP can show how
+            # much each factor (BLL, spreading, seed, emotion) contributed.
+            comp = getattr(node, "score_breakdown", None)
+            if isinstance(comp, dict) and comp:
+                details[nid]["score_breakdown"] = dict(comp)
         return details
 
     def retrieve(

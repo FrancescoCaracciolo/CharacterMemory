@@ -136,6 +136,75 @@ function signedBar(label, value, { fmt } = {}) {
   ]);
 }
 
+/**
+ * Activation score-breakdown: how much each factor contributed to a node's
+ * final activation. Factor values are signed and unbounded (BLL is often
+ * negative, seeds can be > 1), so each bar is drawn centred at zero and
+ * scaled to the largest absolute contribution in the set — the relative
+ * widths are what's meaningful.
+ *
+ * `comp` is the `score_breakdown` object from /api/graph:
+ *   { bll, spread, seed, base, spread_w, emotion_mult, score }
+ *   - base      = base_weight   * bll        (weighted BLL contribution)
+ *   - spread_w  = spread_weight * spread     (weighted spreading contribution)
+ *   - seed      = the RRF/SelfNode seed      ("did this node match the query?")
+ *   - emotion_mult = multiplicative mood-alignment boost actually applied
+ *   - score     = (base + spread_w) * emotion_mult   (final activation)
+ */
+function scoreBreakdownBlock(comp) {
+  if (!comp || typeof comp !== "object") return null;
+  const factors = [
+    ["base", "BLL (base-weighted)"],
+    ["spread_w", "spreading"],
+    ["seed", "query seed"],
+  ];
+  const rows = [];
+  // Scale every bar to the largest |weighted contribution| so the relative
+  // share of each factor is legible at a glance.
+  const scale = Math.max(
+    1e-6,
+    ...factors.map(([k]) => Math.abs(Number(comp[k]) || 0)),
+    Math.abs(Number(comp.score) || 0),
+  );
+  for (const [key, label] of factors) {
+    const v = Number(comp[key]) || 0;
+    rows.push(breakdownRow(label, v, scale));
+  }
+  const mult = Number(comp.emotion_mult) || 1.0;
+  // Show the emotion multiplier only when it actually changed the score
+  // (i.e. this node has an emotional_shift aligned with the current mood).
+  if (Math.abs(mult - 1.0) > 1e-3) {
+    rows.push(el("div", { class: "field bd-mult" }, [
+      el("span", { class: "field-label" }, "mood boost"),
+      el("span", { class: "field-val bd-mult-val" }, "×" + mult.toFixed(2)),
+    ]));
+  }
+  rows.push(breakdownRow("final score", Number(comp.score) || 0, scale, { strong: true }));
+  return el("div", { class: "bd-block" }, [
+    el("div", { class: "bd-title" }, "score breakdown"),
+    ...rows,
+  ]);
+}
+
+/** One centred-at-zero contribution bar, scaled by `scale` (max |value|). */
+function breakdownRow(label, value, scale, { strong = false } = {}) {
+  const v = Number(value) || 0;
+  const pos = v >= 0;
+  const half = Math.min(50, (Math.abs(v) / scale) * 50);
+  const color = strong ? "var(--accent)" : pos ? "var(--good)" : "var(--bad)";
+  const fill = el("div", {
+    class: "signed-fill",
+    style: pos
+      ? `left:50%; width:${half}%; background:${color}`
+      : `right:50%; width:${half}%; background:${color}`,
+  });
+  return el("div", { class: "field" + (strong ? " bd-total" : "") }, [
+    el("span", { class: "field-label" }, label),
+    el("div", { class: "signed-track" }, [fill]),
+    el("span", { class: "field-val" }, (pos ? "+" : "") + v.toFixed(2)),
+  ]);
+}
+
 function metaRow(rec) {
   const m = rec.meta || {};
   const parts = [];
@@ -1664,6 +1733,10 @@ function renderNodeDetail(node) {
   if (raw.confidence != null) box.appendChild(fieldBar("confidence", raw.confidence, { klass: "good" }));
   if (raw.importance != null) box.appendChild(fieldBar("importance", raw.importance));
   if (node.act != null) box.appendChild(fieldBar("activation", node.act, { klass: "warn" }));
+  if (raw.score_breakdown && typeof raw.score_breakdown === "object") {
+    const bd = scoreBreakdownBlock(raw.score_breakdown);
+    if (bd) box.appendChild(bd);
+  }
   if (raw.emotional_shift && typeof raw.emotional_shift === "object") {
     for (const [axis, value] of Object.entries(raw.emotional_shift)) {
       if (Number(value) > 0) box.appendChild(fieldBar(`emotion · ${axis}`, Number(value)));

@@ -757,6 +757,12 @@ def read_graph(
             d["emotion_similarity"] = emotion_similarity(shift, current or {})
             d["impact"] = d["raw_emotional_impact"]
             d["similarity"] = d["emotion_similarity"]
+        # Per-factor decomposition of the activation score (stashed on the
+        # node by KnowledgeGraphRetriever.test_activation). Lets the viz show
+        # how much BLL / spreading / seed / emotion contributed.
+        comp = getattr(node, "score_breakdown", None)
+        if isinstance(comp, dict) and comp:
+            d["score_breakdown"] = dict(comp)
         nodes.append(d)
     # Edges: only between kept nodes, skip co_occurrence unless asked, cap the
     # count. Prefer higher-weight / structural edges over weak ones.
