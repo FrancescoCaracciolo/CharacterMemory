@@ -17,7 +17,13 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from typing import Any, Optional
+
+try:  # POSIX (the library's supported server/CLI environments)
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
 
 from ..chunking.base import Chunk
 from ..memory.store import SQLiteStore
@@ -70,28 +76,77 @@ def _name_of(node_dict: dict[str, Any]) -> Optional[str]:
     return name if isinstance(name, str) and name else None
 
 
+@contextmanager
+def _graph_write_lock(path: str):
+    """Serialize a complete SQLite + hybrid-index graph publication.
+
+    ``HybridSearch.persist`` already locks its own two files, but that lock is
+    too narrow for the graph: SQLite must be updated before ``nodes.json`` is
+    published, and two processes must preserve that same ordering.  A
+    graph-level lock prevents an older writer from publishing a stale hybrid
+    snapshot after a newer SQLite merge has completed.
+    """
+    if not path:
+        yield
+        return
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, ".graph.lock"), "a+") as lock_f:
+        if fcntl is not None:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
+def _upsert_sql(table: str, row: dict[str, Any]) -> tuple[str, list[Any]]:
+    """Return a parameterised ``INSERT .. ON CONFLICT(id)`` statement."""
+    columns = list(row)
+    names = ", ".join(columns)
+    placeholders = ", ".join("?" for _ in columns)
+    updates = ", ".join(
+        f"{column}=excluded.{column}" for column in columns if column != "id"
+    )
+    sql = (
+        f"INSERT INTO {table} ({names}) VALUES ({placeholders}) "
+        f"ON CONFLICT(id) DO UPDATE SET {updates}"
+    )
+    return sql, [row[column] for column in columns]
+
+
 # --------------------------------------------------------------------- write
 def save_graph(
     graph: KnowledgeGraph,
     store: SQLiteStore,
     hybrid: HybridSearch,
     path: str,
-) -> None:
-    """Persist `graph` to SQLite + the hybrid index directory `path`."""
-    _ensure_tables(store)
-    store.execute(f"DELETE FROM {NODES_TABLE}")
-    store.execute(f"DELETE FROM {EDGES_TABLE}")
+    *,
+    replace: bool = False,
+) -> KnowledgeGraph:
+    """Merge ``graph`` into SQLite and publish a matching hybrid index.
 
-    # Persist every node (including SelfNode, whose baseline/current mood is
-    # character state). Build hybrid-index chunks in the same pass, omitting
-    # only nodes with no searchable text; SelfNode is always seeded at
-    # retrieval time and contributes nothing to lexical/dense matching.
-    chunks: list[Chunk] = []
-    for node in graph.nodes.values():
+    Routine extraction is deliberately additive.  The previous implementation
+    deleted both KG tables before rewriting the caller's in-memory graph; a
+    stale Discord/server worker could consequently erase every wiki row while
+    persisting its newly learned user edge.  We now upsert the snapshot and
+    apply only explicit graph tombstones.  A graph rebuilt from scratch uses
+    ``replace=True`` to publish an authoritative replacement.
+
+    The returned graph is reloaded from SQLite after the merge and is therefore
+    the authoritative union when another process had added rows meanwhile.
+    """
+    # Materialise JSON rows before entering the cross-process lock.  This also
+    # avoids iterating live dicts while an extraction thread adds a node/edge.
+    nodes = list(graph.nodes.values())
+    edges = list(graph.edges.values())
+    removed_nodes = set(getattr(graph, "_removed_node_ids", set()))
+    removed_edges = set(getattr(graph, "_removed_edge_ids", set()))
+    node_rows: list[dict[str, Any]] = []
+    for node in nodes:
         text = (node.text or "").strip()
         d = node.to_dict()
-        store.upsert(
-            NODES_TABLE,
+        node_rows.append(
             {
                 "id": node.id,
                 "kind": node.kind,
@@ -104,20 +159,12 @@ def save_graph(
                 "recall_count": int(node.recall_count),
                 "practice_times": json.dumps(list(node.practice_times)),
                 "source": node.source or "",
-            },
+            }
         )
-        if text:
-            chunks.append(
-                Chunk(
-                    text=text,
-                    source=node.kind,
-                    metadata={"id": node.id, "kind": node.kind},
-                )
-            )
 
-    for edge in graph.edges.values():
-        store.upsert(
-            EDGES_TABLE,
+    edge_rows: list[dict[str, Any]] = []
+    for edge in edges:
+        edge_rows.append(
             {
                 "id": edge.id,
                 "kind": edge.kind,
@@ -125,16 +172,55 @@ def save_graph(
                 "dst": edge.dst,
                 "weight": float(edge.weight),
                 "data": json.dumps(edge.to_dict(), ensure_ascii=False),
-            },
+            }
         )
 
-    # Rebuild the node-text index from scratch on every save. Node sets are
-    # modest (hundreds, not millions) and a stale index is worse than a
-    # cheap rebuild.
-    hybrid.build(chunks)
-    if path:
-        os.makedirs(path, exist_ok=True)
-        hybrid.persist(path)
+    with _graph_write_lock(path):
+        _ensure_tables(store)
+        with store.transaction(immediate=True) as conn:
+            if replace:
+                conn.execute(f"DELETE FROM {EDGES_TABLE}")
+                conn.execute(f"DELETE FROM {NODES_TABLE}")
+            else:
+                # Node deletion also removes any durable edge touching it,
+                # including an edge written by a process this snapshot had not
+                # loaded yet.  This prevents dangling endpoints.
+                for node_id in removed_nodes:
+                    conn.execute(
+                        f"DELETE FROM {EDGES_TABLE} WHERE src=? OR dst=?",
+                        (node_id, node_id),
+                    )
+                    conn.execute(
+                        f"DELETE FROM {NODES_TABLE} WHERE id=?", (node_id,)
+                    )
+                for edge_id in removed_edges:
+                    conn.execute(
+                        f"DELETE FROM {EDGES_TABLE} WHERE id=?", (edge_id,)
+                    )
+            for row in node_rows:
+                sql, params = _upsert_sql(NODES_TABLE, row)
+                conn.execute(sql, params)
+            for row in edge_rows:
+                sql, params = _upsert_sql(EDGES_TABLE, row)
+                conn.execute(sql, params)
+
+        # SQLite is now authoritative.  Re-read it while the graph publication
+        # lock is held, then build/publish the exact same node set to the hybrid
+        # index.  This keeps cross-process additions searchable immediately.
+        durable = load_graph(store)
+        chunks = [
+            Chunk(
+                text=(node.text or "").strip(),
+                source=node.kind,
+                metadata={"id": node.id, "kind": node.kind},
+            )
+            for node in durable.nodes.values()
+            if (node.text or "").strip() and node.id != durable.SELF_ID
+        ]
+        hybrid.build(chunks)
+        if path:
+            hybrid.persist(path)
+    return durable
 
 
 # --------------------------------------------------------------------- read

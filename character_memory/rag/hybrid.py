@@ -179,9 +179,18 @@ class HybridSearch(RAGSystem):
         # `qv` is a single 1-D row vector; FAISS needs a 2-D (1, dim) array.
         sims, idxs = self._index.search(np.ascontiguousarray(qv.reshape(1, -1)), pool)
         dense_hits: list[tuple[int, int, float]] = []
+        n_nodes = len(self._nodes)
         rank = 0
         for nid, sim in zip(idxs[0], sims[0]):
             if nid < 0:
+                continue
+            # Guard against a stale dense index that has more vectors than the
+            # current `_nodes` list (e.g. rows deleted from SQLite while the
+            # index dir still holds ghost vectors, or a dim-mismatch rebuild
+            # that left the on-disk faiss.index out of sync with nodes.json).
+            # The positional id is the canonical key per AGENTS.md gotcha #1;
+            # a ghost id is simply dropped rather than crashing recall.
+            if nid >= n_nodes:
                 continue
             node = self._nodes[nid]
             if not _matches(where, node.metadata):

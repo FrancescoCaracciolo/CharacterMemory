@@ -56,7 +56,7 @@ from .ingest import (
     ingest_wiki_llm,
     wire_chat_edges,
 )
-from .nodes import Node
+from .nodes import Node, PersonNode
 from .persistence import has_persisted, load_graph, save_graph
 
 
@@ -109,6 +109,10 @@ class KnowledgeGraphRetriever:
         self.embedder: Optional[EmbeddingProvider] = None
         self.hybrid: Optional[HybridSearch] = None
         self.store: Optional[SQLiteStore] = None
+        # A brand-new/rebuilt retriever owns an authoritative full snapshot;
+        # once loaded or saved, routine extraction persists as a merge so a
+        # stale worker cannot erase wiki rows written by another process.
+        self._replace_on_next_save = True
         self._now = clock or _default_clock
         # user_ids the graph currently knows about (drives person resolution
         # and the SelfNode relation edges). Refreshed on every ingest.
@@ -505,10 +509,10 @@ class KnowledgeGraphRetriever:
                         aliases = _json.loads(aliases)
                     except (ValueError, TypeError):
                         aliases = []
-                if isinstance(node, type(self.graph.ensure_person("x"))):
-                    pass
-                node.name = str(row.get("name") or getattr(node, "name", ""))  # type: ignore[attr-defined]
-                node.aliases = list(aliases or [])  # type: ignore[attr-defined]
+                if isinstance(node, PersonNode):
+                    node.name = str(row.get("name") or node.name)
+                    node.aliases = list(aliases or [])
+                    node.text = self.graph._person_text(node.name, node.aliases)
 
     def _source_memory_for(self, name: str) -> Optional[Any]:
         """The retriever does not hold source memories; the agent resolves them.
@@ -567,7 +571,8 @@ class KnowledgeGraphRetriever:
         seeds = self._seed_activations(query)
         # Bias the user's own PersonNode so "about me" wins ties.
         if user_id:
-            pid = f"person:{user_id}"
+            person = self.graph.find_person_by_user_id(user_id)
+            pid = person.id if person is not None else f"person:{user_id}"
             if pid in self.graph.nodes:
                 seeds[pid] = seeds.get(pid, 0.0) + self.config.self_seed * 0.6
         breakdown = combined_activation_breakdown(
@@ -735,7 +740,15 @@ class KnowledgeGraphRetriever:
     def save(self, path: str) -> "KnowledgeGraphRetriever":
         if self.hybrid is None or self.store is None:
             return self
-        save_graph(self.graph, self.store, self.hybrid, path)
+        self.graph = save_graph(
+            self.graph,
+            self.store,
+            self.hybrid,
+            path,
+            replace=self._replace_on_next_save,
+        )
+        self._replace_on_next_save = False
+        self._known_users = self._graph_user_ids()
         return self
 
     def load_persisted(self, path: str) -> "KnowledgeGraphRetriever":
@@ -744,13 +757,14 @@ class KnowledgeGraphRetriever:
         if not has_persisted(self.store, path):
             return self
         self.graph = load_graph(self.store)
+        self._replace_on_next_save = False
         try:
             self.hybrid.load(path)
         except Exception:
             # The SQLite tables are the source of truth for nodes/edges; a
             # stale/missing FAISS index is rebuilt on the next save().
             pass
-        self._known_users = [n.user_id for n in self.graph.nodes_of_kind("person")]
+        self._known_users = self._graph_user_ids()
         return self
 
     def has_persisted(self, path: str) -> bool:
@@ -762,9 +776,18 @@ class KnowledgeGraphRetriever:
         """Wipe the in-memory graph (counters included)."""
         self.graph = KnowledgeGraph()
         self._known_users = []
+        self._replace_on_next_save = True
         return self
 
     # ----------------------------------------------------------------- helpers
+    def _graph_user_ids(self) -> list[str]:
+        """All primary/linked person identifiers, in stable graph order."""
+        ids: list[str] = []
+        for node in self.graph.nodes_of_kind("person"):
+            ids.extend(getattr(node, "user_ids", []) or [])
+            ids.append(getattr(node, "user_id", "") or "")
+        return list(dict.fromkeys(user_id for user_id in ids if user_id))
+
     def _rebuild_index(self) -> None:
         """Rebuild the node-text hybrid index from the current nodes."""
         if self.hybrid is None:

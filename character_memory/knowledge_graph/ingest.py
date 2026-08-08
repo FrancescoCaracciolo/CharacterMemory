@@ -58,7 +58,7 @@ from .edges import (
     RelationEdge,
 )
 from .graph import KnowledgeGraph, slugify
-from .nodes import EpisodeNode, FactNode, Node
+from .nodes import EntityNode, EpisodeNode, FactNode, Node, PersonNode
 
 
 # A character identity carried through extraction so the LLM can judge what is
@@ -179,22 +179,37 @@ _FACT_EXTRACTION_SCHEMA = {
                             "object — those go in 'entities'."
                         ),
                     },
+                    "subject_id": {
+                        "type": "string",
+                        "description": (
+                            "Stable id of an existing person shown in the graph "
+                            "catalog, or 'self'. Use an empty string only when "
+                            "the subject is genuinely new."
+                        ),
+                    },
                     "entities": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "name": {"type": "string"},
+                                "existing_id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Stable entity id from the existing graph "
+                                        "catalog; empty only for a genuinely new entity."
+                                    ),
+                                },
                                 "kind": {
                                     "type": "string",
                                     "description": "place | organization | object | concept",
                                 },
                             },
-                            "required": ["name", "kind"],
+                            "required": ["name", "kind", "existing_id"],
                         },
                     },
                 },
-                "required": ["index", "subject"],
+                "required": ["index", "subject", "subject_id"],
             },
         }
     },
@@ -228,7 +243,14 @@ _FACT_EXTRACTION_PROMPT = (
     "mentioned merely as references (e.g. Einstein, Mozart) unless they are part of "
     "the character's actual story.\n"
     "- Reuse a name that is already in the graph (see below) rather than inventing a "
-    "synonym, so the same thing/person is not duplicated.\n\n"
+    "synonym, so the same thing/person is not duplicated. When a matching person "
+    "already exists, copy its stable id into `subject_id`.\n\n"
+    "ID REUSE RULE:\n"
+    "- The catalog below is authoritative. If an existing person/entity is the same "
+    "real thing under a nickname, abbreviation, capitalization, or longer/shorter "
+    "name, return its exact id.\n"
+    "- For an existing entity set `existing_id` and keep its catalog name. Use an "
+    "empty id only when no catalog node refers to it. Never invent an id.\n\n"
     "{state_clause}"
     "Return one entry per fact using its index. Respond ONLY with the JSON object "
     "described by the schema."
@@ -242,7 +264,7 @@ def _existing_state_clause(
 ) -> str:
     """Render the 'already in the graph' clause so the LLM reuses existing names.
 
-    Capped so a huge graph doesn't blow the prompt: ~60 entity names and all
+    Capped so a huge graph doesn't blow the prompt: up to 80 entity names and
     known people (names + aliases). Names are lowercased-compared at resolve
     time, so this is a hint, not a hard constraint.
 
@@ -255,10 +277,15 @@ def _existing_state_clause(
     for n in graph.nodes_of_kind("person"):
         label = getattr(n, "name", "") or getattr(n, "user_id", "") or n.id
         aliases = [a for a in (getattr(n, "aliases", []) or []) if a]
-        people.append(label if not aliases else f"{label} (aka {', '.join(aliases[:3])})")
-    entities = sorted(
-        {getattr(n, "name", "") or n.text for n in graph.nodes_of_kind("entity")}
-    )
+        rendered = label if not aliases else f"{label} (aka {', '.join(aliases[:4])})"
+        people.append(f"{n.id} = {rendered}")
+    entities: list[str] = []
+    for n in graph.nodes_of_kind("entity"):
+        label = getattr(n, "name", "") or n.text or n.id
+        aliases = [a for a in (getattr(n, "aliases", []) or []) if a]
+        rendered = label if not aliases else f"{label} (aka {', '.join(aliases[:4])})"
+        entities.append(f"{n.id} = {rendered}")
+    entities.sort()
     parts: list[str] = []
     if character:
         name = (character.get("name") or "").strip()
@@ -273,9 +300,9 @@ def _existing_state_clause(
     if known_users:
         parts.append(f"Known user_ids: {known_users} (use 'self' for facts about the character).")
     if people:
-        parts.append("People already in the graph (reuse these names, do not duplicate): " + "; ".join(people[:40]))
+        parts.append("People already in the graph (return the id when matched): " + "; ".join(people[:40]))
     if entities:
-        parts.append("Entities already in the graph (reuse these names, do not duplicate): " + "; ".join(entities[:60]))
+        parts.append("Entities already in the graph (return the id when matched): " + "; ".join(entities[:80]))
     if not parts:
         return ""
     return "\n".join(parts) + "\n\n"
@@ -324,6 +351,10 @@ def _extract_fact_subjects(
         subject = str(entry.get("subject") or "").strip()
         if not subject:
             subject = str(facts[idx].get("user_id") or "self") if 0 <= idx < len(facts) else "self"
+        subject_id = str(entry.get("subject_id") or "").strip()
+        subject_node = graph.nodes.get(subject_id)
+        if subject_id != graph.SELF_ID and not isinstance(subject_node, PersonNode):
+            subject_id = ""
         entities = entry.get("entities") or []
         clean_entities = []
         for e in entities:
@@ -335,8 +366,19 @@ def _extract_fact_subjects(
                     # model must pick a real category or drop the entity.
                     if kind not in {"place", "organization", "object", "concept"}:
                         continue
-                    clean_entities.append({"name": name, "kind": kind})
-        out[idx] = {"subject": subject, "entities": clean_entities}
+                    existing_id = str(e.get("existing_id") or "").strip()
+                    if not isinstance(graph.nodes.get(existing_id), EntityNode):
+                        existing_id = ""
+                    clean_entities.append({
+                        "name": name,
+                        "kind": kind,
+                        "existing_id": existing_id,
+                    })
+        out[idx] = {
+            "subject": subject,
+            "subject_id": subject_id,
+            "entities": clean_entities,
+        }
     # Fill any indices the LLM skipped with the row-owner heuristic.
     for i, f in enumerate(facts):
         out.setdefault(i, {"subject": str(f.get("user_id") or "self"), "entities": []})
@@ -367,7 +409,7 @@ def ingest_emotion(
     for uid in known_users or []:
         if not uid:
             continue
-        graph.ensure_person(uid)  # make sure the node exists even w/o a summary
+        person = graph.ensure_person(uid)  # make sure the node exists even w/o a summary
         state = emotion.get_user_state(uid)
         comment = emotion.get_user_comment(uid)
         # Strength of the relationship = mean magnitude of the signed
@@ -381,7 +423,7 @@ def ingest_emotion(
             id="",
             kind="relation",
             src=self_node.id,
-            dst=f"person:{uid}",
+            dst=person.id,
             weight=max(0.2, min(1.0, 0.3 + 0.7 * magnitude)),
             valence=float(state.get("valence", 0.0)),
             trust=float(state.get("trust", 0.0)),
@@ -502,7 +544,13 @@ def ingest_facts(
             # Resolve the subject endpoint and link it to the fact. A named
             # person subject becomes a PersonNode; places/objects stay in
             # `entities` and never reach here.
-            subj_id = _resolve_subject(graph, subject, known_user_ids, character)
+            subj_id = _resolve_subject(
+                graph,
+                subject,
+                known_user_ids,
+                character,
+                existing_id=str(info.get("subject_id") or ""),
+            )
             graph.upsert_edge(
                 FactEdge(
                     id="",
@@ -520,7 +568,9 @@ def ingest_facts(
             # Entities the fact mentions become EntityNodes linked to the fact.
             for e in entities:
                 ent = graph.ensure_entity(
-                    e["name"], kind_label=e.get("kind", "thing")
+                    e["name"],
+                    kind_label=e.get("kind", "thing"),
+                    existing_id=e.get("existing_id", ""),
                 )
                 graph.upsert_edge(
                     FactEdge(
@@ -546,6 +596,7 @@ def _resolve_subject(
     subject: str,
     known_users: list[str],
     character: Optional[CharacterContext] = None,
+    existing_id: str = "",
 ) -> str:
     """Map an extraction-time `subject` string to a node id.
 
@@ -558,6 +609,12 @@ def _resolve_subject(
     :func:`ingest_facts`.
     """
     s = subject.strip()
+    existing_id = (existing_id or "").strip()
+    if existing_id == graph.SELF_ID:
+        return graph.SELF_ID
+    existing = graph.nodes.get(existing_id)
+    if isinstance(existing, PersonNode):
+        return existing.id
     if not s:
         return graph.SELF_ID
     # The character routes to the singular SelfNode even when the LLM used
@@ -565,7 +622,7 @@ def _resolve_subject(
     if _is_self_name(s, [], character):
         return graph.SELF_ID
     if s in known_users or f"person:{s}" in graph.nodes:
-        return f"person:{s}"
+        return graph.ensure_person(s).id
     # Maybe the LLM used a name/alias; match against known persons.
     for node in graph.nodes.values():
         if getattr(node, "user_id", None) == s or getattr(node, "name", None) == s:
@@ -632,13 +689,15 @@ def ingest_episodes(
             # The owner is always a participant; surface them as a PersonNode.
             participants: set[str] = set()
             if owner:
-                graph.ensure_person(owner)
-                participants.add(f"person:{owner}")
+                owner_node = graph.ensure_person(owner)
+                participants.add(owner_node.id)
+            else:
+                owner_node = None
             graph.upsert_edge(
                 EpisodeEdge(
                     id="",
                     kind="episode",
-                    src=f"person:{owner}" if owner else graph.SELF_ID,
+                    src=owner_node.id if owner_node is not None else graph.SELF_ID,
                     dst=eid,
                     weight=max(
                         0.3,
@@ -793,6 +852,13 @@ _WIKI_EXTRACTION_SCHEMA = {
                                         "key across sections so the same person becomes one node."
                                     ),
                                 },
+                                "existing_id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Stable person id from the existing graph "
+                                        "catalog; empty only for a genuinely new person."
+                                    ),
+                                },
                                 "name": {"type": "string", "description": "the most formal / complete name"},
                                 "aliases": {
                                     "type": "array",
@@ -804,7 +870,7 @@ _WIKI_EXTRACTION_SCHEMA = {
                                     "description": "protagonist | close | supporting | background | mentioned",
                                 },
                             },
-                            "required": ["key", "name", "relevance"],
+                            "required": ["key", "name", "relevance", "existing_id"],
                         },
                     },
                     "entities": {
@@ -813,12 +879,19 @@ _WIKI_EXTRACTION_SCHEMA = {
                             "type": "object",
                             "properties": {
                                 "name": {"type": "string"},
+                                "existing_id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Stable entity id from the existing graph "
+                                        "catalog; empty only for a genuinely new entity."
+                                    ),
+                                },
                                 "kind": {
                                     "type": "string",
                                     "description": "place | organization | object | concept",
                                 },
                             },
-                            "required": ["name", "kind"],
+                            "required": ["name", "kind", "existing_id"],
                         },
                     },
                 },
@@ -847,14 +920,19 @@ _WIKI_EXTRACTION_PROMPT = (
     "   - background: a named character who only appears in passing;\n"
     "   - mentioned: someone merely referenced (including famous real people — "
     "Einstein, Mozart, etc. — unless they are genuinely part of the story).\n"
-    "   Reuse the SAME `key` across sections for the same person.\n"
+    "   Reuse the SAME `key` across sections for the same person. If the person "
+    "is in the catalog below, copy its exact id into `existing_id` instead of "
+    "minting a variant.\n"
     "2. ENTITIES — *named, distinctive* things in the character's world only: "
     "places, organizations, objects, concepts. Same rule as facts: the Phonewave / "
     "IBN 5100 / D-Mail / Future Gadget Lab are entities; a generic microwave / "
     "camera / lab coat / hotel / database is NOT. Each entity `kind` MUST be one of: "
-    "place | organization | object | concept.\n"
+    "place | organization | object | concept. If a catalog entity is the same "
+    "thing under an abbreviation, nickname, capitalization, or longer/shorter "
+    "name, return its exact `existing_id`; never invent an id.\n"
     "3. is_event — true if the section describes a story event/episode; if so, a "
     "one-sentence event_summary.\n\n"
+    "{state_clause}"
     "Keep only specifically named elements. Respond ONLY with the JSON object "
     "described by the schema."
 )
@@ -873,7 +951,10 @@ def _extract_wiki_batch(
     if not batch or llm is None:
         return empty
     numbered = [f"{i}. {t}" for i, t in batch]
-    prompt = _WIKI_EXTRACTION_PROMPT.format(char_clause=_char_clause(character))
+    prompt = _WIKI_EXTRACTION_PROMPT.format(
+        char_clause=_char_clause(character),
+        state_clause=_existing_state_clause(graph, [], character),
+    )
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": "Sections:\n" + "\n".join(numbered)},
@@ -902,7 +983,16 @@ def _extract_wiki_batch(
             if not name or not key:
                 continue
             aliases = [str(a).strip() for a in (p.get("aliases") or []) if str(a).strip() and str(a).strip() != name]
-            persons.append({"key": key, "name": name, "aliases": aliases, "relevance": relevance})
+            existing_id = str(p.get("existing_id") or "").strip()
+            if not isinstance(graph.nodes.get(existing_id), PersonNode):
+                existing_id = ""
+            persons.append({
+                "key": key,
+                "name": name,
+                "aliases": aliases,
+                "relevance": relevance,
+                "existing_id": existing_id,
+            })
         entities: list[dict[str, str]] = []
         for e in entry.get("entities") or []:
             if isinstance(e, dict):
@@ -911,7 +1001,14 @@ def _extract_wiki_batch(
                     kind = str(e.get("kind") or "").strip().lower()
                     if kind not in {"place", "organization", "object", "concept"}:
                         continue
-                    entities.append({"name": name, "kind": kind})
+                    existing_id = str(e.get("existing_id") or "").strip()
+                    if not isinstance(graph.nodes.get(existing_id), EntityNode):
+                        existing_id = ""
+                    entities.append({
+                        "name": name,
+                        "kind": kind,
+                        "existing_id": existing_id,
+                    })
         out[idx] = {
             "is_event": bool(entry.get("is_event")),
             "event_summary": str(entry.get("event_summary") or "").strip(),
@@ -956,13 +1053,41 @@ def ingest_wiki_llm(
         text_of=lambda item: str(item[1].get("text") or ""),
     )
     for sub in batches:
-        extractions.update(
-            _extract_wiki_batch(
-                llm, [(i, sec.get("text", "")) for i, sec in sub],
-                graph=graph, character=character,
-                _on_llm_request_done=_on_llm_request_done,
-            )
+        batch_extractions = _extract_wiki_batch(
+            llm,
+            [(i, sec.get("text", "")) for i, sec in sub],
+            graph=graph,
+            character=character,
+            _on_llm_request_done=_on_llm_request_done,
         )
+        extractions.update(batch_extractions)
+        # Seed the canonical catalog immediately so the next LLM batch sees
+        # and reuses nodes found in this one.  Previously all batches were
+        # extracted before any node was created, making cross-batch reuse
+        # entirely dependent on the model remembering an unseen key.
+        for ext in batch_extractions.values():
+            for person_data in ext.get("persons", []):
+                if person_data.get("relevance") not in _WIKI_KEEP_RELEVANCE:
+                    continue
+                if _looks_like_self(
+                    graph,
+                    person_data["name"],
+                    person_data.get("aliases") or [],
+                    character,
+                ):
+                    continue
+                graph.ensure_person_by_key(
+                    person_data["key"],
+                    name=person_data["name"],
+                    aliases=person_data.get("aliases") or [],
+                    existing_id=person_data.get("existing_id", ""),
+                )
+            for entity_data in ext.get("entities", []):
+                graph.ensure_entity(
+                    entity_data["name"],
+                    kind_label=entity_data.get("kind", "thing"),
+                    existing_id=entity_data.get("existing_id", ""),
+                )
 
     created_fact_ids: list[str] = []
     section_participants: dict[str, set[str]] = {}
@@ -1014,7 +1139,12 @@ def ingest_wiki_llm(
             # are already the SelfNode.
             if _looks_like_self(graph, name, aliases, character):
                 continue
-            person = graph.ensure_person_by_key(key, name=name, aliases=aliases)
+            person = graph.ensure_person_by_key(
+                key,
+                name=name,
+                aliases=aliases,
+                existing_id=p.get("existing_id", ""),
+            )
             graph.upsert_edge(
                 FactEdge(
                     id="",
@@ -1030,7 +1160,11 @@ def ingest_wiki_llm(
             participants.add(person.id)
         # Named entities -> EntityNode.
         for e in ext.get("entities", []):
-            ent = graph.ensure_entity(e["name"], kind_label=e.get("kind", "thing"))
+            ent = graph.ensure_entity(
+                e["name"],
+                kind_label=e.get("kind", "thing"),
+                existing_id=e.get("existing_id", ""),
+            )
             graph.upsert_edge(
                 FactEdge(
                     id="",

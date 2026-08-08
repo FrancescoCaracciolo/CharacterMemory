@@ -54,6 +54,12 @@ class KnowledgeGraph:
     def __init__(self) -> None:
         self.nodes: dict[str, Node] = {}
         self.edges: dict[str, Edge] = {}
+        # Explicit deletion journals used by incremental persistence.  A
+        # routine extraction must merge its additions into the durable graph,
+        # not replace rows owned by a fresher process; these tombstones let it
+        # still propagate intentional removals (dedup/wiki refresh) precisely.
+        self._removed_node_ids: set[str] = set()
+        self._removed_edge_ids: set[str] = set()
         # Transient observer used only while a bulk build is running. It is
         # deliberately not part of the serialized graph state.
         self._on_node_added: Optional[Callable[[Node], None]] = None
@@ -74,6 +80,7 @@ class KnowledgeGraph:
         existing = self.nodes.get(node.id)
         if existing is not None:
             return existing
+        self._removed_node_ids.discard(node.id)
         self.nodes[node.id] = node
         self._adj.setdefault(node.id, [])
         if self._on_node_added is not None:
@@ -94,6 +101,7 @@ class KnowledgeGraph:
 
     def upsert_node(self, node: Node) -> Node:
         """Insert or replace `node` by id (refresh in place if present)."""
+        self._removed_node_ids.discard(node.id)
         if node.id in self.nodes:
             # Preserve transient activation across a refresh.
             node.activation = self.nodes[node.id].activation
@@ -112,6 +120,7 @@ class KnowledgeGraph:
             self.remove_edge(eid)
         self._adj.pop(node_id, None)
         del self.nodes[node_id]
+        self._removed_node_ids.add(node_id)
 
     def ensure_self(
         self,
@@ -143,17 +152,41 @@ class KnowledgeGraph:
         return self_node
 
     def ensure_person(self, user_id: str, *, name: str = "", aliases: Optional[Iterable[str]] = None) -> PersonNode:
-        """Return the PersonNode for `user_id`, creating it if absent."""
+        """Return the PersonNode for `user_id`, creating it if absent.
+
+        Resolution mirrors :meth:`ensure_person_by_key`: when ``person:<uid>``
+        does not already exist, fall back to name/alias matching against
+        existing persons before minting a fresh node. This stops a
+        ``user_summary`` row (or any caller) for an NPC from creating a
+        duplicate of a wiki person whose ``user_id`` differs but whose name or
+        alias matches — e.g. a summary keyed ``rintaro_okabe`` resolves to the
+        existing ``person:okabe`` (which has alias ``Rintaro``) instead of
+        spawning ``person:rintaro_okabe``. Callers that pass no name/aliases
+        are unaffected: ``_find_person_by_name`` returns ``None`` for empty
+        input and a fresh node is created as before.
+        """
         if not user_id:
             user_id = "unknown"
         nid = f"person:{user_id}"
         node = self.nodes.get(nid)
+        if not isinstance(node, PersonNode):
+            node = self.find_person_by_user_id(user_id)
+        if not isinstance(node, PersonNode):
+            # Fall back to name/alias matching so a non-canonical user_id for
+            # an already-known person attaches to the existing node instead of
+            # creating a duplicate that _dedup_persons would later collapse
+            # (dropping shared-attribution edges on the way).
+            node = self._find_person_by_name(name, aliases or [])
         if isinstance(node, PersonNode):
+            node.user_ids = list(dict.fromkeys([
+                *(node.user_ids or []), node.user_id, user_id
+            ]))
             if name:
                 node.name = name
             if aliases:
                 merged = list(dict.fromkeys([*node.aliases, *aliases]))
                 node.aliases = merged
+            node.text = self._person_text(node.name, node.aliases)
             return node
         import time as _time
         now = _time.time()
@@ -161,6 +194,7 @@ class KnowledgeGraph:
             id=nid,
             kind="person",
             user_id=user_id,
+            user_ids=[user_id],
             name=name or user_id,
             aliases=list(aliases or []),
             text=self._person_text(name or user_id, aliases or []),
@@ -176,6 +210,7 @@ class KnowledgeGraph:
         *,
         name: str = "",
         aliases: Optional[Iterable[str]] = None,
+        existing_id: str = "",
     ) -> PersonNode:
         """Return the PersonNode for a canonical `key`, merging on name/alias.
 
@@ -194,11 +229,19 @@ class KnowledgeGraph:
         """
         key = (key or "").strip().lower() or "unknown"
         nid = f"person:{key}"
-        node = self.nodes.get(nid)
+        # A structured extraction can point at a stable id shown in its
+        # prompt.  Validate the kind before trusting it; malformed/model-made
+        # ids simply fall through to deterministic label resolution.
+        node = self.nodes.get((existing_id or "").strip())
+        if not isinstance(node, PersonNode):
+            node = self.nodes.get(nid)
         if node is None or not isinstance(node, PersonNode):
             # Fall back to name/alias matching against existing persons.
             node = self._find_person_by_name(name, aliases or [])
         if isinstance(node, PersonNode):
+            node.user_ids = list(dict.fromkeys([
+                *(node.user_ids or []), node.user_id, key
+            ]))
             if name:
                 node.name = name if not node.name else node.name
                 # Keep the more formal (longer) name as the display name.
@@ -217,6 +260,7 @@ class KnowledgeGraph:
             id=nid,
             kind="person",
             user_id=key,
+            user_ids=[key],
             name=name or key,
             aliases=aliases_list,
             text=self._person_text(name or key, aliases_list),
@@ -225,6 +269,17 @@ class KnowledgeGraph:
         )
         self.add_node(person)
         return person
+
+    def find_person_by_user_id(self, user_id: str) -> Optional[PersonNode]:
+        """Return the person carrying ``user_id`` as a primary/linked id."""
+        if not user_id:
+            return None
+        for node in self.nodes.values():
+            if not isinstance(node, PersonNode):
+                continue
+            if node.user_id == user_id or user_id in (node.user_ids or []):
+                return node
+        return None
 
     def _find_person_by_name(
         self, name: str, aliases: Iterable[str]
@@ -246,13 +301,37 @@ class KnowledgeGraph:
         parts = [name] + [a for a in aliases if a and a != name]
         return ". ".join(parts[:6])
 
-    def ensure_entity(self, name: str, *, kind_label: str = "thing") -> EntityNode:
-        """Return the EntityNode for `name` (slug-keyed), creating it if absent."""
+    def ensure_entity(
+        self,
+        name: str,
+        *,
+        kind_label: str = "thing",
+        aliases: Optional[Iterable[str]] = None,
+        existing_id: str = "",
+    ) -> EntityNode:
+        """Resolve or create an entity, preferring a supplied stable node id.
+
+        Resolution is conservative: a validated ``existing_id`` from the LLM
+        wins, then the slug id, then exact normalized name/alias matching.  We
+        deliberately avoid fuzzy string merging here because two named devices
+        or organizations can differ by one token.  Newly observed surface
+        forms are retained as aliases for future extraction prompts.
+        """
         nid = f"entity:{slugify(name)}"
-        node = self.nodes.get(nid)
+        node = self.nodes.get((existing_id or "").strip())
+        if not isinstance(node, EntityNode):
+            node = self.nodes.get(nid)
+        if not isinstance(node, EntityNode):
+            node = self._find_entity_by_name(name, aliases or [])
         if isinstance(node, EntityNode):
             if kind_label and kind_label != "thing":
                 node.kind_label = kind_label
+            variants = [name, *(aliases or [])]
+            node.aliases = list(dict.fromkeys([
+                *(node.aliases or []),
+                *[v for v in variants if v and v != node.name],
+            ]))
+            node.text = self._entity_text(node.name, node.aliases)
             return node
         import time as _time
         now = _time.time()
@@ -261,12 +340,37 @@ class KnowledgeGraph:
             kind="entity",
             name=name,
             kind_label=kind_label,
-            text=name,
+            aliases=[a for a in (aliases or []) if a and a != name],
+            text=self._entity_text(name, aliases or []),
             created_at=now,
             practice_times=[now],
         )
         self.add_node(ent)
         return ent
+
+    def _find_entity_by_name(
+        self, name: str, aliases: Iterable[str]
+    ) -> Optional[EntityNode]:
+        """Return an entity with an exactly matching normalized surface form."""
+        labels = {slugify(label) for label in [name, *aliases] if label}
+        if not labels:
+            return None
+        for node in self.nodes.values():
+            if not isinstance(node, EntityNode):
+                continue
+            node_labels = {
+                slugify(label)
+                for label in [node.name, *(node.aliases or [])]
+                if label
+            }
+            if node_labels & labels:
+                return node
+        return None
+
+    @staticmethod
+    def _entity_text(name: str, aliases: Iterable[str]) -> str:
+        parts = [name] + [alias for alias in aliases if alias and alias != name]
+        return ". ".join(dict.fromkeys(parts))
 
     def next_id(self, kind: str) -> str:
         """Return the next auto-incremented id for `kind` ('fact' / 'episode')."""
@@ -315,7 +419,7 @@ class KnowledgeGraph:
         for p in persons:
             labels = {
                 str(c).lower()
-                for c in [p.name, p.user_id, *(p.aliases or [])]
+                for c in [p.name, p.user_id, *(p.user_ids or []), *(p.aliases or [])]
                 if c
             }
             for lab in labels:
@@ -365,7 +469,7 @@ class KnowledgeGraph:
                 continue
             node_labels = {
                 str(c).lower()
-                for c in [node.name, node.user_id, *(node.aliases or [])]
+                for c in [node.name, node.user_id, *(node.user_ids or []), *(node.aliases or [])]
                 if c
             }
             if not (node_labels & target):
@@ -390,27 +494,40 @@ class KnowledgeGraph:
     def _pick_person_survivor(self, member_ids: list[str]) -> str:
         """Choose the canonical survivor id from a group of duplicate persons.
 
-        Prefer a node anchored to a **real user identity** (one whose
-        ``user_id`` came from a ``user_summary`` row, not an LLM canonical
-        key) so that subsequent ingests' ``ensure_person(user_id)`` calls
-        hit the same node instead of re-splitting the person. The heuristic:
-        real platform ids almost always contain a digit, underscore, or
-        uppercase letter, whereas LLM wiki keys are clean lowercase words
-        (``okabe``, ``rintaro``). Break ties by the longest display name so
-        the most formal variant wins.
+        Priorities, strongest first:
+
+        1. **Earliest ``created_at``** — the node that has been in the graph
+           longest wins. This stops a freshly-minted extraction artifact
+           (e.g. a ``user_summary`` row keyed ``rintaro_okabe``, created
+           seconds ago) from deleting a canonical wiki node (``person:okabe``,
+           created at build time) just because the two share an alias. With
+           near-equal timestamps this falls through to the next criterion.
+        2. **Real platform user id** — a ``user_id`` containing a digit or
+           uppercase letter (``francesco_caracciolo``, ``John``) is almost
+           always a real platform id, whereas LLM canonical keys are clean
+           lowercase words (``okabe``, ``rintaro``). Note underscores alone no
+           longer count: LLM-minted slugs like ``rintaro_okabe`` contain them
+           too, which previously let an artifact beat a canonical node.
+        3. **Longest display name** — the most formal variant wins ties.
         """
         import re as _re
 
-        _real_id = _re.compile(r"[0-9_A-Z]")
+        _real_id = _re.compile(r"[0-9A-Z]")
 
-        def score(nid: str) -> tuple[int, int]:
+        def score(nid: str) -> tuple[float, int, int]:
             node = self.nodes.get(nid)
             uid = getattr(node, "user_id", "") or ""
-            # A real external id contains a digit/underscore/uppercase letter;
-            # a clean lowercase slug (LLM canonical key) does not.
+            # A real external id contains a digit or uppercase letter; a clean
+            # lowercase slug (LLM canonical key) does not. Underscores alone
+            # are not evidence of a platform id.
             has_real_id = bool(uid) and bool(_real_id.search(uid))
             name_len = len(getattr(node, "name", "") or "")
-            return (1 if has_real_id else 0, name_len)
+            # Oldest node wins: negate created_at so smaller (earlier) sorts
+            # first under max(). Missing/zero timestamps treat as "now".
+            import time as _time
+            created = float(getattr(node, "created_at", 0.0) or 0.0) or _time.time()
+            age = _time.time() - created
+            return (round(age, 3), 1 if has_real_id else 0, name_len)
 
         return max(member_ids, key=score)
 
@@ -432,17 +549,28 @@ class KnowledgeGraph:
                 survivor.aliases = list(dict.fromkeys([*survivor.aliases, dup.name]))
             survivor.aliases = list(dict.fromkeys([*survivor.aliases, *(dup.aliases or [])]))
             survivor.aliases = [a for a in survivor.aliases if a and a != survivor.name]
+            survivor.user_ids = list(dict.fromkeys([
+                *(survivor.user_ids or []), survivor.user_id,
+                *(dup.user_ids or []), dup.user_id,
+            ]))
             self._rewire_edges(rid, survivor_id)
             self.remove_node(rid)
         survivor.text = self._person_text(survivor.name, survivor.aliases)
 
     def _rewire_edges(self, old_id: str, new_id: str) -> None:
-        """Move every edge touching ``old_id`` onto ``new_id`` and dedupe.
+        """Move every edge touching ``old_id`` onto ``new_id``.
 
         Each affected edge is re-inserted via :meth:`upsert_edge` so the merge
         logic in :meth:`_merge_edge` combines strengths (max for scalars,
         larger magnitude for signed dims) instead of overwriting. Self-loops
         created by the rewire (both endpoints now ``new_id``) are dropped.
+
+        Multi-attribution is preserved: when the rewired edge would collide
+        with an edge the survivor already owns (same kind + endpoints), the
+        two are *distinct* attributions (e.g. two different people both linked
+        to the same fact before being merged) and must not collapse. Such an
+        edge is re-inserted under a unique ``::mN`` suffix id instead of being
+        dropped by ``upsert_edge``'s canonical-id dedup.
         """
         if old_id == new_id:
             return
@@ -457,14 +585,23 @@ class KnowledgeGraph:
                 # Would become a self-loop on the survivor; drop it.
                 self.remove_edge(eid)
                 continue
-            # Drop the old edge then re-insert under the new canonical id so
-            # upsert_edge can merge it with any existing edge between the same
-            # (kind, src, dst) triple.
+            canonical = self.edge_id(edge.kind, new_src, new_dst)
             self.remove_edge(eid)
             edge.src = new_src
             edge.dst = new_dst
-            edge.id = ""
-            self.upsert_edge(edge)
+            if canonical not in self.edges:
+                # No collision: re-insert under the canonical id and let
+                # upsert_edge merge if a concurrent insert landed first.
+                edge.id = ""
+                self.upsert_edge(edge)
+            else:
+                # Collision with an edge the survivor already owns. This is a
+                # legitimate distinct attribution (two pre-merge persons both
+                # linked to the same target), not a duplicate re-ingest. Keep
+                # it as its own edge under a unique suffix id so multi-person
+                # attribution survives the merge.
+                edge.id = self._unique_rewire_id(canonical)
+                self.add_edge(edge)
 
     # ------------------------------------------------------------------ edges
     def add_edge(self, edge: Edge) -> Edge:
@@ -472,6 +609,7 @@ class KnowledgeGraph:
         existing = self.edges.get(edge.id)
         if existing is not None:
             return existing
+        self._removed_edge_ids.discard(edge.id)
         self.edges[edge.id] = edge
         self._adj.setdefault(edge.src, []).append(edge.id)
         self._adj.setdefault(edge.dst, []).append(edge.id)
@@ -488,6 +626,7 @@ class KnowledgeGraph:
             lst = self._adj.get(endpoint, [])
             if edge_id in lst:
                 lst.remove(edge_id)
+        self._removed_edge_ids.add(edge_id)
 
     def edge_id(self, kind: str, src: str, dst: str) -> str:
         """Canonical edge id for a `(kind, src, dst)` triple.
@@ -499,6 +638,19 @@ class KnowledgeGraph:
             a, b = sorted([src, dst])
             return f"e:{kind}:{a}::{b}"
         return f"e:{kind}:{src}->{dst}"
+
+    def _unique_rewire_id(self, canonical: str) -> str:
+        """Return a free edge id derived from ``canonical``.
+
+        Used by :meth:`_rewire_edges` to keep a rewired edge distinct when it
+        would otherwise collide with an edge the survivor already owns (a
+        legitimate second attribution, not a duplicate). Suffixes ``::m1``,
+        ``::m2``, ... are appended until a free id is found.
+        """
+        n = 1
+        while f"{canonical}::m{n}" in self.edges:
+            n += 1
+        return f"{canonical}::m{n}"
 
     def upsert_edge(self, edge: Edge) -> Edge:
         """Insert or merge `edge` by its canonical id."""

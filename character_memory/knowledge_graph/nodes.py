@@ -128,10 +128,15 @@ class PersonNode(Node, _NodeMixin):
     user_id: str = ""
     name: str = ""
     aliases: list[str] = field(default_factory=list)
+    #: All stable identifiers that have resolved to this person.  Wiki keys
+    #: and external chat user ids can differ even when name/alias resolution
+    #: correctly reuses one node.
+    user_ids: list[str] = field(default_factory=list)
 
     def _extra_fields(self) -> dict[str, Any]:
         return {
             "user_id": self.user_id,
+            "user_ids": list(self.user_ids),
             "name": self.name,
             "aliases": list(self.aliases),
         }
@@ -200,9 +205,17 @@ class EntityNode(Node, _NodeMixin):
     kind: str = "entity"
     name: str = ""
     kind_label: str = "thing"
+    #: Alternative surface forms learned during extraction.  Keeping these on
+    #: the canonical entity makes later LLM and deterministic resolution reuse
+    #: the same node even when a conversation uses a shorter wiki name.
+    aliases: list[str] = field(default_factory=list)
 
     def _extra_fields(self) -> dict[str, Any]:
-        return {"name": self.name, "kind_label": self.kind_label}
+        return {
+            "name": self.name,
+            "kind_label": self.kind_label,
+            "aliases": list(self.aliases),
+        }
 
 
 # Registry used by `Node.from_dict` to dispatch on `kind` when loading.

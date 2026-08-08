@@ -8,7 +8,8 @@ raw SQL.
 
 import sqlite3
 import threading
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 
 class SQLiteStore:
@@ -80,6 +81,31 @@ class SQLiteStore:
             rows = self._conn.execute(sql, params or []).fetchall()
             self._conn.commit()
         return [dict(r) for r in rows]
+
+    @contextmanager
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        """Yield the connection inside one store-wide transaction.
+
+        This is intentionally a small escape hatch for persistence code that
+        must update several related rows atomically.  Callers execute SQL on
+        the yielded connection directly; nesting regular ``SQLiteStore``
+        methods inside the block would try to acquire the same non-reentrant
+        lock and is therefore unsupported.
+
+        ``immediate=True`` obtains SQLite's write reservation up front.  It is
+        useful for snapshot-style writers such as the knowledge graph, where
+        another process must not interleave a second graph snapshot between
+        the first row and the last.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield self._conn
+            except BaseException:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
 
     def columns(self, table: str) -> list[str]:
         """Column names of `table` (empty if the table does not exist)."""
