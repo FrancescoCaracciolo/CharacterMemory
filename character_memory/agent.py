@@ -31,7 +31,7 @@ from typing import Any, Callable, Iterable, Iterator, Optional, Union
 
 from .chat import Chat, _ChatBackend
 from .chunking.registry import get_chunker
-from .character import Character
+from .character import Character, ContextSnapshot
 from .config import (
     CharacterMemoryConfig,
     ChunkingConfig,
@@ -694,11 +694,17 @@ class CharacterAgent:
         self, target: Target, *, user_id: str = "default"
     ) -> dict[str, str]:
         """Return `{memory_name: rendered_section}` for the target."""
+        return self.build_context_snapshot(target, user_id=user_id).sections
+
+    def build_context_snapshot(
+        self, target: Target, *, user_id: str = "default"
+    ) -> ContextSnapshot:
+        """Build context once and expose the exact recalls used to build it."""
         self._require_loaded()
         assert self.character is not None
         last_user_msg, uid, prior, participants = self._resolve_target(target, user_id)
         query = self._weighted_query(last_user_msg, prior)
-        return self.character.build_context(
+        return self.character.build_context_snapshot(
             query, uid, limits=self._limits, participants=participants
         )
 

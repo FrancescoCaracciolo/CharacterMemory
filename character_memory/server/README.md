@@ -341,6 +341,12 @@ Features:
   signed emotional-shift bars for episodes, per-user emotion bars + a baseline
   banner, rendered markdown for wiki chunks, etc.
 - Skeleton loaders + request cancellation keep it feeling snappy.
+- **Live recall monitor** — open `/gui?tab=live&character=Kurisu` to watch
+  successful `POST /context` requests arrive over SSE. Each request shows the
+  exact recalled items in collapsible memory drawers and, when the knowledge
+  graph contributed, the captured activation field. The monitor keeps the
+  latest 25 events per character in memory for the current server session; it
+  does not add a second durable chat log.
 
 Keyboard: `/` focuses search, `Esc` clears it.
 
@@ -348,6 +354,23 @@ Keyboard: `/` focuses search, `Esc` clears it.
 
 The HTML page. Static assets (`styles.css`, `app.js`) are served from
 `/gui/static/`.
+
+Use `?tab=live&character=<name>` to deep-link directly to the live recall
+monitor. The browser reconnects automatically if the SSE connection drops.
+
+---
+
+### `GET /api/context-events/{character}`
+
+Server-Sent Events stream for the live recall monitor. The stream replays the
+current in-memory session history (up to 25 events), then emits one `context`
+event after each successful `POST /context`. Events include the request
+metadata, the weighted retrieval query, each recalled memory's rendered section
+and items, and a capped graph payload built from the activation trace captured
+during that same recall. `POST /context` itself remains unchanged.
+
+This broker is process-local and intended for the documented single-worker
+server. It is not a durable or multi-worker event transport.
 
 ---
 
@@ -485,6 +508,7 @@ register themselves at module import.
 |-------------------------|-------------------|------------------------------------------------------------------------------|
 | `list_memories`         | _character_       | Sidebar overview: every memory with title, kind, count, known users.        |
 | `search_memory`         | _read-only_       | Optional `query`, `user_id`, ISO-8601 `date_from` / `date_to`, `limit`.     |
+| `search_memory_by_date` | _read-only_       | Required calendar `date`; optional IANA `timezone`, `query`, `user_id`, `limit`. |
 | `add_fact`              | `user_facts`      | `user_id`, `content`, `type`, `importance`, `confidence`.                  |
 | `update_fact`           | `user_facts`      | `id`, plus any subset of fields to overwrite.                                |
 | `delete_fact`           | `user_facts`      | `id`.                                                                       |
@@ -503,8 +527,11 @@ register themselves at module import.
 | `add_character_info`    | `character_info`  | `text`, optional `source`. Session-scoped — see caveat below.               |
 | `add_dialogue`          | `dialogue_style`  | Same caveat as `add_character_info`.                                         |
 
-`search_memory` is the only tool with a `date_from` / `date_to` filter.
-It is honoured on memories whose rows carry `created_at`
+`search_memory` accepts a `date_from` / `date_to` timestamp range. The
+dedicated `search_memory_by_date` tool accepts a calendar date
+(`YYYY-MM-DD`) and an optional IANA timezone (default `UTC`), and searches
+the half-open local-day range so daylight-saving transitions are handled
+correctly. Date filtering is honoured on memories whose rows carry `created_at`
 (`user_facts`, `user_directives`, `episodic`, `heartbeat`,
 `user_summary`) and silently ignored on the others
 (`character_info`, `dialogue_style`, `emotion`). Bad ISO 8601 input
@@ -560,6 +587,27 @@ curl -X POST 'http://localhost:8000/mcp?character=Kurisu' \
             "memory": "user_facts",
             "date_from": "2024-01-01T00:00:00Z",
             "date_to":   "2024-12-31T23:59:59Z",
+            "limit": 10
+          }
+        }
+      }'
+```
+
+### Example: `search_memory_by_date`
+
+```bash
+curl -X POST 'http://localhost:8000/mcp?character=Kurisu' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "search_memory_by_date",
+          "arguments": {
+            "memory": "episodic",
+            "date": "2024-07-17",
+            "timezone": "Europe/Rome",
+            "user_id": "francesco",
             "limit": 10
           }
         }

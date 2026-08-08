@@ -28,6 +28,11 @@ const state = {
   editor: { editable: false, fields: [], description: "" },
   editing: null,
   graph: { data: null, q: "", user: "", full: false, _gv: null, _wired: false }, // KG viz state
+  live: {
+    events: new Map(), selectedId: null, follow: true, source: null,
+    connection: "closed", graph: {}, graphUser: "", openMemory: new Set(), openInitialized: false,
+    _gv: null, _active: false,
+  },
 };
 
 // ---------------------------------------------------------------- DOM shortcuts
@@ -461,6 +466,8 @@ async function loadCharacters() {
   }
   state.character = state.character && state.characters.includes(state.character)
     ? state.character : state.characters[0];
+  const requestedCharacter = new URLSearchParams(location.search).get("character");
+  if (requestedCharacter && state.characters.includes(requestedCharacter)) state.character = requestedCharacter;
   sel.value = state.character;
   return true;
 }
@@ -948,6 +955,8 @@ function graphCssColor(token, fallback) {
 // imperative API used by the rest of the app (setData / fit / focus / freeze).
 function createGraphViz(canvas, opts) {
   const onSelect = opts && opts.onSelect;
+  const overlay = (opts && opts.overlay) || document.getElementById("graph-overlay");
+  const visibility = opts && opts.visibility;
   const settings = (opts && opts.settings) || GRAPH_SETTINGS;
   const ctx = canvas.getContext("2d");
   const dpr = () => window.devicePixelRatio || 1;
@@ -976,7 +985,7 @@ function createGraphViz(canvas, opts) {
 
   // DOM tooltip living inside the overlay (sibling of the canvas).
   const tip = el("div", { class: "graph-tip-box" });
-  document.getElementById("graph-overlay").appendChild(tip);
+  (overlay || canvas.parentElement).appendChild(tip);
 
   // physics constants (world units) — REP/REST/GRAV are live-tunable via settings
   const SPRING = 0.045, DAMP = 0.82, MAXV = 28;
@@ -1032,7 +1041,7 @@ function createGraphViz(canvas, opts) {
     selectedId = null;
     if (onSelect) onSelect(null);
     const present = new Set(data.nodes.map(n => n.id));
-    dimMode = data.mode === "full" && !!data.query;
+    dimMode = (data.mode === "full" || data.mode === "trace") && !!data.query;
     const golden = Math.PI * (3 - Math.sqrt(5));
     const next = [];
     data.nodes.forEach((n, i) => {
@@ -1529,7 +1538,9 @@ function createGraphViz(canvas, opts) {
     view.panX = target.panX = e.offsetX - w.x * ns;
     view.panY = target.panY = e.offsetY - w.y * ns;
   }
-  function onResize() { if (!document.getElementById("graph-view").classList.contains("hidden")) resize(); }
+  function onResize() {
+    if (!visibility || !visibility.classList.contains("hidden")) resize();
+  }
 
   canvas.addEventListener("pointerdown", onPointerDown);
   canvas.addEventListener("pointermove", onPointerMove);
@@ -1641,7 +1652,12 @@ async function renderGraphView() {
     (data.query ? ` · query “${data.query}”` : "");
 
   const canvas = $("cy");
-  if (!state.graph._gv) state.graph._gv = createGraphViz(canvas, { onSelect: renderNodeDetail, settings: GRAPH_SETTINGS });
+  if (!state.graph._gv) state.graph._gv = createGraphViz(canvas, {
+    onSelect: renderNodeDetail,
+    settings: GRAPH_SETTINGS,
+    overlay: $("graph-overlay"),
+    visibility: $("graph-view"),
+  });
   state.graph._gv.resize();
   state.graph._gv.setData(view);
   requestAnimationFrame(() => state.graph._gv.resize());
@@ -1832,7 +1848,10 @@ function focusGraphNode(id) {
 // Build the side detail card for a clicked node (called by the renderer's
 // onSelect callback with the internal node object).
 function renderNodeDetail(node) {
-  const box = $("graph-detail");
+  renderNodeDetailInto(node, $("graph-detail"));
+}
+
+function renderNodeDetailInto(node, box) {
   clear(box);
   if (!node) { box.classList.add("hidden"); return; }
   box.classList.remove("hidden");
@@ -1868,12 +1887,399 @@ function renderNodeDetail(node) {
     meta.map(([k, v]) => el("span", {}, [el("b", {}, k + ":"), " " + v]))));
 }
 
+function renderLiveNodeDetail(node) {
+  renderNodeDetailInto(node, $("live-graph-detail"));
+}
+
+// ---------------------------------------------------------------- live /context monitor
+function liveUrl() {
+  const params = new URLSearchParams(location.search);
+  params.set("tab", "live");
+  if (state.character) params.set("character", state.character);
+  return `${location.pathname}?${params.toString()}${location.hash || ""}`;
+}
+
+function updateViewUrl({ replace = false } = {}) {
+  const params = new URLSearchParams(location.search);
+  const active = $("tab-live").classList.contains("active")
+    ? "live" : $("tab-configure").classList.contains("active") ? "configure" : "browse";
+  if (active === "browse") params.delete("tab"); else params.set("tab", active);
+  if (state.character) params.set("character", state.character);
+  const url = `${location.pathname}${params.toString() ? "?" + params.toString() : ""}${location.hash || ""}`;
+  if (replace) history.replaceState({}, "", url); else history.pushState({}, "", url);
+}
+
+function liveSetConnection(kind, label) {
+  state.live.connection = kind;
+  const dot = $("live-status-dot"), text = $("live-status");
+  if (dot) dot.className = `live-status-dot ${kind}`;
+  if (text) text.textContent = label;
+}
+
+function closeLiveStream() {
+  if (state.live.source) {
+    state.live.source.close();
+    state.live.source = null;
+  }
+  state.live.connection = "closed";
+}
+
+function connectLiveStream() {
+  if (!state.live._active || !state.character) return;
+  closeLiveStream();
+  if (!window.EventSource) {
+    liveSetConnection("error", "Live updates are not supported by this browser");
+    return;
+  }
+  liveSetConnection("connecting", "Connecting to /context…");
+  const source = new EventSource(`${API}/api/context-events/${encodeURIComponent(state.character)}`);
+  state.live.source = source;
+  source.onopen = () => liveSetConnection("connected", "Listening for /context");
+  source.onerror = () => {
+    if (state.live._active) liveSetConnection("connecting", "Connection interrupted · retrying…");
+  };
+  const receiveContext = (event) => {
+    let payload;
+    try { payload = JSON.parse(event.data); } catch (error) { return; }
+    const id = String(payload.id || payload.sequence || "");
+    if (!id || state.live.events.has(id)) return;
+    state.live.events.set(id, payload);
+    while (state.live.events.size > 25) {
+      const oldest = state.live.events.keys().next().value;
+      state.live.events.delete(oldest);
+    }
+    renderLiveTimeline();
+    const newest = latestLiveEvent();
+    if (state.live.follow && newest && String(newest.id) === id) {
+      state.live.selectedId = id;
+      $("live-new").classList.add("hidden");
+      renderLiveEvent(newest);
+    } else if (state.live.selectedId !== id) {
+      $("live-new").classList.remove("hidden");
+    }
+  };
+  source.addEventListener("context", receiveContext);
+  // Be tolerant of SSE relays that strip the named-event line.
+  source.onmessage = receiveContext;
+}
+
+function sortedLiveEvents() {
+  return Array.from(state.live.events.values()).sort((a, b) =>
+    Number(a.sequence || a.id || 0) - Number(b.sequence || b.id || 0));
+}
+
+function latestLiveEvent() {
+  const events = sortedLiveEvents();
+  return events.length ? events[events.length - 1] : null;
+}
+
+function liveTime(epoch) {
+  return epoch ? `${relTime(epoch)} · ${new Date(epoch * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "—";
+}
+
+function liveMetaChips(event) {
+  const out = [chip(`${event.memory_count || 0} memories`, "kind-chip"), chip(`${event.item_count || 0} items`)];
+  if (event.user) out.push(chip(`speaker · ${event.user}`));
+  if (event.chat_id) out.push(chip(`chat · ${event.chat_id}`));
+  if ((event.participants || []).length > 1) out.push(chip(`participants · ${event.participants.join(", ")}`));
+  if (Object.keys(event.graphs || {}).length) out.push(chip("graph active", "kind-chip"));
+  return out;
+}
+
+function renderLiveTimeline() {
+  const box = $("live-timeline"); clear(box);
+  const events = sortedLiveEvents().reverse();
+  $("live-history-count").textContent = `${events.length} / 25`;
+  for (const event of events) {
+    const id = String(event.id);
+    const button = el("button", {
+      class: "live-timeline-item" + (id === state.live.selectedId ? " active" : "") +
+        (id === String(latestLiveEvent() && latestLiveEvent().id) ? " newest" : ""),
+      type: "button",
+      onclick: () => selectLiveEvent(id),
+    }, [
+      el("div", { class: "live-timeline-top" }, [
+        el("span", { class: "live-timeline-speaker" }, event.user || "unknown speaker"),
+        el("span", {}, liveTime(event.created_at)),
+      ]),
+      el("div", { class: "live-timeline-message" }, event.message || "(empty message)"),
+      el("div", { class: "live-timeline-tags" }, [
+        el("span", {}, `${event.memory_count || 0} recalled`),
+        Object.keys(event.graphs || {}).length ? el("span", { class: "kg-on" }, "◆ graph") : null,
+      ]),
+    ]);
+    box.appendChild(button);
+  }
+}
+
+function liveItemMeta(item) {
+  if (!item || typeof item !== "object") return [];
+  const meta = item.metadata || {};
+  const fields = [];
+  for (const key of ["user_id", "source", "node_id", "id", "recall_count"]) {
+    if (meta[key] !== undefined && meta[key] !== null && meta[key] !== "") fields.push(`${key}: ${typeof meta[key] === "object" ? JSON.stringify(meta[key]) : meta[key]}`);
+  }
+  return fields;
+}
+
+function liveMemoryItems(memory) {
+  let raw = memory && (memory.items ?? memory.results ?? memory.records);
+  if (typeof raw === "string") {
+    try { raw = JSON.parse(raw); } catch (error) { return []; }
+  }
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object") return Object.values(raw);
+  return [];
+}
+
+function liveMemories(event) {
+  let raw = event && event.memories;
+  if (typeof raw === "string") {
+    try { raw = JSON.parse(raw); } catch (error) { raw = null; }
+  }
+  const usable = Array.isArray(raw) || (raw && typeof raw === "object");
+  if ((!usable || (Array.isArray(raw) && raw.length === 0)) && event) {
+    raw = event.recalls ?? event.recalled_memories ?? event.memory_sections ?? event.sections ?? event.context;
+    if (typeof raw === "string") {
+      try { raw = JSON.parse(raw); } catch (error) { raw = null; }
+    }
+  }
+  if (Array.isArray(raw)) return raw.filter((memory) => memory && typeof memory === "object");
+  if (raw && typeof raw === "object") {
+    return Object.entries(raw).map(([name, memory]) => {
+      if (Array.isArray(memory)) return { name, title: name, items: memory };
+      return {
+        name,
+        ...(memory && typeof memory === "object" ? memory : { body: String(memory || "") }),
+      };
+    });
+  }
+  return [];
+}
+
+function renderLiveRecalls(event) {
+  const box = $("live-recalls"); clear(box);
+  const memories = liveMemories(event);
+  const firstRender = !state.live.openInitialized;
+  if (firstRender) for (const memory of memories) state.live.openMemory.add(memory.name);
+  $("live-empty").classList.toggle("hidden", !!memories.length);
+  for (const memory of memories) {
+    const known = state.live.openMemory.has(memory.name);
+    const items = liveMemoryItems(memory);
+    const details = el("details", { class: "live-memory", open: firstRender || known }, []);
+    const summary = el("summary", { class: "live-memory-summary" }, [
+      el("span", { class: "live-memory-name", title: memory.name }, memory.title || memory.name),
+      el("span", { class: "live-memory-scope" }, memory.scope || "memory"),
+      el("span", { class: "live-memory-count" }, `${items.length} recalled`),
+    ]);
+    details.appendChild(summary);
+    const body = el("div", { class: "live-memory-body" });
+    const promptText = typeof memory.body === "string" ? memory.body
+      : typeof memory.section === "string" ? memory.section : "";
+    if (promptText) body.appendChild(el("pre", { class: "live-memory-prompt" }, promptText));
+    for (const item of items) {
+      const safeItem = item && typeof item === "object" ? item : { text: String(item ?? "") };
+      const score = Number(safeItem.score);
+      body.appendChild(el("article", { class: "live-item" }, [
+        el("div", { class: "live-item-top" }, [
+          el("span", { class: "live-item-kind" }, safeItem.kind || "recalled item"),
+          Number.isFinite(score) ? el("span", { class: "live-item-score" }, `score ${score.toFixed(2)}`) : null,
+        ]),
+        el("div", { class: "live-item-text" }, safeItem.text || "(empty)"),
+        liveItemMeta(safeItem).length ? el("div", { class: "live-item-meta" }, liveItemMeta(safeItem).map((value) => el("span", {}, value))) : null,
+      ]));
+    }
+    details.appendChild(body);
+    details.addEventListener("toggle", () => {
+      if (details.open) state.live.openMemory.add(memory.name);
+      else state.live.openMemory.delete(memory.name);
+      state.live.openInitialized = true;
+    });
+    box.appendChild(details);
+  }
+  state.live.openInitialized = true;
+}
+
+function graphNodeText(node) {
+  if (node.kind === "fact") return node.content || node.text || node.id;
+  if (node.kind === "episode") return node.summary || node.text || node.id;
+  if (node.kind === "person") return node.name || node.user_id || node.id;
+  if (node.kind === "entity") return node.name || node.id;
+  if (node.kind === "self") return "self";
+  return node.text || node.id;
+}
+
+function renderLiveGraphList(data) {
+  const box = $("live-graph-list"); clear(box);
+  const nodes = (data.nodes || []).slice().sort((a, b) => (+b.activation || 0) - (+a.activation || 0)).slice(0, 15);
+  for (const node of nodes) {
+    const normalized = clamp(Number(node.activation_norm) || 0, 0, 1);
+    box.appendChild(el("li", { onclick: () => state.live._gv && state.live._gv.focus(node.id) }, [
+      el("div", {}, [
+        el("span", { class: "gl-kind" }, GRAPH_KIND_LABEL[node.kind] || node.kind),
+        " ", el("span", { class: "gl-act" }, `${(normalized * 100).toFixed(0)}%`),
+      ]),
+      el("div", { class: "gl-text" }, graphNodeText(node)),
+    ]));
+  }
+}
+
+function renderLiveGraph(event) {
+  let rawGraphs = event.graphs ?? event.graph ?? {};
+  if (typeof rawGraphs === "string") {
+    try { rawGraphs = JSON.parse(rawGraphs); } catch (error) { rawGraphs = {}; }
+  }
+  const graphs = rawGraphs && !Array.isArray(rawGraphs) && Array.isArray(rawGraphs.nodes)
+    ? { [event.user || "default"]: rawGraphs }
+    : Array.isArray(rawGraphs)
+    ? Object.fromEntries(rawGraphs.map((graph, index) => [graph.user || graph.user_id || String(index), graph]))
+    : rawGraphs && typeof rawGraphs === "object" ? rawGraphs : {};
+  const users = Object.keys(graphs);
+  const shell = $("live-graph-shell"), empty = $("live-graph-empty"), select = $("live-graph-user");
+  if (!users.length) {
+    shell.classList.add("hidden"); empty.classList.remove("hidden");
+    select.classList.add("hidden"); $("live-graph-meta").textContent = "No graph in this request";
+    clear($("live-graph-list")); clear($("live-graph-detail")); $("live-graph-detail").classList.add("hidden");
+    if (state.live._gv) {
+      try { state.live._gv.destroy(); } catch (error) { /* best effort */ }
+      state.live._gv = null;
+    }
+    return;
+  }
+  const preferred = state.live.graphUser && users.includes(state.live.graphUser)
+    ? state.live.graphUser
+    : event.user && users.includes(event.user) ? event.user : users[0];
+  state.live.graphUser = preferred;
+  clear(select);
+  for (const user of users) select.appendChild(el("option", { value: user }, user));
+  select.value = state.live.graphUser;
+  select.classList.toggle("hidden", users.length < 2);
+  const data = graphs[state.live.graphUser];
+  shell.classList.remove("hidden"); empty.classList.add("hidden");
+  $("live-graph-meta").textContent = `${(data.nodes || []).length} nodes · ${(data.edges || []).length} edges · ${state.live.graphUser}`;
+  if (!state.live._gv) {
+    state.live._gv = createGraphViz($("live-cy"), {
+      onSelect: renderLiveNodeDetail,
+      settings: GRAPH_SETTINGS,
+      overlay: $("live-graph-overlay"),
+      visibility: shell,
+    });
+  }
+  // The live monitor explains the exact captured activation. Browse-view
+  // filters such as "hide all facts/episodes" must not erase that trace.
+  state.live._gv.setData(data);
+  renderLiveGraphList(data);
+  requestAnimationFrame(() => state.live._gv && state.live._gv.resize());
+}
+
+function renderLiveEvent(event) {
+  if (!event) return;
+  const request = $("live-request"); clear(request); request.classList.remove("hidden");
+  request.appendChild(el("div", { class: "live-request-title" }, [
+    el("strong", {}, `${event.character || state.character} · /context`),
+    el("span", { class: "live-request-time" }, liveTime(event.created_at)),
+  ]));
+  request.appendChild(el("div", { class: "live-request-message" }, event.message || "(empty message)"));
+  request.appendChild(el("div", { class: "live-request-meta" }, liveMetaChips(event)));
+  const query = (event.query || []).map((part) => {
+    const weight = Number(part.weight);
+    const prefix = Number.isFinite(weight) && weight !== 1 ? `${weight.toFixed(2)}× ` : "";
+    return `${prefix}${part.text || ""}`;
+  }).filter(Boolean).join(" · ");
+  if (query) request.appendChild(el("div", { class: "live-request-query" }, [
+    el("b", {}, "weighted retrieval"), " ", query,
+  ]));
+  renderLiveRecalls(event);
+  try {
+    renderLiveGraph(event);
+  } catch (error) {
+    // A plugin-specific graph payload must not hide the recalled memories.
+    renderLiveGraph({ graphs: {} });
+  }
+}
+
+function selectLiveEvent(id, { follow = false } = {}) {
+  const event = state.live.events.get(String(id));
+  if (!event) return;
+  if (state.live.selectedId !== String(id)) state.live.graphUser = event.user || "";
+  state.live.selectedId = String(id);
+  state.live.follow = !!follow;
+  $("live-new").classList.add("hidden");
+  $("live-follow-label").textContent = state.live.follow ? "Following latest" : "Inspecting a past request";
+  $("live-follow-label").classList.toggle("paused", !state.live.follow);
+  renderLiveTimeline(); renderLiveEvent(event);
+}
+
+function renderLiveLatest() {
+  const newest = latestLiveEvent();
+  if (!newest) {
+    $("live-request").classList.add("hidden"); $("live-empty").classList.remove("hidden");
+    renderLiveTimeline(); return;
+  }
+  selectLiveEvent(String(newest.id), { follow: true });
+}
+
+function wireLiveControls() {
+  $("live-follow").addEventListener("click", () => {
+    state.live.follow = true;
+    renderLiveLatest();
+  });
+  $("live-new-btn").addEventListener("click", () => {
+    state.live.follow = true;
+    renderLiveLatest();
+  });
+  $("live-expand").addEventListener("click", () => {
+    for (const event of state.live.events.values()) for (const memory of liveMemories(event)) state.live.openMemory.add(memory.name);
+    const selected = state.live.events.get(state.live.selectedId); if (selected) renderLiveRecalls(selected);
+  });
+  $("live-collapse").addEventListener("click", () => {
+    state.live.openMemory.clear(); state.live.openInitialized = true;
+    const selected = state.live.events.get(state.live.selectedId); if (selected) renderLiveRecalls(selected);
+  });
+  $("live-graph-user").addEventListener("change", (event) => {
+    state.live.graphUser = event.target.value;
+    const selected = state.live.events.get(state.live.selectedId); if (selected) renderLiveGraph(selected);
+  });
+  $("live-zoom-in").addEventListener("click", () => state.live._gv && state.live._gv.zoomIn());
+  $("live-zoom-out").addEventListener("click", () => state.live._gv && state.live._gv.zoomOut());
+}
+
+function activateLive() {
+  state.live._active = true;
+  connectLiveStream();
+  renderLiveLatest();
+}
+
+function deactivateLive() {
+  state.live._active = false;
+  closeLiveStream();
+  if (state.live._gv) {
+    try { state.live._gv.destroy(); } catch (error) { /* best effort */ }
+    state.live._gv = null;
+  }
+}
+
+function resetCharacterView() {
+  state.memory = null; state.page = 1; state.q = ""; state.user = "";
+  state.editor = { editable: false, fields: [], description: "" };
+  if (state.graph._gv) { try { state.graph._gv.destroy(); } catch (error) {} }
+  // Controls and persisted graph settings outlive a character. In particular,
+  // do not keep Full mode while silently resetting its limits.
+  state.graph = { data: null, q: "", user: "", full: state.graph.full, _gv: null, _wired: graphControlsWired };
+  state.live.events.clear(); state.live.selectedId = null; state.live.graphUser = "";
+  state.live.openMemory.clear(); state.live.openInitialized = false;
+  if (state.live._gv) { try { state.live._gv.destroy(); } catch (error) {} state.live._gv = null; }
+  $("q").value = "";
+  $("graph-q").value = "";
+}
+
 // ---------------------------------------------------------------- wire up
 async function init() {
   wireThemeToggle();
   // The markup starts closed; this selectively restores a saved graph panel
   // state and settings before the controls are first wired/rendered.
   loadGraphUI();
+  wireLiveControls();
   $("refresh").addEventListener("click", () => loadOverview());
   $("add-memory").addEventListener("click", () => openMemoryEditor());
   $("memory-form").addEventListener("submit", saveMemory);
@@ -1884,15 +2290,9 @@ async function init() {
   });
   $("character").addEventListener("change", (e) => {
     state.character = e.target.value;
-    state.memory = null; state.page = 1; state.q = ""; state.user = "";
-    state.editor = { editable: false, fields: [], description: "" };
-    // Tear down the previous renderer when switching characters.
-    if (state.graph._gv) { try { state.graph._gv.destroy(); } catch (err) {} }
-    // Controls and persisted graph settings outlive a character. In
-    // particular, do not keep Full mode while silently resetting its limits.
-    state.graph = { data: null, q: "", user: "", full: state.graph.full, _gv: null, _wired: graphControlsWired };
-    $("q").value = "";
-    $("graph-q").value = "";
+    updateViewUrl();
+    resetCharacterView();
+    if (state.live._active) connectLiveStream();
     loadOverview();
   });
   $("memory-filter").addEventListener("input", renderSidebar);
@@ -1913,12 +2313,17 @@ async function init() {
   // Refit the canvas renderer when the window resizes (the viz also watches
   // its own canvas via ResizeObserver, this just forces a re-measure).
   window.addEventListener("resize", () => {
-    if (!$("graph-view") || $("graph-view").classList.contains("hidden")) return;
-    if (state.graph._gv) state.graph._gv.resize();
+    if ($("graph-view") && !$("graph-view").classList.contains("hidden") && state.graph._gv) state.graph._gv.resize();
+    if ($("live-pane") && !$("live-pane").classList.contains("hidden") && state.live._gv) state.live._gv.resize();
   });
   try {
     const ok = await loadCharacters();
-    if (ok) await loadOverview();
+    if (ok) {
+      await loadOverview();
+      const initialTab = ["browse", "configure", "live"].includes(new URLSearchParams(location.search).get("tab"))
+        ? new URLSearchParams(location.search).get("tab") : "browse";
+      setTab(initialTab, { history: false });
+    }
   } catch (e) {
     showError(e.message);
   }
@@ -1929,24 +2334,44 @@ async function init() {
 // so the configurator never duplicates el()/clear()/$()/markdown()/getJSON().
 window.cmUtil = { $, el, clear, getJSON, markdown, esc };
 
-function setTab(name) {
+function setTab(name, { history = true } = {}) {
   const browse = name === "browse";
+  const configure = name === "configure";
+  const live = name === "live";
   $("tab-browse").classList.toggle("active", browse);
   $("tab-browse").setAttribute("aria-selected", browse ? "true" : "false");
-  $("tab-configure").classList.toggle("active", !browse);
-  $("tab-configure").setAttribute("aria-selected", browse ? "false" : "true");
+  $("tab-configure").classList.toggle("active", configure);
+  $("tab-configure").setAttribute("aria-selected", configure ? "true" : "false");
+  $("tab-live").classList.toggle("active", live);
+  $("tab-live").setAttribute("aria-selected", live ? "true" : "false");
   const main = document.querySelector(".app > .main");
   const cfg = $("cfg-pane");
   if (main) main.classList.toggle("hidden", !browse);
-  if (cfg) cfg.classList.toggle("hidden", browse);
-  if (!browse && window.cmConfig && typeof window.cmConfig.activate === "function") {
+  if (cfg) cfg.classList.toggle("hidden", !configure);
+  $("live-pane").classList.toggle("hidden", !live);
+  if (live) activateLive(); else deactivateLive();
+  if (configure && window.cmConfig && typeof window.cmConfig.activate === "function") {
     window.cmConfig.activate();
   }
+  if (history) updateViewUrl();
 }
 
 function wireTabs() {
   $("tab-browse").addEventListener("click", () => setTab("browse"));
   $("tab-configure").addEventListener("click", () => setTab("configure"));
+  $("tab-live").addEventListener("click", () => setTab("live"));
+  window.addEventListener("popstate", async () => {
+    const requestedCharacter = new URLSearchParams(location.search).get("character");
+    if (requestedCharacter && state.characters.includes(requestedCharacter) && requestedCharacter !== state.character) {
+      state.character = requestedCharacter;
+      $("character").value = requestedCharacter;
+      resetCharacterView();
+      if (state.live._active) connectLiveStream();
+      await loadOverview();
+    }
+    const tab = new URLSearchParams(location.search).get("tab");
+    setTab(["browse", "configure", "live"].includes(tab) ? tab : "browse", { history: false });
+  });
 }
 wireTabs();
 

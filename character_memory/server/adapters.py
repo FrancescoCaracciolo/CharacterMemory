@@ -101,6 +101,75 @@ class StructuredAdapter(MemoryAdapter):
     def _where(self, user_id: Optional[str]) -> Optional[dict[str, Any]]:
         return {"user_id": user_id} if user_id else None
 
+    def _created_rows(
+        self,
+        user_id: Optional[str],
+        created_from: Optional[float],
+        created_before: Optional[float],
+        *,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Rows inside a half-open ``created_at`` range.
+
+        Keeping this query in the structured adapter makes date filtering
+        happen before pagination and leaves every structured-memory subclass
+        on the shared SQLite path.
+        """
+        clauses, params = self._created_filter(
+            user_id, created_from, created_before
+        )
+
+        stmt = f"SELECT * FROM {self.m.table}"
+        if clauses:
+            stmt += " WHERE " + " AND ".join(clauses)
+        if order_by:
+            stmt += f" ORDER BY {order_by}"
+        if limit is not None:
+            stmt += " LIMIT ?"
+            params.append(int(limit))
+        if offset is not None:
+            if limit is None:
+                stmt += " LIMIT -1"
+            stmt += " OFFSET ?"
+            params.append(int(offset))
+        return self.m.store.execute(stmt, params)
+
+    @staticmethod
+    def _created_filter(
+        user_id: Optional[str],
+        created_from: Optional[float],
+        created_before: Optional[float],
+    ) -> tuple[list[str], list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if created_from is not None:
+            clauses.append("created_at >= ?")
+            params.append(float(created_from))
+        if created_before is not None:
+            clauses.append("created_at < ?")
+            params.append(float(created_before))
+        return clauses, params
+
+    def _created_count(
+        self,
+        user_id: Optional[str],
+        created_from: Optional[float],
+        created_before: Optional[float],
+    ) -> int:
+        clauses, params = self._created_filter(
+            user_id, created_from, created_before
+        )
+        stmt = f"SELECT COUNT(*) AS c FROM {self.m.table}"
+        if clauses:
+            stmt += " WHERE " + " AND ".join(clauses)
+        rows = self.m.store.execute(stmt, params)
+        return int(rows[0]["c"]) if rows else 0
+
     def count(self, user_id: Optional[str] = None) -> int:
         stmt = f"SELECT COUNT(*) AS c FROM {self.m.table}"
         params: list[Any] = []
@@ -165,6 +234,26 @@ class StructuredAdapter(MemoryAdapter):
         )
         return [self._record(r) for r in rows], total
 
+    def page_created_between(
+        self,
+        page: int,
+        size: int,
+        user_id: Optional[str],
+        created_from: Optional[float],
+        created_before: Optional[float],
+    ) -> tuple[list[MemoryRecord], int]:
+        """Page rows created in ``[created_from, created_before)``."""
+        total = self._created_count(user_id, created_from, created_before)
+        rows = self._created_rows(
+            user_id,
+            created_from,
+            created_before,
+            order_by="id DESC",
+            limit=size,
+            offset=(page - 1) * size,
+        )
+        return [self._record(r) for r in rows], total
+
     def search(
         self, q: str, page: int, size: int, user_id: Optional[str] = None
     ) -> tuple[list[MemoryRecord], int]:
@@ -173,7 +262,34 @@ class StructuredAdapter(MemoryAdapter):
         start = (page - 1) * size
         return [self._record(r, score=s) for r, s in ranked[start : start + size]], total
 
-    def _ranked_rows(self, q: str, user_id: Optional[str]) -> list[tuple[dict, float]]:
+    def search_created_between(
+        self,
+        q: str,
+        page: int,
+        size: int,
+        user_id: Optional[str],
+        created_from: Optional[float],
+        created_before: Optional[float],
+    ) -> tuple[list[MemoryRecord], int]:
+        """Search, then page, rows created in the half-open range."""
+        ranked = self._ranked_rows(
+            q,
+            user_id,
+            created_from=created_from,
+            created_before=created_before,
+        )
+        total = len(ranked)
+        start = (page - 1) * size
+        return [self._record(r, score=s) for r, s in ranked[start : start + size]], total
+
+    def _ranked_rows(
+        self,
+        q: str,
+        user_id: Optional[str],
+        *,
+        created_from: Optional[float] = None,
+        created_before: Optional[float] = None,
+    ) -> list[tuple[dict, float]]:
         q = (q or "").strip()
         if not q:
             return []
@@ -184,7 +300,12 @@ class StructuredAdapter(MemoryAdapter):
         except Exception:
             hits = []
         if hits:
-            rows_by_id = {r["id"]: r for r in self.m.store.select(self.m.table, where=where)}
+            rows_by_id = {
+                r["id"]: r
+                for r in self._created_rows(
+                    user_id, created_from, created_before
+                )
+            }
             out: list[tuple[dict, float]] = []
             for h in hits:
                 rid = h.metadata.get("id")
@@ -194,11 +315,23 @@ class StructuredAdapter(MemoryAdapter):
             if out:
                 return out
         # Lexical fallback (embedding server down / no hits): substring + count.
-        return self._lexical(q, user_id)
+        return self._lexical(
+            q,
+            user_id,
+            created_from=created_from,
+            created_before=created_before,
+        )
 
-    def _lexical(self, q: str, user_id: Optional[str]) -> list[tuple[dict, float]]:
+    def _lexical(
+        self,
+        q: str,
+        user_id: Optional[str],
+        *,
+        created_from: Optional[float] = None,
+        created_before: Optional[float] = None,
+    ) -> list[tuple[dict, float]]:
         ql = q.lower()
-        rows = self.m.store.select(self.m.table, where=self._where(user_id))
+        rows = self._created_rows(user_id, created_from, created_before)
         scored: list[tuple[float, dict]] = []
         for r in rows:
             hay = (self.m.row_text(r) or "").lower()
@@ -580,23 +713,54 @@ def read_memory(
     size: int = 25,
     user: Optional[str] = None,
     q: Optional[str] = None,
+    created_from: Optional[float] = None,
+    created_before: Optional[float] = None,
 ) -> dict[str, Any]:
-    """One page of records for one memory, with optional search + user filter."""
+    """One page of records with optional search, user, and creation-time filters.
+
+    Creation bounds use ``[created_from, created_before)`` and apply to
+    :class:`StructuredMemory` adapters. Other memory backends do not have the
+    shared ``created_at`` contract and retain their normal behaviour.
+    """
     mem = agent.memories.get(name)
     if mem is None:
         raise KeyError(name)
 
     adapter = get_adapter(mem)
     page = max(1, int(page or 1))
-    size = max(1, min(100, int(size or 25)))
+    size = max(1, min(SEARCH_CAP, int(size or 25)))
     q = (q or "").strip()
     user = user or None
 
-    if q:
+    has_created_bounds = created_from is not None or created_before is not None
+    if q and has_created_bounds and isinstance(adapter, StructuredAdapter):
+        records, total = _safe(
+            adapter.search_created_between,
+            q,
+            page,
+            size,
+            user,
+            created_from,
+            created_before,
+            default=([], 0),
+        ) or ([], 0)
+        search = True
+    elif q:
         records, total = _safe(
             adapter.search, q, page, size, user, default=([], 0)
         ) or ([], 0)
         search = True
+    elif has_created_bounds and isinstance(adapter, StructuredAdapter):
+        records, total = _safe(
+            adapter.page_created_between,
+            page,
+            size,
+            user,
+            created_from,
+            created_before,
+            default=([], 0),
+        ) or ([], 0)
+        search = False
     else:
         records, total = _safe(
             adapter.page, page, size, user, default=([], 0)
@@ -639,6 +803,9 @@ def read_graph(
     include_co_occurrence: bool = False,
     full: bool = False,
     retrieve_k: int = 30,
+    precomputed_trace: Optional[dict[str, float]] = None,
+    precomputed_retrieved: Optional[set[str]] = None,
+    precomputed_breakdowns: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Return the activation-weighted knowledge-graph for the viz.
 
@@ -680,50 +847,92 @@ def read_graph(
         # leave a graph of isolated dots with no visible structure.
         include_co = True
 
-    # Compute activations (read-only).
-    if q and q.strip():
+    # Compute activations (read-only), unless the caller captured the exact
+    # trace during the context recall.  The latter is used by the live monitor
+    # so displaying a graph never performs a second retrieval.
+    trace = precomputed_trace
+    trace_is_precomputed = trace is not None
+    if trace is None and q and q.strip():
         trace = retriever.test_activation(q.strip(), user_id=user)
-    else:
+    elif trace is None:
         trace = retriever.test_activation("", user_id=user)
+    trace = {str(nid): float(score) for nid, score in trace.items()}
 
     if full:
         # Keep the whole graph (capped); the top-`retrieve_k` by activation are
         # flagged "retrieved" so the GUI can highlight them.
         ranked = sorted(trace.items(), key=lambda kv: kv[1], reverse=True)
         k = max(1, min(len(ranked), int(retrieve_k or 30)))
-        retrieved_ids = {nid for nid, _ in ranked[:k]}
+        retrieved_ids = set(precomputed_retrieved or {nid for nid, _ in ranked[:k]})
         keep_ids = [nid for nid in retriever.graph.nodes if nid in trace][:node_budget]
         keep_set = set(keep_ids)
     else:
         # Sort all nodes by activation desc; take the top slice as the seed set.
         ranked = sorted(trace.items(), key=lambda kv: kv[1], reverse=True)
-        seed_ids: list[str] = [nid for nid, _act in ranked[: max(1, node_budget // 3)]]
-        seed_set: set[str] = set(seed_ids)
-        # Grow a *connected* subgraph from the seeds: repeatedly add the
-        # neighbour (of anything already kept) that adds the most edges to the
-        # kept set, breaking ties by activation. This yields an edge-rich,
-        # connected viz rather than a bag of isolated high-activation nodes.
-        keep_ids = list(seed_ids)
-        keep_set = set(seed_set)
-        if hops_subgraph > 0:
-            def edge_yield(nid: str) -> int:
-                return sum(
-                    1 for _e, nb in retriever.graph.neighbors(nid) if nb.id in keep_set
-                )
+        preferred = [nid for nid in (precomputed_retrieved or ()) if nid in trace]
+        if trace_is_precomputed and preferred:
+            # A live snapshot must show every surfaced node and then only the
+            # strongest direct neighbourhood around those nodes.  The normal
+            # browser graph keeps its connected-growth behaviour below; this
+            # branch is deliberately deterministic and one-hop.
+            surfaced = sorted(set(preferred), key=lambda nid: (-trace.get(nid, 0.0), nid))
+            keep_ids = surfaced[:node_budget]
+            keep_set = set(keep_ids)
+            if hops_subgraph > 0 and len(keep_set) < node_budget:
+                candidates: dict[str, tuple[float, float]] = {}
+                for nid in surfaced:
+                    for edge, neighbour in retriever.graph.neighbors(nid):
+                        if neighbour.id in keep_set:
+                            continue
+                        edge_strength = abs(float(edge.weight or 0.0))
+                        prior = candidates.get(neighbour.id)
+                        value = (edge_strength, trace.get(neighbour.id, 0.0))
+                        if prior is None or value > prior:
+                            candidates[neighbour.id] = value
+                for nid, _rank in sorted(
+                    candidates.items(),
+                    key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]),
+                )[: max(0, node_budget - len(keep_set))]:
+                    keep_set.add(nid)
+                    keep_ids.append(nid)
+        else:
+            seed_ids = list(dict.fromkeys([
+                *preferred,
+                *[nid for nid, _act in ranked[: max(1, node_budget // 3)]],
+            ]))[:node_budget]
+            seed_set: set[str] = set(seed_ids)
+            # Grow a *connected* subgraph from the seeds: repeatedly add the
+            # neighbour (of anything already kept) that adds the most edges to
+            # the kept set, breaking ties by activation. This yields an edge-
+            # rich, connected viz rather than a bag of isolated high-activation
+            # nodes.
+            keep_ids = list(seed_ids)
+            keep_set = set(seed_set)
+            if hops_subgraph > 0:
+                def edge_yield(nid: str) -> int:
+                    return sum(
+                        1 for _e, nb in retriever.graph.neighbors(nid) if nb.id in keep_set
+                    )
 
-            while len(keep_set) < node_budget:
-                cand: dict[str, float] = {}
-                for nid in list(keep_set):
-                    for _edge, neighbour in retriever.graph.neighbors(nid):
-                        if neighbour.id not in keep_set:
-                            cand[neighbour.id] = trace.get(neighbour.id, 0.0)
-                if not cand:
-                    break
-                best_nid = max(cand, key=lambda nid: (edge_yield(nid), cand[nid]))
-                keep_set.add(best_nid)
-                keep_ids.append(best_nid)
+                while len(keep_set) < node_budget:
+                    cand: dict[str, float] = {}
+                    for nid in list(keep_set):
+                        for _edge, neighbour in retriever.graph.neighbors(nid):
+                            if neighbour.id not in keep_set:
+                                cand[neighbour.id] = trace.get(neighbour.id, 0.0)
+                    if not cand:
+                        break
+                    best_nid = max(cand, key=lambda nid: (edge_yield(nid), cand[nid]))
+                    keep_set.add(best_nid)
+                    keep_ids.append(best_nid)
         # In subgraph mode everything returned is "retrieved".
-        retrieved_ids = set(keep_ids)
+        retrieved_ids = set(precomputed_retrieved or keep_ids)
+        # A trace must always keep every node that was actually surfaced in
+        # the prompt.  Add them before the optional neighbourhood expansion.
+        for nid in (precomputed_retrieved or set()):
+            if nid in trace and nid not in keep_set:
+                keep_set.add(nid)
+                keep_ids.append(nid)
 
     # Activation normalization across the returned graph (not the whole graph)
     # so the GUI's radius/opacity math is robust to negative BLL.
@@ -763,7 +972,9 @@ def read_graph(
         # Per-factor decomposition of the activation score (stashed on the
         # node by KnowledgeGraphRetriever.test_activation). Lets the viz show
         # how much BLL / spreading / seed / emotion contributed.
-        comp = getattr(node, "score_breakdown", None)
+        comp = (precomputed_breakdowns or {}).get(node.id)
+        if comp is None:
+            comp = getattr(node, "score_breakdown", None)
         if isinstance(comp, dict) and comp:
             d["score_breakdown"] = dict(comp)
         nodes.append(d)
@@ -774,7 +985,20 @@ def read_graph(
         if e.src in keep_set and e.dst in keep_set
         and (include_co or e.kind != "co_occurrence")
     ]
-    edge_objs.sort(key=lambda e: float(e.weight or 0.0), reverse=True)
+    if trace_is_precomputed:
+        # Surface-to-surface links are the most useful visual explanation of a
+        # recalled context, followed by links from a surfaced node to its
+        # one-hop neighbourhood. Weight still breaks ties within each tier.
+        edge_objs.sort(
+            key=lambda e: (
+                2 if e.src in retrieved_ids and e.dst in retrieved_ids
+                else 1 if e.src in retrieved_ids or e.dst in retrieved_ids else 0,
+                abs(float(e.weight or 0.0)),
+            ),
+            reverse=True,
+        )
+    else:
+        edge_objs.sort(key=lambda e: float(e.weight or 0.0), reverse=True)
     edge_objs = edge_objs[:edge_budget]
     edges = [
         {"id": e.id, "kind": e.kind, "src": e.src, "dst": e.dst, "weight": float(e.weight)}
@@ -785,7 +1009,7 @@ def read_graph(
         "character": agent.character_name,
         "query": q or "",
         "user": user,
-        "mode": "full" if full else "subgraph",
+        "mode": "trace" if trace_is_precomputed else ("full" if full else "subgraph"),
         "self_node": self_node,
         "nodes": nodes,
         "edges": edges,

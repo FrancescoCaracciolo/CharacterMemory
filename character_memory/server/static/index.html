@@ -16,7 +16,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=clubhouse-2">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=clubhouse-8">
   <!-- The knowledge-graph view is a self-contained canvas force-renderer (no CDN). -->
 </head>
 <body>
@@ -29,6 +29,7 @@
       <nav class="tabbar" role="tablist" aria-label="View">
         <button id="tab-browse" class="tab active" role="tab" aria-selected="true"><span>01</span> Memory shelf</button>
         <button id="tab-configure" class="tab" role="tab" aria-selected="false"><span>02</span> Character studio</button>
+        <button id="tab-live" class="tab" role="tab" aria-selected="false"><span>03</span> Live recall</button>
       </nav>
       <div class="topbar-actions">
         <label class="char-picker">
@@ -169,6 +170,83 @@
         <div id="paginator" class="paginator"></div>
         <div id="status" class="status hidden"></div>
       </section>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- Live /context recall monitor.                                     -->
+    <!-- ================================================================ -->
+    <div id="live-pane" class="live-pane hidden">
+      <header class="live-head">
+        <div class="live-title-wrap">
+          <div class="live-eyebrow"><span id="live-status-dot" class="live-status-dot connecting"></span><span id="live-status">Connecting to /context…</span></div>
+          <h2>Live recall</h2>
+          <p>Watch the memories that shape each incoming request.</p>
+        </div>
+        <div class="live-head-actions">
+          <span id="live-follow-label" class="live-follow-label">Following latest</span>
+          <button id="live-follow" class="btn ghost" type="button">↟ Follow latest</button>
+          <button id="live-expand" class="btn ghost" type="button">Expand all</button>
+          <button id="live-collapse" class="btn ghost" type="button">Collapse all</button>
+        </div>
+      </header>
+      <div id="live-new" class="live-new hidden" role="status" aria-live="polite">
+        <button id="live-new-btn" type="button">New request received · show latest</button>
+      </div>
+      <div class="live-layout">
+        <aside class="live-timeline-panel">
+          <div class="live-panel-label"><span>Recent requests</span><span id="live-history-count">0 / 25</span></div>
+          <div id="live-timeline" class="live-timeline" aria-label="Recent context requests"></div>
+          <div id="live-timeline-empty" class="live-empty live-timeline-empty">
+            <span class="live-empty-mark">◌</span>
+            <span>Waiting for a <code>POST /context</code> request…</span>
+          </div>
+        </aside>
+        <main class="live-main" aria-live="polite">
+          <div id="live-request" class="live-request hidden"></div>
+          <div id="live-recalls" class="live-recalls"></div>
+          <div id="live-empty" class="live-empty hidden">
+            <span class="live-empty-mark">◌</span>
+            <strong>No context request yet</strong>
+            <span>Keep this tab open while your client chats with the character.</span>
+          </div>
+        </main>
+        <section class="live-graph-panel" aria-label="Knowledge graph activation">
+          <div class="live-graph-head">
+            <div>
+              <div class="live-panel-label">Activation field</div>
+              <div id="live-graph-meta" class="live-graph-meta">No graph in this request</div>
+            </div>
+            <select id="live-graph-user" class="user-filter hidden" title="Choose participant graph"></select>
+          </div>
+          <div id="live-graph-empty" class="live-empty">
+            <span class="live-empty-mark">◇</span>
+            <strong>Knowledge graph idle</strong>
+            <span>When graph memory is recalled, its activation cloud will appear here.</span>
+          </div>
+          <div id="live-graph-shell" class="live-graph-shell hidden">
+            <div class="live-graph-canvas-wrap">
+              <canvas id="live-cy" class="graph-cy" tabindex="0" aria-label="Knowledge graph activation for the selected context request"></canvas>
+              <div id="live-graph-overlay" class="graph-overlay"></div>
+              <div class="graph-nav live-graph-nav" role="group" aria-label="Live graph zoom controls">
+                <button id="live-zoom-in" class="graph-nav-btn" type="button" title="Zoom in" aria-label="Zoom in">＋</button>
+                <button id="live-zoom-out" class="graph-nav-btn" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+              </div>
+            </div>
+            <aside class="live-graph-side">
+              <div class="graph-side-head">Top activated</div>
+              <div id="live-graph-detail" class="graph-detail hidden"></div>
+              <ol id="live-graph-list" class="graph-list"></ol>
+            </aside>
+          </div>
+          <div class="graph-legend live-graph-legend">
+            <span><span class="dot dot-self"></span> self</span>
+            <span><span class="dot dot-person"></span> person</span>
+            <span><span class="dot dot-fact"></span> fact</span>
+            <span><span class="dot dot-episode"></span> episode</span>
+            <span><span class="dot dot-entity"></span> entity</span>
+          </div>
+        </section>
+      </div>
     </div>
 
     <!-- Schema-driven editor for structured memories and emotion state. -->
@@ -384,7 +462,7 @@
       </div>
     </div>
   </div>
-  <script src="/gui/static/app.js?v=clubhouse-2"></script>
+  <script src="/gui/static/app.js?v=clubhouse-8"></script>
   <script src="/gui/static/config.js?v=clubhouse-1"></script>
 </body>
 </html>

@@ -27,10 +27,13 @@ that step the next ``search_memory`` call would rank against the old text
 from __future__ import annotations
 
 import json
+import math
 import os
 import warnings
-from datetime import datetime
+from datetime import date as calendar_date
+from datetime import datetime, time, timedelta
 from typing import Any, Callable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
@@ -53,20 +56,6 @@ SERVER_NAME = "character-memory-mcp"
 SERVER_VERSION = "0.1.0"
 PROTOCOL_VERSION = "2024-11-05"  # MCP protocol version this server speaks.
 
-# Memories whose rows carry a ``created_at`` column — :func:`search_memory`
-# honours ``date_from`` / ``date_to`` for these and silently ignores the
-# filter for the others (character_info / dialogue_style / emotion), so the
-# caller never gets a confusing empty result just because the bound memory
-# didn't store timestamps.
-_DATE_AWARE_MEMORIES = {
-    "user_facts",
-    "user_directives",
-    "episodic",
-    "heartbeat",
-    "user_summary",
-}
-
-
 # --------------------------------------------------------------------------- #
 # Small utilities
 # --------------------------------------------------------------------------- #
@@ -82,6 +71,35 @@ def _parse_iso(ts: Optional[str]) -> Optional[float]:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError) as e:
         raise ValueError(f"Invalid ISO 8601 timestamp {ts!r}: {e}") from e
+
+
+def _calendar_day_bounds(
+    value: Any, timezone_name: Any = "UTC"
+) -> tuple[float, float, str, str]:
+    """Return the half-open epoch range for one calendar day.
+
+    ``timezone_name`` is an IANA zone so dates remain correct across daylight
+    saving transitions; the returned ISO strings make the interpreted range
+    explicit to MCP callers.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("date is required and must use YYYY-MM-DD format.")
+    try:
+        day = calendar_date.fromisoformat(value.strip())
+    except ValueError as e:
+        raise ValueError(f"Invalid calendar date {value!r}; expected YYYY-MM-DD.") from e
+
+    zone_name = str(timezone_name or "UTC").strip() or "UTC"
+    try:
+        zone = ZoneInfo(zone_name)
+    except ZoneInfoNotFoundError as e:
+        raise ValueError(
+            f"Unknown IANA timezone {zone_name!r}; use a name such as 'UTC' or 'Europe/Rome'."
+        ) from e
+
+    start = datetime.combine(day, time.min, tzinfo=zone)
+    end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=zone)
+    return start.timestamp(), end.timestamp(), start.isoformat(), end.isoformat()
 
 
 def _json_result(payload: Any) -> dict[str, Any]:
@@ -151,39 +169,6 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0, default: float = 0.5) ->
     except (TypeError, ValueError):
         return default
     return max(lo, min(hi, x))
-
-
-def _filter_records_by_date(
-    records: list[dict],
-    date_from: Optional[float],
-    date_to: Optional[float],
-) -> list[dict]:
-    """Drop records whose ``fields.created_at`` falls outside ``[date_from, date_to]``.
-
-    Records without a usable ``created_at`` are kept — that means
-    date-unaware memories (whose ``fields`` is metadata, not SQLite rows)
-    always pass through unchanged. This is the silent-ignore behaviour for
-    memories without timestamp support.
-    """
-    if date_from is None and date_to is None:
-        return records
-    out = []
-    for rec in records:
-        ts = (rec.get("fields") or {}).get("created_at")
-        if ts is None:
-            out.append(rec)
-            continue
-        try:
-            ts_f = float(ts)
-        except (TypeError, ValueError):
-            out.append(rec)
-            continue
-        if date_from is not None and ts_f < date_from:
-            continue
-        if date_to is not None and ts_f > date_to:
-            continue
-        out.append(rec)
-    return out
 
 
 def _persist_after_write(agent: CharacterAgent, mem: Any) -> None:
@@ -348,22 +333,61 @@ def _tool_search_memory(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     date_from = _parse_iso(_args(args, "date_from", None))
     date_to = _parse_iso(_args(args, "date_to", None))
     if date_from is not None and date_to is not None and date_from > date_to:
-        return _json_error("date_from must not be after date_to.")
+        raise ValueError("date_from must not be after date_to.")
+
+    # ``read_memory`` uses a half-open upper bound. Move an explicitly
+    # inclusive ``date_to`` to the next representable float so the public
+    # range semantics remain unchanged.
+    date_before = math.nextafter(date_to, math.inf) if date_to is not None else None
 
     page = read_memory(
-        agent, mem.name, page=page_in, size=size_in, user=user, q=q or None
+        agent,
+        mem.name,
+        page=page_in,
+        size=size_in,
+        user=user,
+        q=q or None,
+        created_from=date_from if isinstance(mem, StructuredMemory) else None,
+        created_before=date_before if isinstance(mem, StructuredMemory) else None,
     )
-
-    # Apply the date filter as a post-pass. ``read_memory`` already paginated
-    # the SQL; filtering in Python can shrink the page below ``size`` — the
-    # caller can re-page to fetch more.
-    if mem.name in _DATE_AWARE_MEMORIES and (date_from is not None or date_to is not None):
-        kept = _filter_records_by_date(page["records"], date_from, date_to)
-        page["records"] = kept
-        page["total"] = len(kept)
 
     page["date_from"] = _args(args, "date_from", None)
     page["date_to"] = _args(args, "date_to", None)
+    return page
+
+
+def _tool_search_memory_by_date(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    """Search rows created on one calendar date in an IANA timezone."""
+    if (
+        not isinstance(mem, StructuredMemory)
+        or "created_at" not in mem.store.columns(mem.table)
+    ):
+        raise ValueError(
+            f"Memory {mem.name!r} does not store creation dates; choose a structured memory."
+        )
+
+    timezone_name = str(_args(args, "timezone", "UTC") or "UTC").strip() or "UTC"
+    created_from, created_before, from_iso, before_iso = _calendar_day_bounds(
+        _args(args, "date", None), timezone_name
+    )
+    page_in = max(1, int(_args(args, "page", 1) or 1))
+    size_in = max(1, min(200, int(_args(args, "limit", 25) or 25)))
+    q = str(_args(args, "query", "") or "").strip()
+    user = _args(args, "user_id", None)
+
+    page = read_memory(
+        agent,
+        mem.name,
+        page=page_in,
+        size=size_in,
+        user=user,
+        q=q or None,
+        created_from=created_from,
+        created_before=created_before,
+    )
+    page["date"] = str(_args(args, "date", ""))
+    page["timezone"] = timezone_name
+    page["date_range"] = {"from": from_iso, "before": before_iso}
     return page
 
 
@@ -838,6 +862,37 @@ _register(
         "required": ["memory"],
     },
     _tool_search_memory,
+)
+
+_register(
+    "search_memory_by_date",
+    "Search one structured memory for records created on a specific calendar "
+    "date. `date` uses YYYY-MM-DD. `timezone` is an IANA timezone (default "
+    "UTC), so the day boundary remains correct across daylight-saving changes. "
+    "Optional `query` and `user_id` narrow the results; `limit` caps the page "
+    "size (1..200, default 25).",
+    {
+        "type": "object",
+        "properties": {
+            "memory": {"type": "string"},
+            "date": {
+                "type": "string",
+                "format": "date",
+                "description": "Calendar date in YYYY-MM-DD format.",
+            },
+            "timezone": {
+                "type": "string",
+                "default": "UTC",
+                "description": "IANA timezone, e.g. UTC or Europe/Rome.",
+            },
+            "query": {"type": "string"},
+            "user_id": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 25},
+            "page": {"type": "integer", "minimum": 1, "default": 1},
+        },
+        "required": ["memory", "date"],
+    },
+    _tool_search_memory_by_date,
 )
 
 # user_facts ---- ---------------------------------------------------------- #

@@ -37,10 +37,11 @@ character keyed by its folder name. Override the assets root with the
 from __future__ import annotations
 
 import os
+import queue
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -70,6 +71,11 @@ from .admin import build_jobs_router as build_jobs_router_impl
 # when another process (the Discord bot, the CLI, a second worker) writes to
 # the shared per-character save_directory.
 from .sync import MemorySync
+from .context_events import (
+    ContextEventBroker,
+    build_context_event,
+    sse_event,
+)
 
 # Default to the current working directory: once installed the package has no
 # notion of a "repo root", so the server operates relative to the cwd it is
@@ -167,6 +173,10 @@ def _discover_characters(assets_dir: str) -> dict[str, CharacterAgent]:
 
 
 AGENTS: dict[str, CharacterAgent] = _discover_characters(ASSETS_DIR)
+
+# `/context` observability is intentionally process-local and bounded.  It is
+# a live UI aid, not a second persistence layer for chat or memory data.
+CONTEXT_EVENTS = ContextEventBroker(max_events=25)
 
 
 # One cache synchronizer per character. The poller reloads in-RAM hybrid
@@ -298,8 +308,61 @@ def context(req: ContextRequest) -> ContextResponse:
     # chat this is what makes each participant's messages attributable.
     chat.add_message("user", req.message, user_id=req.user)
 
-    sections = agent.build_context(chat)
-    return ContextResponse(chat_id=chat.id, context=sections)
+    snapshot = agent.build_context_snapshot(chat)
+    try:
+        event = build_context_event(
+            agent,
+            snapshot=snapshot,
+            character=req.character,
+            user=req.user,
+            message=req.message,
+            chat_id=chat.id,
+        )
+        CONTEXT_EVENTS.publish(req.character, event)
+    except Exception:
+        # Monitoring must never change the thin-client contract or turn a
+        # successful recall into a failed request.
+        pass
+    return ContextResponse(chat_id=chat.id, context=snapshot.sections)
+
+
+@app.get("/api/context-events/{character}")
+def context_events(
+    character: str,
+    last_event_id: Optional[str] = Header(None, alias="Last-Event-ID"),
+) -> StreamingResponse:
+    """Stream recent and future `/context` recall snapshots for the GUI."""
+    _get_agent(character)
+    replay, subscriber, unsubscribe = CONTEXT_EVENTS.subscribe(
+        character, last_event_id=last_event_id
+    )
+
+    def stream():
+        try:
+            # Flush headers through buffering proxies immediately so the
+            # browser enters its listening state before the first request.
+            yield ": connected\n\n"
+            for event in replay:
+                yield sse_event(event)
+            while True:
+                try:
+                    event = subscriber.get(timeout=15.0)
+                except queue.Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+                yield sse_event(event)
+        finally:
+            unsubscribe()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/save", response_model=SaveResponse)

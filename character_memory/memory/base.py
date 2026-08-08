@@ -50,6 +50,20 @@ class MemoryItem:
 
 
 @dataclass
+class RecallResult:
+    """The result of one memory recall and its prompt rendering.
+
+    ``diagnostics`` is intentionally backend-defined.  It lets observability
+    clients inspect a retrieval without asking the memory to recall a second
+    time; normal callers can ignore it.
+    """
+
+    items: list[MemoryItem] = field(default_factory=list)
+    body: Optional[str] = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ExtractionSpec:
     """How a memory is populated by LLM extraction.
 
@@ -145,14 +159,20 @@ class Memory(ABC):
 
         `state_changing` is forwarded to :meth:`recall`.
         """
+        return self.build_section_result(
+            query, user_id, limit, state_changing=state_changing
+        ).body
+
+    def build_section_result(
+        self, query: Query, user_id: str, limit: int, state_changing: bool = True
+    ) -> RecallResult:
+        """Recall and render once, retaining the actual items for inspection."""
         items = (
             self.recall(query, user_id, limit, state_changing=state_changing)
             if self.enabled
             else []
         )
-        if not items:
-            return None
-        return self.format(items)
+        return RecallResult(items=items, body=self.format(items) if items else None)
 
     # Multi-participant (group chat) handling --------------------------------
     # These are orchestration conveniences layered on top of the single-user
@@ -242,22 +262,33 @@ class Memory(ABC):
         not per-user); PER_USER memories are formatted with
         :meth:`format_grouped`.
         """
+        return self.build_section_participants_result(
+            query, participants, limit, state_changing=state_changing
+        ).body
+
+    def build_section_participants_result(
+        self,
+        query: Query,
+        participants: list[str],
+        limit: int,
+        state_changing: bool = True,
+    ) -> RecallResult:
+        """Group-aware equivalent of :meth:`build_section_result`."""
         if not participants:
-            return None
+            return RecallResult()
         if len(participants) == 1:
-            return self.build_section(
+            return self.build_section_result(
                 query, participants[0], limit, state_changing=state_changing
             )
         if not self.enabled:
-            return None
+            return RecallResult()
         items = self.recall_participants(
             query, participants, limit, state_changing=state_changing
         )
         if not items:
-            return None
-        if self.scope is MemoryScope.CHARACTER:
-            return self.format(items)
-        return self.format_grouped(items, participants)
+            return RecallResult(items=[])
+        body = self.format(items) if self.scope is MemoryScope.CHARACTER else self.format_grouped(items, participants)
+        return RecallResult(items=items, body=body)
 
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
         """Return every memory stored in this memory's backend.

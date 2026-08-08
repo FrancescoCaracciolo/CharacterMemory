@@ -1,12 +1,37 @@
 """A character bundles an identity with the memory systems it can recall from and write to."""
 
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 from character_memory.llm.base import LLMClient
 from character_memory.prompts import PromptConfig
 from .memory.extract import Extractor, ExtractionContext, build_extraction
-from .memory.base import Memory, MemoryItem
+from .memory.base import Memory, MemoryItem, RecallResult
 from .memory.structured import StructuredMemory
 from .rag.base import Query
+
+
+@dataclass
+class MemoryRecallSnapshot:
+    """One memory's exact contribution to a built context."""
+
+    name: str
+    title: str
+    scope: str
+    body: str
+    section: str
+    items: list[MemoryItem] = field(default_factory=list)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ContextSnapshot:
+    """A context plus the recall details used to assemble it."""
+
+    sections: dict[str, str]
+    recalls: dict[str, MemoryRecallSnapshot]
+    query: Query
+    user_id: str
+    participants: list[str]
 
 
 class Character:
@@ -123,14 +148,14 @@ class Character:
         extracted["__added__"] = added
         return extracted
 
-    def build_context(
+    def build_context_snapshot(
         self,
         query: Query,
         user_id: str = "default",
         limits: dict[str, int] = {},
         participants: Optional[list[str]] = None,
-    ) -> dict[str, str]:
-        """Return `{memory_name: rendered_section}` for enabled, non-empty memories.
+    ) -> ContextSnapshot:
+        """Build the context and retain the exact items recalled by each memory.
 
         ``query`` may be a plain string or a list of ``(text, weight)`` pairs
         (one per recent chat message, with older ones weighted less); it is
@@ -146,19 +171,50 @@ class Character:
         template = self.prompts.section_template if self.prompts is not None else "## {title}\n{body}"
         multi = bool(participants and len(participants) > 1)
         sections: dict[str, str] = {}
+        recalls: dict[str, MemoryRecallSnapshot] = {}
         for name in order:
             mem = self._by_name.get(name)
             if mem is None or not mem.enabled:
                 continue
             if multi:
-                body = mem.build_section_participants(query, participants, limits.get(name, 0))
+                result: RecallResult = mem.build_section_participants_result(
+                    query, participants, limits.get(name, 0)
+                )
             else:
-                body = mem.build_section(query, user_id, limits.get(name, 0))
-            if not body:
+                result = mem.build_section_result(query, user_id, limits.get(name, 0))
+            if not result.body:
                 continue
             title = self._header_for_multi(name) if multi else self._header_for(name)
-            sections[name] = template.format(title=title, body=body)
-        return sections
+            section = template.format(title=title, body=result.body)
+            sections[name] = section
+            recalls[name] = MemoryRecallSnapshot(
+                name=name,
+                title=title,
+                scope=getattr(mem.scope, "value", str(mem.scope)),
+                body=result.body,
+                section=section,
+                items=list(result.items),
+                diagnostics=dict(result.diagnostics or {}),
+            )
+        return ContextSnapshot(
+            sections=sections,
+            recalls=recalls,
+            query=query,
+            user_id=user_id,
+            participants=list(participants or [user_id]),
+        )
+
+    def build_context(
+        self,
+        query: Query,
+        user_id: str = "default",
+        limits: dict[str, int] = {},
+        participants: Optional[list[str]] = None,
+    ) -> dict[str, str]:
+        """Return `{memory_name: rendered_section}` for enabled, non-empty memories."""
+        return self.build_context_snapshot(
+            query, user_id, limits=limits, participants=participants
+        ).sections
 
     def _header_for_multi(self, name: str) -> str:
         """Section header for the multi-participant rendering (pluralised)."""

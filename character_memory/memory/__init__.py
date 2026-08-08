@@ -1,4 +1,4 @@
-from .base import Memory, MemoryItem, MemoryScope, ExtractionSpec
+from .base import Memory, MemoryItem, MemoryScope, ExtractionSpec, RecallResult
 from .character_base import CharacterInfoMemory, DialogueStyleMemory, RAGMemory
 from .dedup import DedupReport, Deduplicator
 from .emotion import EmotionStatus
@@ -15,6 +15,7 @@ from .user_summary import UserSummaryMemory
 __all__ = [
     "Memory",
     "MemoryItem",
+    "RecallResult",
     "MemoryScope",
     "ExtractionSpec",
     "RAGMemory",

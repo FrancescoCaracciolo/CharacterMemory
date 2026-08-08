@@ -9,7 +9,7 @@ Public surface:
 """
 
 from .agent import CharacterAgent
-from .character import Character
+from .character import Character, ContextSnapshot, MemoryRecallSnapshot
 from .chat import Chat
 from .chunking import (
     Chunk,
@@ -49,6 +49,7 @@ from .memory import (
     KnowledgeGraphMemory,
     Memory,
     MemoryItem,
+    RecallResult,
     MemoryScope,
     SQLiteStore,
     StructuredMemory,
@@ -82,6 +83,8 @@ __version__ = "0.1.0"
 __all__ = [
     "CharacterAgent",
     "Character",
+    "ContextSnapshot",
+    "MemoryRecallSnapshot",
     "Chat",
     "CharacterMemoryConfig",
     "LLMConfig",
@@ -124,6 +127,7 @@ __all__ = [
     "register_chunker",
     "Memory",
     "MemoryItem",
+    "RecallResult",
     "MemoryScope",
     "ExtractionSpec",
     "StructuredMemory",

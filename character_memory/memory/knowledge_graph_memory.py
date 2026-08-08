@@ -22,7 +22,7 @@ from ..knowledge_graph import (
 )
 from ..memory.store import SQLiteStore
 from ..rag.hybrid import HybridSearch
-from .base import Memory, MemoryItem, MemoryScope
+from .base import Memory, MemoryItem, MemoryScope, RecallResult
 
 if TYPE_CHECKING:  # avoid a circular import at runtime
     from ..memory.dedup import DedupReport
@@ -98,6 +98,81 @@ class KnowledgeGraphMemory(Memory):
             user_id=user_id,
             token_budget=limit,
             state_changing=state_changing,
+        )
+
+    def _activation_snapshot(self, items: list[MemoryItem]) -> dict[str, Any]:
+        """Copy the activation state produced by the just-finished recall.
+
+        The copy is request-local: the graph's transient node fields may be
+        overwritten by a later group participant or request, so the live
+        monitor must never read them after the context call returns.
+        """
+        activation = {
+            str(nid): float(getattr(node, "activation", 0.0))
+            for nid, node in self.retriever.graph.nodes.items()
+        }
+        breakdowns = {}
+        for nid, node in self.retriever.graph.nodes.items():
+            comp = getattr(node, "score_breakdown", None)
+            if isinstance(comp, dict) and comp:
+                breakdowns[str(nid)] = dict(comp)
+        surfaced = [
+            str(item.metadata.get("node_id"))
+            for item in items
+            if item.metadata.get("node_id") is not None
+        ]
+        return {
+            "activation": activation,
+            "breakdowns": breakdowns,
+            "retrieved_ids": list(dict.fromkeys(surfaced)),
+        }
+
+    def build_section_result(
+        self,
+        query: str,
+        user_id: str,
+        limit: int,
+        state_changing: bool = True,
+    ) -> RecallResult:
+        result = super().build_section_result(
+            query, user_id, limit, state_changing=state_changing
+        )
+        if result.items:
+            result.diagnostics = self._activation_snapshot(result.items)
+        return result
+
+    def build_section_participants_result(
+        self,
+        query: str,
+        participants: list[str],
+        limit: int,
+        state_changing: bool = True,
+    ) -> RecallResult:
+        if not participants:
+            return RecallResult()
+        if len(participants) == 1:
+            return self.build_section_result(
+                query, participants[0], limit, state_changing=state_changing
+            )
+        if not self.enabled:
+            return RecallResult()
+
+        items: list[MemoryItem] = []
+        by_participant: dict[str, dict[str, Any]] = {}
+        for uid in participants:
+            result = self.build_section_result(
+                query, uid, limit, state_changing=state_changing
+            )
+            items.extend(result.items)
+            if result.items:
+                by_participant[uid] = result.diagnostics
+        if not items:
+            return RecallResult()
+        body = self.format_grouped(items, participants)
+        return RecallResult(
+            items=items,
+            body=body,
+            diagnostics={"participants": by_participant},
         )
 
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
