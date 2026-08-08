@@ -16,7 +16,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=clubhouse-1">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=clubhouse-2">
   <!-- The knowledge-graph view is a self-contained canvas force-renderer (no CDN). -->
 </head>
 <body>
@@ -96,8 +96,12 @@
           </div>
           <div class="graph-split">
             <div class="graph-canvas-wrap">
-              <canvas id="cy" class="graph-cy"></canvas>
+              <canvas id="cy" class="graph-cy" tabindex="0" aria-label="Interactive knowledge graph. Drag to pan, pinch or use the zoom buttons to zoom, and tap a node for details."></canvas>
               <div id="graph-overlay" class="graph-overlay"></div>
+              <div class="graph-nav" role="group" aria-label="Graph zoom controls">
+                <button id="graph-zoom-in" class="graph-nav-btn" type="button" title="Zoom in" aria-label="Zoom in">＋</button>
+                <button id="graph-zoom-out" class="graph-nav-btn" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+              </div>
               <div id="graph-settings" class="graph-settings hidden" role="region" aria-label="Graph settings" aria-hidden="true">
                 <div class="gs-title">Graph settings <button id="gs-close" class="gs-close" type="button" title="Hide panel" aria-label="Close graph settings">×</button></div>
                 <label class="gs-row">
@@ -158,7 +162,7 @@
             <span><span class="dot dot-fact"></span> fact</span>
             <span><span class="dot dot-episode"></span> episode</span>
             <span><span class="dot dot-entity"></span> entity</span>
-            <span class="graph-tip">node size &amp; opacity ∝ activation</span>
+            <span class="graph-tip">drag to pan · pinch/scroll to zoom · tap a node</span>
           </div>
         </div>
         <div id="records" class="records"></div>
@@ -376,7 +380,7 @@
       </div>
     </div>
   </div>
-  <script src="/gui/static/app.js?v=clubhouse-1"></script>
+  <script src="/gui/static/app.js?v=clubhouse-2"></script>
   <script src="/gui/static/config.js?v=clubhouse-1"></script>
 </body>
 </html>

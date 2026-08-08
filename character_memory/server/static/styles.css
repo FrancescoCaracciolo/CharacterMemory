@@ -264,6 +264,18 @@ select option { background: var(--bg-2); }
 .graph-cy.grabbing { cursor: grabbing; }
 .graph-cy.node-hover { cursor: pointer; }
 .graph-overlay { position: absolute; inset: 0; pointer-events: none; }
+.graph-nav {
+  position: absolute; left: 10px; bottom: 10px; z-index: 15;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.graph-nav-btn {
+  width: 38px; height: 38px; padding: 0;
+  color: var(--text); background: color-mix(in srgb, var(--surface) 94%, transparent);
+  border: 2px solid var(--outline); border-radius: 11px; box-shadow: var(--shadow-sm);
+  font: 800 20px/1 var(--sans); cursor: pointer; touch-action: manipulation;
+}
+.graph-nav-btn:hover { color: var(--accent); transform: translateY(-1px); }
+.graph-nav-btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .graph-settings {
   position: absolute; top: 10px; right: 10px; z-index: 20; width: 212px;
   padding: 10px 12px; display: flex; flex-direction: column; gap: 9px;
@@ -1458,15 +1470,24 @@ select option { background: var(--input); color: var(--text); }
   /* The page shell stays fixed; the content pane is the deliberate mobile
      scroller so a graph below the compact header is still reachable. */
   .content { overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
-  .graph-view { flex: 0 0 390px; height: 390px; min-height: 390px; max-height: 390px; }
-  .graph-view { padding: 10px 12px 8px; gap: 7px; }
+  .graph-view { flex: 0 0 auto; height: auto; min-height: 0; max-height: none; overflow: visible; }
+  .graph-view { padding: 10px 12px 12px; gap: 7px; }
   .graph-controls { gap: 6px; }
-  .graph-controls .search { flex: 1 1 180px; }
+  .graph-controls .search { flex: 1 1 100%; }
   .graph-controls .search input { width: 100%; min-width: 0; }
+  .graph-controls .user-filter { flex: 1 1 150px; min-height: 40px; }
+  .graph-controls .btn { min-height: 40px; }
+  .graph-meta { flex: 1 1 100%; order: 5; }
   .graph-ctl-spacer { display: none; }
-  .graph-split { flex: 1 1 0; grid-template-columns: 1fr; grid-template-rows: minmax(150px, 1fr) minmax(0, 30%); }
-  .graph-canvas-wrap { min-height: 150px; }
-  .graph-side { min-height: 92px; border-left: 0; border-top: 2px solid var(--outline); }
+  .graph-split {
+    flex: 0 0 auto; height: max(540px, 76dvh); overflow: hidden;
+    grid-template-columns: 1fr; grid-template-rows: minmax(300px, 3fr) minmax(200px, 2fr);
+  }
+  .graph-canvas-wrap { min-height: 300px; }
+  .graph-side { min-height: 200px; border-left: 0; border-top: 2px solid var(--outline); }
   .graph-detail { max-height: 44%; }
+  .graph-list li { min-height: 44px; padding-top: 8px; padding-bottom: 8px; }
   .graph-tip { margin-left: 0; }
+  .graph-nav { left: 12px; bottom: 12px; gap: 8px; }
+  .graph-nav-btn { width: 44px; height: 44px; font-size: 23px; }
 }

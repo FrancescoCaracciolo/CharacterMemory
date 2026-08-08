@@ -965,6 +965,8 @@ function createGraphViz(canvas, opts) {
   let draggingId = null;
   let panning = false;
   let down = null;                      // pointer-down bookkeeping
+  const pointers = new Map();           // active pointer id -> canvas coordinates
+  let pinch = null;                     // two-finger camera gesture state
   const mouse = { x: 0, y: 0, inside: false };
   let lastT = performance.now();
   let raf = 0;
@@ -1116,6 +1118,19 @@ function createGraphViz(canvas, opts) {
     const s = Math.max(view.scale, 1.1);
     const t = { scale: s, panX: w / 2 - n.x * s, panY: h / 2 - n.y * s };
     Object.assign(target, t);
+  }
+
+  function zoomBy(factor, sx = view.w / 2, sy = view.h / 2) {
+    fitWhenSettled = false;
+    // Use the target camera so repeated button presses compose even while the
+    // previous animated zoom is still settling.
+    const baseScale = target.scale || view.scale;
+    const worldX = (sx - target.panX) / baseScale;
+    const worldY = (sy - target.panY) / baseScale;
+    const ns = clamp(baseScale * factor, MIN_SCALE, 4);
+    target.scale = ns;
+    target.panX = sx - worldX * ns;
+    target.panY = sy - worldY * ns;
   }
 
   function relayout() {
@@ -1341,45 +1356,71 @@ function createGraphViz(canvas, opts) {
   }
 
   // -------------------------------------------------------------- picking
-  function pick(mx, my) {
+  function pick(mx, my, padding = 6) {
     let best = null, bestD = Infinity;
     for (const a of nodes) {
       const s = toScreen(a.x, a.y);
       const d = Math.hypot(s.x - mx, s.y - my);
-      const hit = a.r * view.scale + 6;
+      const hit = a.r * view.scale + padding;
       if (d <= hit && d < bestD) { bestD = d; best = a; }
     }
     return best;
   }
 
   // -------------------------------------------------------------- pointers
-  function onDown(e) {
+  function pointerPosition(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  function startPinch() {
+    const entries = Array.from(pointers.entries()).slice(0, 2);
+    if (entries.length < 2) { pinch = null; return; }
+    const [a, b] = entries.map(([, point]) => point);
+    const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+    // Stop any camera easing first so the point between both fingers remains
+    // anchored throughout the gesture.
+    Object.assign(target, view);
+    pinch = {
+      ids: entries.map(([id]) => id),
+      distance: Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)),
+      scale: view.scale,
+      world: toWorld(cx, cy),
+    };
+    draggingId = null;
+    panning = false;
+    down = null;
+    tip.classList.remove("show");
+    canvas.classList.add("grabbing");
+  }
+
+  function onPointerDown(e) {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault();
     fitWhenSettled = false;
-    const n = pick(e.offsetX, e.offsetY);
+    const point = pointerPosition(e);
+    pointers.set(e.pointerId, point);
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* unsupported capture */ }
+    if (pointers.size >= 2) { startPinch(); return; }
+
+    // Graph dots can be visually tiny after fitting a large graph. Give
+    // coarse pointers a forgiving invisible hit area without changing the
+    // tighter mouse-hover behaviour.
+    const n = pick(point.x, point.y, e.pointerType === "mouse" ? 6 : 16);
     if (n) {
-      draggingId = n.id; down = { mode: "node" }; reheat(0.5);
+      draggingId = n.id;
+      down = { pointerId: e.pointerId, mode: "node", nodeId: n.id, sx: point.x, sy: point.y, moved: false };
+      reheat(0.5);
       canvas.classList.add("grabbing");
     } else {
-      panning = true; down = { mode: "pan", sx: e.offsetX, sy: e.offsetY, panX: view.panX, panY: view.panY };
+      panning = true;
+      down = { pointerId: e.pointerId, mode: "pan", sx: point.x, sy: point.y,
+               panX: view.panX, panY: view.panY, moved: false };
       canvas.classList.add("grabbing");
     }
   }
-  function onMove(e) {
-    if (draggingId || panning) {
-      const r = canvas.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      if (draggingId) {
-        const n = byId.get(draggingId); const w = toWorld(mx, my);
-        if (n) { n.x = w.x; n.y = w.y; n.vx = 0; n.vy = 0; prevPos.set(n.id, { x: n.x, y: n.y }); }
-        reheat(0.4);
-      } else if (panning) {
-        view.panX = target.panX = down.panX + (mx - down.sx);
-        view.panY = target.panY = down.panY + (my - down.sy);
-      }
-      return;
-    }
-    const r = canvas.getBoundingClientRect();
-    const mx = e.clientX - r.left, my = e.clientY - r.top;
+
+  function updateHover(mx, my) {
     mouse.x = mx; mouse.y = my; mouse.inside = true;
     const n = pick(mx, my);
     hoveredId = n ? n.id : null;
@@ -1396,11 +1437,84 @@ function createGraphViz(canvas, opts) {
       tip.classList.remove("show");
     }
   }
-  function onUp() {
-    if (draggingId) reheat(0.3);
-    draggingId = null; panning = false; down = null;
-    canvas.classList.remove("grabbing");
+
+  function onPointerMove(e) {
+    const point = pointerPosition(e);
+    if (pointers.has(e.pointerId)) pointers.set(e.pointerId, point);
+
+    if (pointers.size >= 2) {
+      e.preventDefault();
+      if (!pinch || pinch.ids.some(id => !pointers.has(id))) startPinch();
+      if (!pinch) return;
+      const a = pointers.get(pinch.ids[0]), b = pointers.get(pinch.ids[1]);
+      const distance = Math.max(1, Math.hypot(b.x - a.x, b.y - a.y));
+      const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+      const ns = clamp(pinch.scale * distance / pinch.distance, MIN_SCALE, 4);
+      view.scale = target.scale = ns;
+      view.panX = target.panX = cx - pinch.world.x * ns;
+      view.panY = target.panY = cy - pinch.world.y * ns;
+      return;
+    }
+
+    if (draggingId || panning) {
+      if (!down || down.pointerId !== e.pointerId) return;
+      const mx = point.x, my = point.y;
+      if (!down.moved && Math.hypot(mx - down.sx, my - down.sy) >= 6) down.moved = true;
+      if (draggingId) {
+        if (!down.moved) return;
+        const n = byId.get(draggingId); const w = toWorld(mx, my);
+        if (n) { n.x = w.x; n.y = w.y; n.vx = 0; n.vy = 0; prevPos.set(n.id, { x: n.x, y: n.y }); }
+        reheat(0.4);
+      } else if (panning) {
+        if (!down.moved) return;
+        view.panX = target.panX = down.panX + (mx - down.sx);
+        view.panY = target.panY = down.panY + (my - down.sy);
+      }
+      return;
+    }
+    if (e.pointerType === "mouse") updateHover(point.x, point.y);
   }
+
+  function finishPointer(e, cancelled = false) {
+    const point = pointers.get(e.pointerId) || pointerPosition(e);
+    const tapped = !cancelled && pointers.size === 1 && !pinch && down &&
+      down.pointerId === e.pointerId && !down.moved;
+    const tappedNodeId = tapped && down.mode === "node" ? down.nodeId : null;
+    const tappedEmpty = tapped && down.mode === "pan";
+    if (draggingId) reheat(0.3);
+    pointers.delete(e.pointerId);
+    try { canvas.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+
+    if (pointers.size >= 2) {
+      startPinch();
+      return;
+    }
+    if (pointers.size === 1) {
+      // Continue naturally as a one-finger pan after ending a pinch, without a
+      // jump and without treating the eventual release as a tap.
+      const [pointerId, remaining] = pointers.entries().next().value;
+      pinch = null;
+      draggingId = null;
+      panning = true;
+      down = { pointerId, mode: "pan", sx: remaining.x, sy: remaining.y,
+               panX: view.panX, panY: view.panY, moved: true };
+      return;
+    }
+
+    pinch = null;
+    draggingId = null;
+    panning = false;
+    down = null;
+    canvas.classList.remove("grabbing");
+    if (tappedNodeId) focusNode(tappedNodeId);
+    else if (tappedEmpty) {
+      selectedId = null;
+      if (onSelect) onSelect(null);
+    }
+    if (e.pointerType === "mouse") updateHover(point.x, point.y);
+  }
+  function onPointerCancel(e) { finishPointer(e, true); }
+
   function onLeave() {
     hoveredId = null; mouse.inside = false; tip.classList.remove("show");
     if (!panning && !draggingId) canvas.classList.remove("node-hover");
@@ -1415,24 +1529,14 @@ function createGraphViz(canvas, opts) {
     view.panX = target.panX = e.offsetX - w.x * ns;
     view.panY = target.panY = e.offsetY - w.y * ns;
   }
-  function onClick(e) {
-    const r = canvas.getBoundingClientRect();
-    const n = pick(e.clientX - r.left, e.clientY - r.top);
-    if (n) {
-      focusNode(n.id);                       // select + centre + show detail
-    } else {
-      selectedId = null;                     // click empty space clears selection
-      if (onSelect) onSelect(null);
-    }
-  }
   function onResize() { if (!document.getElementById("graph-view").classList.contains("hidden")) resize(); }
 
-  canvas.addEventListener("mousedown", onDown);
-  window.addEventListener("mousemove", onMove);
-  window.addEventListener("mouseup", onUp);
-  canvas.addEventListener("mouseleave", onLeave);
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerup", finishPointer);
+  canvas.addEventListener("pointercancel", onPointerCancel);
+  canvas.addEventListener("pointerleave", onLeave);
   canvas.addEventListener("wheel", onWheel, { passive: false });
-  canvas.addEventListener("click", onClick);
   window.addEventListener("resize", onResize);
   let ro = null;
   if (typeof ResizeObserver !== "undefined") {
@@ -1445,6 +1549,7 @@ function createGraphViz(canvas, opts) {
 
   return {
     setData, resize, fit: () => { fitWhenSettled = false; resize(); fitView(false); }, focus: focusNode, relayout,
+    zoomIn: () => zoomBy(1.35), zoomOut: () => zoomBy(1 / 1.35),
     reheat, freeze: () => { frozen = !frozen; return frozen; },
     isFrozen: () => frozen,
     debugView: () => {
@@ -1459,12 +1564,12 @@ function createGraphViz(canvas, opts) {
     },
     destroy() {
       cancelAnimationFrame(raf);
-      canvas.removeEventListener("mousedown", onDown);
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      canvas.removeEventListener("mouseleave", onLeave);
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup", finishPointer);
+      canvas.removeEventListener("pointercancel", onPointerCancel);
+      canvas.removeEventListener("pointerleave", onLeave);
       canvas.removeEventListener("wheel", onWheel);
-      canvas.removeEventListener("click", onClick);
       window.removeEventListener("resize", onResize);
       if (ro) ro.disconnect();
       tip.remove();
@@ -1667,6 +1772,12 @@ function wireGraphControls() {
   wireCheckbox("gs-hide-epfact", "hideEpFact");
   $("graph-fit").addEventListener("click", () => {
     if (state.graph._gv) state.graph._gv.fit();
+  });
+  $("graph-zoom-in").addEventListener("click", () => {
+    if (state.graph._gv) state.graph._gv.zoomIn();
+  });
+  $("graph-zoom-out").addEventListener("click", () => {
+    if (state.graph._gv) state.graph._gv.zoomOut();
   });
   $("graph-freeze").addEventListener("click", () => {
     if (!state.graph._gv) return;
