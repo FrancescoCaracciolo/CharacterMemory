@@ -8,7 +8,7 @@ This is the class the example API in the design doc drives::
     kg.update(extracted_items)
     kg.apply_deduplication(dedup_report)
     trace = kg.test_activation("message")
-    items = kg.retrieve("message", user_id="...", limit=6)
+    items = kg.retrieve("message", user_id="...", token_budget=1000)
     kg.save(save_dir)
 
 It owns a :class:`KnowledgeGraph`, a node-text :class:`HybridSearch`, and an
@@ -48,6 +48,7 @@ from .ingest import (
     _EPISODE_BATCH_SIZE,
     _WIKI_BATCH_SIZE,
     _batch_by_limits,
+    _count_tokens,
     ingest_emotion,
     ingest_episodes,
     ingest_facts,
@@ -624,10 +625,16 @@ class KnowledgeGraphRetriever:
         query: str,
         *,
         user_id: Optional[str] = None,
-        limit: int = 6,
+        token_budget: int = 1_000,
         state_changing: bool = True,
     ) -> list[MemoryItem]:
-        """Return the top-`limit` nodes by activation as MemoryItems.
+        """Return activation-ranked nodes that fit within ``token_budget``.
+
+        The budget covers the exact bullet-list body injected into the prompt
+        (``- node text`` lines), not an arbitrary number of nodes. Nodes are
+        considered in activation order and retrieval stops before the first
+        node that would make the rendered body exceed the budget. A
+        non-positive budget returns no items.
 
         When `state_changing` is True (the default) the surfaced nodes get a
         practice event appended and the Hebbian step strengthens the
@@ -636,22 +643,27 @@ class KnowledgeGraphRetriever:
         """
         if not self.graph.nodes:
             return []
+        budget = max(0, int(token_budget))
+        if budget == 0:
+            return []
         act = self.test_activation(query, user_id=user_id)
         ranked = sorted(
             ((a, nid) for nid, a in act.items() if a >= self.config.min_activation),
             reverse=True,
         )
-        top = [(a, nid) for a, nid in ranked[: max(0, limit)]]
-        if not top:
-            return []
         items: list[MemoryItem] = []
         surfaced_ids: list[str] = []
-        for a, nid in top:
+        for a, nid in ranked:
             node = self.graph.nodes.get(nid)
             if node is None:
                 continue
-            items.append(self._node_to_item(node, a))
+            item = self._node_to_item(node, a)
+            if _count_tokens(self.format_items([*items, item])) > budget:
+                break
+            items.append(item)
             surfaced_ids.append(nid)
+        if not items:
+            return []
         if state_changing:
             now = self._now()
             for nid in surfaced_ids:
@@ -688,6 +700,19 @@ class KnowledgeGraphRetriever:
                 edge.weight = min(1.0, float(edge.weight) + lr)
 
     # --------------------------------------------------------------- rendering
+    @staticmethod
+    def format_items(items: list[MemoryItem]) -> str:
+        """Render recalled nodes exactly as they appear in the KG section."""
+        order = {"person": 0, "fact": 1, "episode": 2, "entity": 3, "self": 4}
+        ranked = sorted(
+            items,
+            key=lambda item: (
+                order.get(item.metadata.get("node_kind"), 9),
+                -item.score,
+            ),
+        )
+        return "\n".join(f"- {item.text}" for item in ranked)
+
     def _node_to_item(self, node: Node, activation: float) -> MemoryItem:
         """Render a node into a prompt-friendly MemoryItem."""
         kind = node.kind

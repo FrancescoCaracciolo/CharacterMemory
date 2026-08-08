@@ -456,11 +456,14 @@ class KnowledgeGraphAdapter(MemoryAdapter):
         # prompt would actually surface.
         try:
             items = self.m.retriever.retrieve(
-                q, user_id=user_id, limit=SEARCH_CAP, state_changing=False
+                q,
+                user_id=user_id,
+                token_budget=self.m.token_budget,
+                state_changing=False,
             )
         except Exception:
             items = []
-        ranked = sorted(items, key=lambda it: -float(it.score or 0.0))
+        ranked = sorted(items, key=lambda it: -float(it.score or 0.0))[:SEARCH_CAP]
         total = len(ranked)
         start = (page - 1) * size
         recs: list[MemoryRecord] = []

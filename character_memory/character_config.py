@@ -4,7 +4,7 @@ and every sub-config.
 A character is, at its core, a directory on disk (``assets/<Name>/`` with
 ``Information/`` + ``Dialogues/`` subfolders). Every tunable that used to live
 only in Python — identity (persona), the prompt templates, the LLM/embedding
-endpoints, chunking, the per-memory toggles and retrieval sizes, decay,
+endpoints, chunking, the per-memory toggles and retrieval bounds, decay,
 deduplication, and the knowledge-graph parameters — now also has a persisted,
 hand-editable home: ``<character_dir>/config.yaml``.
 
@@ -30,7 +30,8 @@ default, unknown keys are ignored so the format is forward-compatible)::
                   dialogue_context_width }
     memory:
       enabled_character_info: true     # and every other enabled_* toggle
-      character_info_k: 4              # and every other *_k size
+      character_info_k: 4              # top-k sizes for non-KG memories
+      knowledge_graph_token_budget: 1000
       sticky_threshold, extract_interval, decay_half_life
       emotion_baseline: { ... }
       emotion_user_dims: { ... }
@@ -293,7 +294,10 @@ def _migrate_legacy_manifest(character_dir: str) -> Optional[dict[str, Any]]:
     for name, on in (m.get("enabled") or {}).items():
         memory[f"enabled_{name}"] = bool(on)
     for name, k in (m.get("k_sizes") or {}).items():
-        memory[f"{name}_k"] = int(k)
+        # Legacy KG manifests stored a node count. There is no faithful way to
+        # translate that to prompt tokens, so let the new token default apply.
+        if name != "knowledge_graph":
+            memory[f"{name}_k"] = int(k)
     if m.get("extract_interval") is not None:
         memory["extract_interval"] = int(m["extract_interval"])
     if m.get("emotion_baseline"):

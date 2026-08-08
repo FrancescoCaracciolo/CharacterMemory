@@ -30,7 +30,7 @@ dependencies = [
     "llama-index-retrievers-bm25>=0.7",
     "faiss-cpu>=1.13",
     "rank-bm25>=0.2.2",
-    # Tokenization for header-based chunking budgets
+    # Tokenization for chunking and knowledge-graph retrieval budgets
     "tiktoken>=0.13",
     # Per-character config.yaml (prompts + sub-configs).
     "pyyaml>=6.0",

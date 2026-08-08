@@ -135,8 +135,10 @@ class Character:
         ``query`` may be a plain string or a list of ``(text, weight)`` pairs
         (one per recent chat message, with older ones weighted less); it is
         forwarded to each memory's recall and never interpolated into prompt
-        text. When ``participants`` has more than one entry each memory is
-        rendered through its participants-aware path (PER_USER memories recall
+        text. ``limits`` contains top-k counts for regular memories and a token
+        budget for the knowledge graph. When ``participants`` has more than
+        one entry each memory is rendered through its participants-aware path
+        (PER_USER memories recall
         + group per speaker; CHARACTER memories recall once). A single
         participant (or none) uses the legacy single-user rendering unchanged.
         """

@@ -186,7 +186,9 @@ class MemoryConfig:
     #: (e.g. the Kurisu asset flips this True) or via config.
     enabled_knowledge_graph: bool = False
 
-    # Retrivial Sizes
+    # Retrieval sizes. Most memories use a top-k item limit; the knowledge
+    # graph uses a prompt-token budget because graph nodes vary substantially
+    # in length (short entities versus full facts/episodes).
     character_info_k: int = 4
     dialogue_style_k: int = 4
     user_facts_k: int = 5
@@ -194,7 +196,7 @@ class MemoryConfig:
     episodic_k: int = 4
     heartbeat_k: int = 4
     user_summary_k: int = 2
-    knowledge_graph_k: int = 6
+    knowledge_graph_token_budget: int = 1_000
 
     # Structured Memory behavior
     # Facts/directives whose effective importance is at/above this value are
@@ -243,7 +245,21 @@ class MemoryConfig:
         return bool(getattr(self, f"enabled_{name}", False))
 
     def k_for(self, name: str) -> int:
+        # Kept as a compatibility entry point for callers that predate
+        # ``retrieval_limit_for``. The KG value is now tokens, not nodes.
+        if name == "knowledge_graph":
+            return max(0, int(self.knowledge_graph_token_budget))
         return int(getattr(self, f"{name}_k", 4))
+
+    def retrieval_limit_for(self, name: str) -> int:
+        """Return the configured recall bound for ``name``.
+
+        The integer is a top-k item count for regular memories and a token
+        budget for the knowledge graph. Keeping this distinction here lets
+        the generic character orchestration continue to pass one per-memory
+        bound without treating KG nodes as if they had uniform sizes.
+        """
+        return self.k_for(name)
 
 
 @dataclass

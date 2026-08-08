@@ -158,6 +158,12 @@ function renderConfig() {
   $("cfg-persona").value = cfg.persona || "";
   renderMemoryList(cfg.memory || {});
   $("cfg-kg").checked = !!cfg.kg_enabled;
+  $("cfg-kg-token-budget").disabled = !cfg.kg_enabled;
+  $("cfg-kg-token-budget").value = String(
+    cfg.memory && cfg.memory.knowledge_graph_token_budget != null
+      ? cfg.memory.knowledge_graph_token_budget
+      : 1000
+  );
 }
 
 function renderMemoryList(mem) {
@@ -206,6 +212,10 @@ function gatherConfig() {
       const v = parseInt(k && k.value, 10);
       if (!Number.isNaN(v)) mem[`${m.name}_k`] = v;
     }
+  }
+  const kgTokenBudget = parseInt($("cfg-kg-token-budget").value, 10);
+  if (!Number.isNaN(kgTokenBudget)) {
+    mem.knowledge_graph_token_budget = Math.max(0, kgTokenBudget);
   }
   return { persona: $("cfg-persona").value, kg_enabled: $("cfg-kg").checked, memory: mem };
 }
@@ -672,6 +682,11 @@ function wire() {
 
   $("cfg-save-persona").addEventListener("click", savePersona);
   $("cfg-save-memory").addEventListener("click", saveMemory);
+  $("cfg-kg").addEventListener("change", () => {
+    $("cfg-kg-token-budget").disabled = !$("cfg-kg").checked;
+    dirtyMemory();
+  });
+  $("cfg-kg-token-budget").addEventListener("input", dirtyMemory);
 
   document.querySelectorAll(".editor-tabs .etab").forEach((b) => {
     b.addEventListener("click", () => setEditTab(b.dataset.edit));

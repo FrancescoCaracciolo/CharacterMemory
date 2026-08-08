@@ -45,11 +45,13 @@ class KnowledgeGraphMemory(Memory):
         *,
         enabled: bool = True,
         config: Optional[KnowledgeGraphConfig] = None,
+        token_budget: int = 1_000,
         name: Optional[str] = None,
     ) -> None:
         super().__init__(enabled=enabled, name=name)
         self.store = store
         self.hybrid = hybrid
+        self.token_budget = max(0, int(token_budget))
         self.retriever = KnowledgeGraphRetriever(config=config)
         # Source memories are wired by the agent after construction (see
         # :meth:`wire_sources`); the retriever's update/dedup paths need them.
@@ -83,10 +85,19 @@ class KnowledgeGraphMemory(Memory):
         limit: int,
         state_changing: bool = True,
     ) -> list[MemoryItem]:
+        """Recall nodes within ``limit`` prompt tokens.
+
+        ``Memory`` names its generic per-memory bound ``limit``; for the
+        knowledge graph that value is deliberately a token budget rather than
+        a node count.
+        """
         if not self.enabled:
             return []
         return self.retriever.retrieve(
-            query, user_id=user_id, limit=limit, state_changing=state_changing
+            query,
+            user_id=user_id,
+            token_budget=limit,
+            state_changing=state_changing,
         )
 
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
@@ -99,11 +110,7 @@ class KnowledgeGraphMemory(Memory):
     def format(self, items: list[MemoryItem]) -> str:
         if not items:
             return ""
-        # Group by node kind so the prompt reads cleanly: people first, then
-        # facts, then episodes, then entities.
-        order = {"person": 0, "fact": 1, "episode": 2, "entity": 3, "self": 4}
-        lines = sorted(items, key=lambda it: (order.get(it.metadata.get("node_kind"), 9), -it.score))
-        return "\n".join(f"- {it.text}" for it in lines)
+        return self.retriever.format_items(items)
 
     # ----------------------------------------------- build / persist / load stubs
     def build(self, info_chunks: list[Chunk]) -> None:

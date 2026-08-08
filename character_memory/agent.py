@@ -152,6 +152,7 @@ class CharacterAgent:
         self.memories: dict[str, Memory] = {}
         self.character: Optional[Character] = None
         self.deduplicator: Optional[Deduplicator] = None
+        # Per-memory recall bounds: top-k counts, except KG prompt tokens.
         self._limits: dict[str, int] = {}
         self._chats: Optional[_ChatBackend] = None
         self._built = False
@@ -326,11 +327,16 @@ class CharacterAgent:
                 self.store, hybrid(),
                 enabled=m.is_enabled("knowledge_graph"),
                 config=m.knowledge_graph,
+                token_budget=m.knowledge_graph_token_budget,
             )
 
     def _wire_character(self) -> None:
         self._limits = {
-            name: (self.config.memory.k_for(name) if self.config else 4)
+            name: (
+                self.config.memory.retrieval_limit_for(name)
+                if self.config
+                else (1_000 if name == _KG_MEMORY else 4)
+            )
             for name in self.memories
         }
         self.character = Character(
