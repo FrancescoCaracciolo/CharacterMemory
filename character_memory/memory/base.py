@@ -100,7 +100,11 @@ class Memory(ABC):
     def recall(
         self, query: Query, user_id: str, limit: int, state_changing: bool = True
     ) -> list[MemoryItem]:
-        """Return up to `limit` items relevant to `query` for `user_id`.
+        """Return results within ``limit`` for ``query`` and ``user_id``.
+
+        For most memories ``limit`` is a top-k item count. Memories whose
+        entries vary substantially in size may define another unit; the
+        knowledge graph treats it as a rendered prompt-token budget.
 
         `query` is normally the last user message, but may be a list of
         ``(text, weight)`` pairs (e.g. one per recent chat message, with older
@@ -165,8 +169,8 @@ class Memory(ABC):
     ) -> list[MemoryItem]:
         """Recall items for the conversation's participants.
 
-        * ``PER_USER`` scope: recall once per participant (each gets up to
-          ``limit`` items); the speaker is carried in each item's metadata.
+        * ``PER_USER`` scope: recall once per participant (each gets its own
+          ``limit`` bound); the speaker is carried in each item's metadata.
         * ``CHARACTER`` scope: recall once (the memory is not about any one
           participant); the first participant is passed to :meth:`recall` as a
           dummy ``user_id`` and ignored by the implementation.

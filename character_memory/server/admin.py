@@ -130,7 +130,8 @@ class CreateCharacterRequest(BaseModel):
 
 
 class ConfigMemoryPatch(BaseModel):
-    # Allow arbitrary enabled_<name> / <name>_k fields without modelling each.
+    # Allow arbitrary enabled_<name> / <name>_k fields and the KG token budget
+    # without modelling each one.
     model_config = {"extra": "allow"}
 
 
@@ -355,6 +356,7 @@ def build_admin_router(
             memory_view[f"enabled_{m}"] = getattr(mem, f"enabled_{m}", False)
             if hasattr(mem, f"{m}_k"):
                 memory_view[f"{m}_k"] = getattr(mem, f"{m}_k")
+        memory_view["knowledge_graph_token_budget"] = mem.knowledge_graph_token_budget
         marker = os.path.join(_char_dir(name), ".knowledge_graph")
         return {
             "name": name,
@@ -380,9 +382,18 @@ def build_admin_router(
             for key, val in patch.memory.items():
                 if key.startswith("enabled_") and key[len("enabled_"):] in MEMORY_NAMES:
                     setattr(mem, key, bool(val))
-                elif key.endswith("_k") and key[:-2] in MEMORY_NAMES:
+                elif (
+                    key.endswith("_k")
+                    and key[:-2] in MEMORY_NAMES
+                    and key != "knowledge_graph_k"
+                ):
                     try:
                         setattr(mem, key, int(val))
+                    except (TypeError, ValueError):
+                        pass
+                elif key == "knowledge_graph_token_budget":
+                    try:
+                        mem.knowledge_graph_token_budget = max(0, int(val))
                     except (TypeError, ValueError):
                         pass
         # KG toggle: set the YAML field AND manage the `.knowledge_graph`

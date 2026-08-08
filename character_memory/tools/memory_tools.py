@@ -106,7 +106,17 @@ class _SearchMemory(Tool):
             if not getattr(mem, "enabled", True):
                 continue
             try:
-                items = mem.recall(query, uid, limit, state_changing=False)
+                # ``limit`` remains the tool's output-item cap. KG prompt
+                # retrieval itself is token-budgeted, so give it the same
+                # budget as normal prompt construction and slice afterward.
+                recall_bound = (
+                    mem.token_budget
+                    if name == "knowledge_graph" and hasattr(mem, "token_budget")
+                    else limit
+                )
+                items = mem.recall(
+                    query, uid, recall_bound, state_changing=False
+                )[:limit]
             except Exception as e:  # noqa: BLE001 - one bad memory shouldn't fail the tool
                 lines.append(f"[{name}] error: {e!r}")
                 continue

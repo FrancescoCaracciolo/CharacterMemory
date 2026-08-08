@@ -248,8 +248,12 @@
                 <input id="cfg-kg" type="checkbox" class="switch-input inline">
                 Knowledge graph
               </label>
-              <span class="cfg-hint">Off by default. Building it runs an LLM extraction pass.</span>
+              <span class="k-wrap">
+                <span class="k-label">token budget</span>
+                <input id="cfg-kg-token-budget" type="number" min="0" step="100" class="k-input">
+              </span>
             </div>
+            <span class="cfg-hint">Off by default. Building it runs an LLM extraction pass.</span>
           </div>
 
           <div class="cfg-block">
