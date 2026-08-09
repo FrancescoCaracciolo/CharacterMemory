@@ -1,5 +1,6 @@
 """Episodic memory: events weighted by emotional impact and mood congruence."""
 
+import json
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Optional
 from ..config import ContradictionPolicy
@@ -32,6 +33,7 @@ class EpisodicMemory(StructuredMemory):
         # The chat an episode was learned in (NULL ⇒ legacy / single-user).
         # Used by the knowledge graph to link facts and episodes of the same chat.
         "chat_id": "TEXT",
+        "source_message_ids": "TEXT NOT NULL DEFAULT '[]'",
     }
     text_column = "summary"
 
@@ -69,6 +71,7 @@ class EpisodicMemory(StructuredMemory):
         importance: float = 0.5,
         emotional_shift: Mapping[str, float] | None = None,
         chat_id: Optional[str] = None,
+        source_message_ids: Optional[list[int]] = None,
     ) -> int:
         return self.add(
             user_id,
@@ -79,6 +82,7 @@ class EpisodicMemory(StructuredMemory):
                 allowed_axes=self.emotion_baseline,
             ),
             chat_id=chat_id,
+            source_message_ids=json.dumps(source_message_ids or []),
         )
 
     def _effective(self, row: dict[str, Any]) -> float:
@@ -142,8 +146,15 @@ class EpisodicMemory(StructuredMemory):
                         "summary": {"type": "string"},
                         "importance": {"type": "number"},
                         "emotional_shift": shift_schema,
+                        "source_message_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
                     },
-                    "required": ["summary", "importance", "emotional_shift"],
+                    "required": [
+                        "summary", "importance", "emotional_shift",
+                        "source_message_ids",
+                    ],
                 },
             },
             instruction=(
@@ -159,7 +170,8 @@ class EpisodicMemory(StructuredMemory):
         added: list[MemoryItem] = []
         for e in value or []:
             summary = (e.get("summary") or "").strip()
-            if not summary:
+            source_message_ids = e.get("source_message_ids") or []
+            if not summary or not source_message_ids:
                 continue
             emotional_shift = e.get("emotional_shift", {})
             # Deliberately strict: scalar shifts are not part of this model.
@@ -175,6 +187,7 @@ class EpisodicMemory(StructuredMemory):
                 importance=self._clip(e.get("importance", 0.5)),
                 emotional_shift=emotional_shift,
                 chat_id=chat_id,
+                source_message_ids=source_message_ids,
             )
             row = self.get_row(row_id)
             if row is not None:

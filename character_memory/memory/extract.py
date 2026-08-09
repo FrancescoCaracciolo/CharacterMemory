@@ -24,6 +24,7 @@ contexts (the default) are bit-for-bit identical to the legacy single-user path.
 """
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Optional
 
 from ..llm.base import LLMClient
@@ -64,6 +65,12 @@ _DEFAULT_MULTI_NOTE = (
     "per-user field, set the item's `user_id` to the participant the item is "
     "about (one of the listed names). Only attribute an item to someone when "
     "the conversation actually establishes it about them."
+)
+
+_PROVENANCE_NOTE = (
+    "Every extracted fact, directive, and episode must include "
+    "`source_message_ids`: the IDs of the transcript messages that directly "
+    "support it. Cite only IDs shown in the transcript."
 )
 
 # Legacy header/footer kept for the no-context path (backward compatibility).
@@ -155,6 +162,7 @@ def _format_instruction(specs: list[ExtractionSpec], context: ExtractionContext)
         bullets = "\n".join(f"- {f}" for f in context.known_facts)
         parts.append(f"{intro}\n{bullets}")
     parts.append("\n".join(s.instruction for s in specs))
+    parts.append(_PROVENANCE_NOTE)
     if context.multi_user:
         parts.append(
             context.multi_note.format(participants=", ".join(context.participants))
@@ -201,6 +209,8 @@ def build_extraction(
             _INSTRUCTION_HEADER
             + "\n".join(s.instruction for s in specs)
             + "\n"
+            + _PROVENANCE_NOTE
+            + "\n"
             + _INSTRUCTION_FOOTER
         )
     else:
@@ -216,7 +226,7 @@ class Extractor:
 
     def extract(
         self,
-        turns: list[dict[str, str]],
+        turns: list[dict[str, Any]],
         schema: dict[str, Any],
         instruction: str,
         *,
@@ -224,9 +234,9 @@ class Extractor:
     ) -> dict[str, Any]:
         """Run one structured extraction pass.
 
-        `turns` is a list of `{"role": "user"|"assistant", "content": ...}` and
-        may carry an optional ``user_id`` (the speaker of a user turn, as
-        produced by :meth:`Chat.messages_with_speakers`).
+        `turns` contains role/content plus an optional speaker, message ID, and
+        occurrence timestamp, as produced by
+        :meth:`Chat.messages_with_speakers`.
         `schema`/`instruction` are built by :func:`build_extraction` from the
         participating memories' specs.
 
@@ -250,9 +260,17 @@ class Extractor:
                 # In a group chat prefer the turn's real speaker; otherwise the
                 # single user name.
                 speaker = (t.get("user_id") or user_name) if multi else user_name
-                lines.append(f"{speaker}: {content}")
+                label = f"{speaker}: {content}"
             else:
-                lines.append(f"{char_name}: {content}")
+                label = f"{char_name}: {content}"
+            annotations: list[str] = []
+            if t.get("message_id") is not None:
+                annotations.append(f"message_id={int(t['message_id'])}")
+            if t.get("occurred_at") is not None:
+                timestamp = datetime.fromtimestamp(float(t["occurred_at"]), tz=UTC)
+                annotations.append(f"occurred_at={timestamp.isoformat()}")
+            prefix = f"[{' | '.join(annotations)}] " if annotations else ""
+            lines.append(prefix + label)
         transcript = "\n\n".join(lines)
         fields = list(schema.get("properties", {}).keys())
         empty = {f: ([] if schema["properties"][f].get("type") == "array" else {}) for f in fields}
@@ -266,6 +284,28 @@ class Extractor:
             result = self.llm.chat_structured(messages, schema)
         except Exception as exc:  # pragma: no cover - network/model errors
             return {**empty, "error": str(exc)}
+        valid_message_ids = {
+            int(turn["message_id"])
+            for turn in turns
+            if turn.get("message_id") is not None
+        }
+        for value in result.values():
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if not isinstance(item, dict) or "source_message_ids" not in item:
+                    continue
+                supplied = item.get("source_message_ids")
+                if not isinstance(supplied, list):
+                    item["source_message_ids"] = []
+                    continue
+                item["source_message_ids"] = [
+                    int(message_id)
+                    for message_id in supplied
+                    if isinstance(message_id, int)
+                    and not isinstance(message_id, bool)
+                    and int(message_id) in valid_message_ids
+                ]
         for f, default in empty.items():
             result.setdefault(f, default)
         return result

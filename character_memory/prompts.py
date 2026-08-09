@@ -33,6 +33,7 @@ class PromptConfig:
     user_facts_header: str = "What you remember about this user"
     user_directives_header: str = "Standing instructions from this user"
     episodic_header: str = "Episodes you've shared with this user"
+    conversation_events_header: str = "Relevant source conversations"
     heartbeat_header: str = "Recent discoveries / actions of yours"
     user_summary_header: str = "Summary of this user"
     user_summary_header_multi: str = "Summaries of these users"
@@ -47,6 +48,7 @@ class PromptConfig:
     user_facts_header_multi: str = "What you remember about these users"
     user_directives_header_multi: str = "Standing instructions from these users"
     episodic_header_multi: str = "Episodes you've shared with these users"
+    conversation_events_header_multi: str = "Relevant source conversations"
     emotion_header_multi: str = "Emotional state (baseline + toward each user)"
 
     # Extraction LLM prompts (see character_memory.memory.extract). These render
@@ -120,6 +122,7 @@ class PromptConfig:
             "user_directives",
             "user_facts",
             "episodic",
+            "conversation_events",
             "heartbeat",
             "user_summary",
             "knowledge_graph",

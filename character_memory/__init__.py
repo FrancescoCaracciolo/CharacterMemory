@@ -37,6 +37,7 @@ from .llm import (
 from .llm.base import LLMResponse
 from .memory import (
     CharacterInfoMemory,
+    ConversationEventMemory,
     DialogueStyleMemory,
     DedupReport,
     Deduplicator,
@@ -132,6 +133,7 @@ __all__ = [
     "ExtractionSpec",
     "StructuredMemory",
     "CharacterInfoMemory",
+    "ConversationEventMemory",
     "DialogueStyleMemory",
     "UserFactMemory",
     "UserDirectiveMemory",

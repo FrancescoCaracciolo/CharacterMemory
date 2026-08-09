@@ -33,6 +33,7 @@ const MEMORIES = [
   { name: "user_facts", title: "User facts", k: true },
   { name: "user_directives", title: "User directives", k: true },
   { name: "episodic", title: "Episodic", k: true },
+  { name: "conversation_events", title: "Source conversations", k: true },
   { name: "heartbeat", title: "Heartbeat journal", k: true },
   { name: "user_summary", title: "User summary", k: true },
   { name: "emotion", title: "Emotion tracking", k: false },

@@ -23,6 +23,7 @@ class UserDirectiveMemory(StructuredMemory):
     extra_columns = {
         "content": "TEXT NOT NULL",
         "retrieval_keywords": "TEXT NOT NULL DEFAULT '[]'",  # JSON array
+        "source_message_ids": "TEXT NOT NULL DEFAULT '[]'",
     }
     text_column = "content"
 
@@ -33,12 +34,14 @@ class UserDirectiveMemory(StructuredMemory):
         *,
         importance: float = 0.5,
         retrieval_keywords: list[str] | None = None,
+        source_message_ids: Optional[list[int]] = None,
     ) -> int:
         return self.add(
             user_id,
             importance,
             content=content,
             retrieval_keywords=json.dumps(retrieval_keywords or []),
+            source_message_ids=json.dumps(source_message_ids or []),
         )
 
     def _keywords(self, row: dict[str, Any]) -> list[str]:
@@ -98,8 +101,15 @@ class UserDirectiveMemory(StructuredMemory):
                         "content": {"type": "string"},
                         "importance": {"type": "number"},
                         "keywords": {"type": "array", "items": {"type": "string"}},
+                        "source_message_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
                     },
-                    "required": ["content", "importance", "keywords"],
+                    "required": [
+                        "content", "importance", "keywords",
+                        "source_message_ids",
+                    ],
                 },
             },
             instruction=(
@@ -114,7 +124,12 @@ class UserDirectiveMemory(StructuredMemory):
         added: list[MemoryItem] = []
         for d in value or []:
             content = (d.get("content") or "").strip()
-            if not content or self._has_text(user_id, content, "content"):
+            source_message_ids = d.get("source_message_ids") or []
+            if (
+                not content
+                or not source_message_ids
+                or self._has_text(user_id, content, "content")
+            ):
                 continue
             keywords = d.get("keywords") or []
             # Multi-user: attribute to the participant the LLM named, else the
@@ -127,6 +142,7 @@ class UserDirectiveMemory(StructuredMemory):
                 content,
                 importance=self._clip(d.get("importance", 0.5)),
                 retrieval_keywords=keywords,
+                source_message_ids=source_message_ids,
             )
             row = self.get_row(row_id)
             if row is not None:

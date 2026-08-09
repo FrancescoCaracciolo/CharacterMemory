@@ -1,5 +1,6 @@
 """User facts: structured, multi-user memory with confidence/importance + decay."""
 
+import json
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..config import ContradictionPolicy
@@ -27,6 +28,9 @@ class UserFactMemory(StructuredMemory):
         # The chat a fact was learned in (NULL ⇒ legacy / single-user). Used
         # by the knowledge graph to link facts and episodes of the same chat.
         "chat_id": "TEXT",
+        # Stable provenance into the messages table. Empty only for facts added
+        # directly through the public API rather than conversation extraction.
+        "source_message_ids": "TEXT NOT NULL DEFAULT '[]'",
     }
     text_column = "content"
 
@@ -39,6 +43,7 @@ class UserFactMemory(StructuredMemory):
         importance: float = 0.5,
         confidence: float = 0.5,
         chat_id: Optional[str] = None,
+        source_message_ids: Optional[list[int]] = None,
     ) -> int:
         return self.add(
             user_id,
@@ -47,6 +52,7 @@ class UserFactMemory(StructuredMemory):
             content=content,
             confidence=confidence,
             chat_id=chat_id,
+            source_message_ids=json.dumps(source_message_ids or []),
         )
 
     def row_text(self, row: dict[str, Any]) -> str:
@@ -77,8 +83,15 @@ class UserFactMemory(StructuredMemory):
                         "content": {"type": "string"},
                         "importance": {"type": "number"},
                         "confidence": {"type": "number"},
+                        "source_message_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
                     },
-                    "required": ["type", "content", "importance", "confidence"],
+                    "required": [
+                        "type", "content", "importance", "confidence",
+                        "source_message_ids",
+                    ],
                 },
             },
             instruction=(
@@ -95,7 +108,12 @@ class UserFactMemory(StructuredMemory):
         added: list[MemoryItem] = []
         for f in value or []:
             content = (f.get("content") or "").strip()
-            if not content or self._has_text(user_id, content, "content"):
+            source_message_ids = f.get("source_message_ids") or []
+            if (
+                not content
+                or not source_message_ids
+                or self._has_text(user_id, content, "content")
+            ):
                 continue
             # Multi-user: attribute to the participant the LLM named, else the
             # caller's default user (the chat owner / current speaker).
@@ -109,6 +127,7 @@ class UserFactMemory(StructuredMemory):
                 importance=self._clip(f.get("importance", 0.5)),
                 confidence=self._clip(f.get("confidence", 0.5)),
                 chat_id=chat_id,
+                source_message_ids=source_message_ids,
             )
             row = self.get_row(row_id)
             if row is not None:

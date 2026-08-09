@@ -11,6 +11,7 @@ for their BM25+similarity recall.
 
 import json
 import os
+from collections.abc import Hashable
 from typing import Any, Optional
 
 try:
@@ -127,30 +128,42 @@ class HybridSearch(RAGSystem):
         if q_vecs.ndim == 1:  # embed() squeezed a single query to (dim,).
             q_vecs = q_vecs.reshape(1, -1)
 
-        # Reciprocal Rank Fusion over positional indices, weight-scaled.
-        scores: dict[int, float] = {}
-        # Dense similarity kept per positional id for display/debugging; when
-        # several queries hit the same node we keep the highest similarity.
-        sim_by_pos: dict[int, float] = {}
+        # Reciprocal Rank Fusion over result groups, weight-scaled. Normal
+        # documents form one group per positional node. A memory may stamp
+        # several index keys with the same `_result_id`; those keys then rank
+        # as one result and cannot consume several top-k slots.
+        scores: dict[Hashable, float] = {}
+        representative: dict[Hashable, int] = {}
+        sim_by_result: dict[Hashable, float] = {}
         for (qtext, weight), qv in zip(queries, q_vecs):
             bm25_hits, dense_hits = self._query_candidates(qtext, qv, pool, where)
             for pos, rank in bm25_hits:
-                scores[pos] = scores.get(pos, 0.0) + weight / (self.rrf_k + rank + 1)
+                key = self._result_key(pos)
+                scores[key] = scores.get(key, 0.0) + weight / (self.rrf_k + rank + 1)
+                representative.setdefault(key, pos)
             for pos, rank, sim in dense_hits:
-                scores[pos] = scores.get(pos, 0.0) + weight / (self.rrf_k + rank + 1)
-                if sim > sim_by_pos.get(pos, -1.0):
-                    sim_by_pos[pos] = sim
+                key = self._result_key(pos)
+                scores[key] = scores.get(key, 0.0) + weight / (self.rrf_k + rank + 1)
+                representative.setdefault(key, pos)
+                if sim > sim_by_result.get(key, -1.0):
+                    sim_by_result[key] = sim
 
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
         hits: list[Hit] = []
-        for pos, score in ranked:
+        for key, score in ranked:
+            pos = representative[key]
             node = self._nodes[pos]
             meta = dict(node.metadata)
-            meta["similarity"] = sim_by_pos.get(pos, 0.0)
+            meta["similarity"] = sim_by_result.get(key, 0.0)
             hits.append(
                 Hit(text=node.text, score=score, source=meta.get("source", ""), metadata=meta)
             )
         return hits
+
+    def _result_key(self, pos: int) -> Hashable:
+        """Return a retrieval-group key without changing positional IDs."""
+        result_id = self._nodes[pos].metadata.get("_result_id")
+        return ("result", result_id) if result_id is not None else ("_pos", pos)
 
     def _query_candidates(
         self, qtext: str, qv: "np.ndarray", pool: int, where: dict | None
@@ -167,10 +180,18 @@ class HybridSearch(RAGSystem):
         if self._bm25 is not None:
             nodes = self._bm25.retrieve(qtext)
             rank = 0
+            seen_results: set[Hashable] = set()
             for n in nodes:
                 if not _matches(where, n.metadata):
                     continue
-                bm25_hits.append((int(n.metadata.get("_pos", -1)), rank))
+                pos = int(n.metadata.get("_pos", -1))
+                if pos < 0 or pos >= len(self._nodes):
+                    continue
+                key = self._result_key(pos)
+                if key in seen_results:
+                    continue
+                seen_results.add(key)
+                bm25_hits.append((pos, rank))
                 rank += 1
                 if len(bm25_hits) >= pool:
                     break
@@ -181,6 +202,7 @@ class HybridSearch(RAGSystem):
         dense_hits: list[tuple[int, int, float]] = []
         n_nodes = len(self._nodes)
         rank = 0
+        seen_results: set[Hashable] = set()
         for nid, sim in zip(idxs[0], sims[0]):
             if nid < 0:
                 continue
@@ -195,6 +217,10 @@ class HybridSearch(RAGSystem):
             node = self._nodes[nid]
             if not _matches(where, node.metadata):
                 continue
+            key = self._result_key(int(nid))
+            if key in seen_results:
+                continue
+            seen_results.add(key)
             dense_hits.append((int(nid), rank, float(sim)))
             rank += 1
         return bm25_hits, dense_hits

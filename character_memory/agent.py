@@ -43,6 +43,7 @@ from .llm.base import LLMClient
 from .llm.embedding_base import EmbeddingProvider
 from .memory.base import Memory
 from .memory.character_base import CharacterInfoMemory, DialogueStyleMemory
+from .memory.conversation_events import ConversationEventMemory
 from .memory.dedup import Deduplicator, DedupReport
 from .memory.emotion import EmotionStatus
 from .memory.episodic import EpisodicMemory
@@ -74,7 +75,17 @@ _DIALOGUE_GLOB = "Dialogues"
 
 # Names of the two RAG memories populated from the character directory and of
 # the structured memories whose hybrid index is rebuilt from SQLite rows.
-_STRUCTURED_MEMORIES = ("user_facts", "user_directives", "episodic", "heartbeat", "user_summary")
+_STRUCTURED_MEMORIES = (
+    "user_facts",
+    "user_directives",
+    "episodic",
+    "conversation_events",
+    "heartbeat",
+    "user_summary",
+)
+_DEDUP_MEMORIES = (
+    "user_facts", "user_directives", "episodic", "heartbeat", "user_summary"
+)
 # The knowledge-graph memory has its own persistence layout (kg_index/) and a
 # load-or-ingest lifecycle driven by the other memories.
 _KG_MEMORY = "knowledge_graph"
@@ -308,6 +319,13 @@ class CharacterAgent:
             half_life=half, sticky_threshold=sticky,
             emotion_baseline=m.emotion_baseline,
             current_mood=(emotion.get_current_mood if emotion.enabled else lambda: {}),
+        )
+        self.memories["conversation_events"] = ConversationEventMemory(
+            self.store,
+            hybrid(),
+            enabled=m.is_enabled("conversation_events"),
+            half_life=half,
+            sticky_threshold=sticky,
         )
         self.memories["heartbeat"] = HeartbeatJournal(
             self.store, hybrid(), enabled=m.is_enabled("heartbeat"),
@@ -1053,11 +1071,27 @@ class CharacterAgent:
         assert self.character is not None
         if not rows:
             return
+        event_memory = self.memories.get("conversation_events")
+        events_changed = False
+        if (
+            isinstance(event_memory, ConversationEventMemory)
+            and event_memory.enabled
+            and chat_id is not None
+        ):
+            event_memory.ingest_messages(
+                rows,
+                default_user_id=user_id,
+                chat_id=chat_id,
+                character_name=self.character_name,
+            )
+            events_changed = True
         turns = [
             {
                 "role": r["role"],
                 "content": r["content"],
                 "user_id": r.get("user_id"),
+                "message_id": r["id"],
+                "occurred_at": r.get("occurred_at"),
             }
             for r in rows
         ]
@@ -1067,6 +1101,8 @@ class CharacterAgent:
         )
         if result is not None:
             added = result.pop("__added__", {})
+            if isinstance(event_memory, ConversationEventMemory) and event_memory.enabled:
+                event_memory.link_extracted(added, self.memories)
             self.persist_structured()
             # Knowledge graph: ingest the freshly-added items so its nodes
             # exist before dedup possibly mutates their source rows.
@@ -1075,6 +1111,8 @@ class CharacterAgent:
             # each memory's existing rows, then mirror the mutations into
             # the knowledge graph.
             self._dedup_added(added)
+        elif events_changed:
+            self.persist_structured()
         # Mark extracted whether or not the extractor returned data: a None
         # return means no participating memories, so there is nothing to learn.
         assert self.store is not None
@@ -1155,7 +1193,7 @@ class CharacterAgent:
         dedup = self.deduplicator or Deduplicator(
             self.embedder, self.llm, prompts=self.prompts
         )
-        names = (memory_name,) if memory_name else _STRUCTURED_MEMORIES
+        names = (memory_name,) if memory_name else _DEDUP_MEMORIES
         reports: dict[str, DedupReport] = {}
         for name in names:
             mem = self.memories.get(name)

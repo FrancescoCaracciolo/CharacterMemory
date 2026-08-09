@@ -9,7 +9,7 @@ Two tables (additive — learned memories are untouched):
 
 * `chats`    - one row per conversation (`id, user_id, title, created_at`)
 * `messages` - one row per turn         (`id, chat_id, role, content,
-                user_id, created_at, extracted`)
+                user_id, occurred_at, created_at, extracted`)
 
 The `user_id` column on `messages` records **who spoke that turn**. For a
 1:1 chat it is always the chat's owner (or NULL on rows written before this
@@ -39,7 +39,10 @@ _MESSAGE_COLUMNS: dict[str, str] = {
     "chat_id": "TEXT NOT NULL",
     "role": "TEXT NOT NULL",
     "content": "TEXT NOT NULL",
-    "user_id": "TEXT",  # the speaker of this turn; NULL on legacy rows
+    "user_id": "TEXT",
+    # When the message happened in the source conversation. This is distinct
+    # from created_at (when it was written to this store) and may be omitted.
+    "occurred_at": "REAL",
     "created_at": "REAL NOT NULL",
     "extracted": "INTEGER NOT NULL DEFAULT 0",
 }
@@ -81,6 +84,7 @@ class Chat:
         content: str,
         *,
         user_id: Optional[str] = None,
+        occurred_at: Optional[float] = None,
         extracted: bool = False,
     ) -> dict[str, Any]:
         """Persist one message and return it as an openai-style dict.
@@ -89,6 +93,9 @@ class Chat:
         to the chat owner; for an assistant turn it defaults to None (the
         character speaks, not a user). In a group chat callers pass the real
         speaker so extraction can attribute the turn correctly.
+
+        `occurred_at` is an optional Unix timestamp for when the source message
+        happened. `created_at` always records when this row was persisted.
         """
         if user_id is None and role == "user":
             user_id = self.user_id
@@ -97,6 +104,7 @@ class Chat:
             "role": role,
             "content": content,
             "user_id": user_id,
+            "occurred_at": occurred_at,
             "created_at": time.time(),
             "extracted": 1 if extracted else 0,
         }
@@ -134,9 +142,9 @@ class Chat:
     def messages_with_speakers(self) -> list[dict[str, Any]]:
         """All messages with the speaker of each turn.
 
-        Each dict is `{role, content, user_id}` (assistant turns have
-        ``user_id=None``). Used by the multi-user extractor to label the
-        transcript with the real speaker names.
+        Each dict includes `role`, `content`, `user_id`, `message_id`, and the
+        optional `occurred_at` timestamp. Used by extraction to label the
+        transcript with real speakers and stable source-message provenance.
         """
         rows = self.store.select(
             "messages",
@@ -148,6 +156,8 @@ class Chat:
                 "role": r["role"],
                 "content": r["content"],
                 "user_id": r.get("user_id"),
+                "message_id": r["id"],
+                "occurred_at": r.get("occurred_at"),
             }
             for r in rows
         ]
@@ -219,11 +229,17 @@ class _ChatBackend:
         self.store = store
         self.store.create_table("chats", _CHAT_COLUMNS, pk="id")
         self.store.create_table("messages", _MESSAGE_COLUMNS, pk="id")
-        # Additive migration: older databases predate the `messages.user_id`
-        # column (the speaker). Add it in place; NULL on legacy rows, which the
-        # chat falls back to the chat owner.
-        if "user_id" not in self.store.columns("messages"):
-            self.store.execute("ALTER TABLE messages ADD COLUMN user_id TEXT")
+        # Additive migration: older databases predate some of the
+        # `messages` columns (e.g. `user_id` the speaker, `occurred_at` the
+        # source timestamp, `extracted` the learning flag). Add any that are
+        # missing in place; legacy rows get NULL / the column default, which
+        # the chat treats as "unknown speaker, unknown time, not extracted".
+        # `CREATE TABLE ... IF NOT EXISTS` no-ops on an existing table, so this
+        # only ever touches columns the table is actually missing.
+        existing = set(self.store.columns("messages"))
+        for col, decl in _MESSAGE_COLUMNS.items():
+            if col not in existing:
+                self.store.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
 
     def create_chat(self, user_id: str, *, title: str = "") -> Chat:
         chat_id = uuid.uuid4().hex

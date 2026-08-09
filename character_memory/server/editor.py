@@ -16,6 +16,7 @@ import warnings
 from typing import Any
 
 from ..emotion_vectors import emotion_vector, encode_emotion_vector
+from ..memory.conversation_events import ConversationEventMemory
 from ..memory.emotion import EmotionStatus
 from ..memory.episodic import EpisodicMemory
 from ..memory.structured import StructuredMemory
@@ -159,6 +160,15 @@ def _structured_schema(memory: StructuredMemory) -> dict[str, Any]:
 
 def edit_schema(memory: Any) -> dict[str, Any]:
     """Return the small JSON form schema consumed by the WebUI."""
+    if isinstance(memory, ConversationEventMemory):
+        return {
+            "editable": False,
+            "fields": [],
+            "description": (
+                "Conversation events are immutable source records created from "
+                "chat messages."
+            ),
+        }
     if isinstance(memory, EmotionStatus):
         fields: list[dict[str, Any]] = [
             {

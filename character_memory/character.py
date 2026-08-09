@@ -100,7 +100,7 @@ class Character:
 
     def extract(
         self,
-        turns: list[dict[str, str]],
+        turns: list[dict[str, Any]],
         user_id: str = "default",
         llm: Optional[LLMClient] = None,
         participants: Optional[list[str]] = None,

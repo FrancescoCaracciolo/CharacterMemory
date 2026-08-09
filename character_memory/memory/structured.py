@@ -34,6 +34,10 @@ class StructuredMemory(Memory):
     table: str = "structured"
     extra_columns: dict[str, str] = {}  # memory-specific columns
     text_column: str = "content"        # column holding the primary text for this memory
+    # Most structured memories use hybrid search only to form a candidate set,
+    # then rank by salience/decay. Source-event memory opts into retrieval order
+    # because all of its immutable rows intentionally have equal importance.
+    rank_by_relevance: bool = False
 
     def __init__(
         self,
@@ -76,6 +80,20 @@ class StructuredMemory(Memory):
     def _row_meta(self, row: dict[str, Any]) -> dict:
         return {"id": row["id"], "user_id": row["user_id"]}
 
+    def index_chunks(self, row: dict[str, Any]) -> list[Chunk]:
+        """Search keys contributed by one stored row.
+
+        The default is the row's primary text. Subclasses may add secondary
+        keys while keeping one SQLite row as the value returned to the prompt.
+        """
+        return [
+            Chunk(
+                text=self.row_text(row),
+                source=self.table,
+                metadata=self._row_meta(row),
+            )
+        ]
+
     # Extraction helpers (used by subclasses' apply_extraction).
     def _has_text(self, user_id: str, text: str, content_col: str = "content") -> bool:
         """True if a row for `user_id` already stores `text` (case-insensitive)."""
@@ -105,17 +123,12 @@ class StructuredMemory(Memory):
         row_id = self.store.upsert(self.table, row)
         # Index the new row so BM25+similarity can find it.
         stored = self.store.select(self.table, {"id": row_id})[0]
-        self.hybrid.add_documents(
-            [Chunk(text=self.row_text(stored), source=self.table, metadata=self._row_meta(stored))]
-        )
+        self.hybrid.add_documents(self.index_chunks(stored))
         return row_id
 
     def rebuild_index(self) -> None:
         rows = self.store.select(self.table)
-        chunks = [
-            Chunk(text=self.row_text(r), source=self.table, metadata=self._row_meta(r))
-            for r in rows
-        ]
+        chunks = [chunk for row in rows for chunk in self.index_chunks(row)]
         self.hybrid.build(chunks)
 
     # RECALL functions
@@ -144,7 +157,12 @@ class StructuredMemory(Memory):
 
         # BM25 + similarity retrieval for this user.
         hits = self.hybrid.search(query, k=max(limit, self.hybrid.candidate_pool), where={"user_id": user_id})
-        candidate_ids: set[int] = {int(h.metadata.get("id")) for h in hits if h.metadata.get("id") in rows_by_id}
+        retrieval_ranks: dict[int, int] = {}
+        for rank, hit in enumerate(hits):
+            rid = hit.metadata.get("id")
+            if rid in rows_by_id:
+                retrieval_ranks.setdefault(int(rid), rank)
+        candidate_ids: set[int] = set(retrieval_ranks)
 
         # High base-importance, injected regardless of query.
         i = 0
@@ -159,7 +177,15 @@ class StructuredMemory(Memory):
         for rid in candidate_ids:
             row = rows_by_id[rid]
             scored.append((self._effective(row), row))
-        scored.sort(key=lambda kv: kv[0], reverse=True)
+        if self.rank_by_relevance:
+            scored.sort(
+                key=lambda kv: (
+                    retrieval_ranks.get(int(kv[1]["id"]), len(hits) + 1),
+                    -kv[0],
+                )
+            )
+        else:
+            scored.sort(key=lambda kv: kv[0], reverse=True)
         chosen = scored[:limit]
 
         # Bump recall counters for what we surfaced (skipped when read-only).

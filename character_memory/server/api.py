@@ -213,6 +213,10 @@ class ContextRequest(BaseModel):
         default=None,
         description="Existing chat id. If absent or unknown, a new chat is created.",
     )
+    occurred_at: Optional[float] = Field(
+        default=None,
+        description="Optional Unix timestamp for when the user message occurred.",
+    )
 
 
 class ContextResponse(BaseModel):
@@ -223,6 +227,10 @@ class ContextResponse(BaseModel):
 class SaveRequest(BaseModel):
     chat_id: str = Field(..., description="The chat id returned by /context.")
     answer: str = Field(..., description="The assistant answer to persist.")
+    occurred_at: Optional[float] = Field(
+        default=None,
+        description="Optional Unix timestamp for when the assistant answer occurred.",
+    )
 
 
 class SaveResponse(BaseModel):
@@ -306,7 +314,9 @@ def context(req: ContextRequest) -> ContextResponse:
 
     # Persist the user turn attributed to the current speaker. For a group
     # chat this is what makes each participant's messages attributable.
-    chat.add_message("user", req.message, user_id=req.user)
+    chat.add_message(
+        "user", req.message, user_id=req.user, occurred_at=req.occurred_at
+    )
 
     snapshot = agent.build_context_snapshot(chat)
     try:
@@ -383,7 +393,7 @@ def save(req: SaveRequest) -> SaveResponse:
         raise HTTPException(status_code=404, detail=f"Unknown chat_id {req.chat_id!r}.")
 
     before = len(chat.unextracted())
-    chat.add_message("assistant", req.answer)
+    chat.add_message("assistant", req.answer, occurred_at=req.occurred_at)
     # Force extraction over the chat: anything new gets learned + flagged.
     owner.extract(chat)
     after = len(chat.unextracted())

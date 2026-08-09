@@ -149,6 +149,7 @@ class ChatRequest(BaseModel):
     message: str
     user: str = "user"
     chat_id: Optional[str] = None
+    occurred_at: Optional[float] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -590,7 +591,9 @@ def build_admin_router(
                 )
         else:
             chat = agent.create_chat(req.user, title=req.message[:60])
-        chat.add_message("user", req.message, user_id=req.user)
+        chat.add_message(
+            "user", req.message, user_id=req.user, occurred_at=req.occurred_at
+        )
         # auto_extract=False: persist the assistant reply row now, but skip the
         # synchronous extraction pass — the thread below runs it instead.
         reply = agent.generate_answer(
