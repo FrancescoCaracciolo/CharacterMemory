@@ -61,7 +61,8 @@ from .editor import create_record, delete_record, edit_schema, update_record
 
 # MCP (Model Context Protocol) endpoint: JSON-RPC 2.0 over the Streamable
 # HTTP transport, JSON-only. Mounted at /mcp with ``?character=<name>``
-# binding every call to one CharacterAgent from the AGENTS dict below.
+# binding every call to one CharacterAgent from the AGENTS dict below;
+# optional ``&tools=events,kg`` restricts discovery and dispatch by category.
 from .mcp import build_router as build_mcp_router
 # Admin router: write-side endpoints (create / configure / delete / rebuild /
 # chat) that back the Configure tab of the GUI. Reads live in `adapters.py`.

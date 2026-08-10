@@ -126,6 +126,29 @@ class StructuredMemory(Memory):
         self.hybrid.add_documents(self.index_chunks(stored))
         return row_id
 
+    def add_many(
+        self, entries: list[tuple[str, float, dict[str, Any]]]
+    ) -> list[int]:
+        """Store several rows and rebuild the shared index only once."""
+        row_ids: list[int] = []
+        for user_id, importance, fields in entries:
+            row_ids.append(
+                self.store.upsert(
+                    self.table,
+                    {
+                        "user_id": user_id,
+                        "importance": float(importance),
+                        "created_at": self._now(),
+                        "last_recalled": None,
+                        "recall_count": 0,
+                        **fields,
+                    },
+                )
+            )
+        if row_ids:
+            self.rebuild_index()
+        return row_ids
+
     def rebuild_index(self) -> None:
         rows = self.store.select(self.table)
         chunks = [chunk for row in rows for chunk in self.index_chunks(row)]

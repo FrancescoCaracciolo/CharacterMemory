@@ -3,9 +3,10 @@
 A lightweight MCP-conformant JSON-RPC 2.0 server that lets MCP clients
 (Claude Desktop, MCP Inspector, the Python ``mcp`` client, …) edit and
 search a character's memories. The endpoint is ``POST /mcp`` with a
-required ``?character=<name>`` query parameter; one ``CharacterAgent``
-per character is reused from the global registry that :mod:`.api` builds
-at startup.
+required ``?character=<name>`` query parameter and an optional category
+selection such as ``?character=Kurisu&tools=events,kg``; one
+``CharacterAgent`` per character is reused from the global registry that
+:mod:`.api` builds at startup.
 
 We don't pull in the official ``mcp`` Python package: the protocol surface
 we need (initialize, tools/list, tools/call, ping, the
@@ -46,6 +47,16 @@ from ..memory.character_base import RAGMemory
 from ..memory.emotion import EmotionStatus
 from ..memory.knowledge_graph_memory import KnowledgeGraphMemory
 from ..memory.structured import StructuredMemory
+from ..tools import (
+    CalculateTimeDifference,
+    GetConversationEvents,
+    GetEventNeighbors,
+    GetKnowledgeGraphNeighbors,
+    GetKnowledgeGraphNodes,
+    ResolveTimeRange,
+    SearchConversationEvents,
+    Tool,
+)
 from .sync import MemorySync
 
 
@@ -53,8 +64,9 @@ from .sync import MemorySync
 # Constants
 # --------------------------------------------------------------------------- #
 SERVER_NAME = "character-memory-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 PROTOCOL_VERSION = "2024-11-05"  # MCP protocol version this server speaks.
+TOOL_CATEGORIES = frozenset({"core", "memory", "events", "kg"})
 
 # --------------------------------------------------------------------------- #
 # Small utilities
@@ -118,6 +130,17 @@ def _json_error(text: str) -> dict[str, Any]:
     }
 
 
+def _as_tool_result(payload: Any) -> dict[str, Any]:
+    """Preserve an MCP error result returned directly by a handler."""
+    if (
+        isinstance(payload, dict)
+        and payload.get("isError") is True
+        and isinstance(payload.get("content"), list)
+    ):
+        return payload
+    return _json_result(payload)
+
+
 def _require_character(
     request: Request, agent_registry: dict[str, CharacterAgent]
 ) -> tuple[Optional[CharacterAgent], Optional[JSONResponse]]:
@@ -160,6 +183,37 @@ def _require_character(
 def _args(args: dict, key: str, default=None):
     """``args[key]`` with a default; ``None`` sent by callers falls back."""
     return args[key] if args.get(key) is not None else default
+
+
+def _parse_tool_categories(raw: Optional[str]) -> Optional[frozenset[str]]:
+    """Parse the optional comma-separated ``?tools=`` category selection.
+
+    ``None`` and the explicit value ``all`` mean the complete registry. An
+    empty or unknown selection is rejected so a misspelled category cannot
+    silently expose a different set of tools than the caller intended.
+    """
+    if raw is None:
+        return None
+    values = frozenset(
+        part.strip().lower() for part in raw.split(",") if part.strip()
+    )
+    if not values:
+        raise ValueError(
+            "?tools= must contain one or more categories: "
+            + ", ".join(sorted(TOOL_CATEGORIES))
+            + ", or all."
+        )
+    if "all" in values:
+        if len(values) != 1:
+            raise ValueError("?tools=all cannot be combined with other categories.")
+        return None
+    unknown = values - TOOL_CATEGORIES
+    if unknown:
+        raise ValueError(
+            f"Unknown tool categories: {sorted(unknown)}. Available: "
+            f"{sorted(TOOL_CATEGORIES)}."
+        )
+    return values
 
 
 def _clip(value: Any, lo: float = 0.0, hi: float = 1.0, default: float = 0.5) -> float:
@@ -260,6 +314,17 @@ def _tool_search_knowledge_graph(agent: CharacterAgent, mem: Any, args: dict) ->
         return read_graph(agent, q=q, user=user, limit=limit, hops_subgraph=hops)
     except KeyError:
         return _json_error("knowledge_graph memory not built.")
+
+
+def _run_provider_tool(
+    tool_type: type[Tool], agent: CharacterAgent, args: dict, *, bound: bool
+) -> dict:
+    """Run a provider-neutral library tool through the MCP adapter."""
+    tool = tool_type(agent) if bound else tool_type()
+    result = tool.run(**args)
+    if not isinstance(result, dict):
+        return {"result": result}
+    return result
 
 
 def _tool_deduplicate_knowledge_graph(agent: CharacterAgent, mem: Any, args: dict) -> dict:
@@ -759,14 +824,47 @@ def _register(
     handler: Callable[..., dict],
     *,
     needs_memory: bool = True,
+    categories: tuple[str, ...] = ("memory",),
 ) -> None:
     """Add a tool: ``handler`` gets ``(agent, mem, args)`` and returns a dict.
 
-    ``needs_memory=False`` registers a character-level tool (``list_memories``
-    is the only one today); the dispatcher's memory-lookup is skipped for it.
+    ``needs_memory=False`` registers a character-level or provider-neutral
+    tool; the dispatcher's explicit memory-lookup is skipped for it.
     """
-    _TOOLS.append({"name": name, "description": description, "inputSchema": input_schema})
+    category_set = frozenset(categories)
+    unknown = category_set - TOOL_CATEGORIES
+    if not category_set or unknown:
+        raise ValueError(
+            f"Tool {name!r} has invalid categories {sorted(category_set)}; "
+            f"available categories are {sorted(TOOL_CATEGORIES)}."
+        )
+    _TOOLS.append(
+        {
+            "name": name,
+            "description": description,
+            "inputSchema": input_schema,
+            "categories": category_set,
+        }
+    )
     _HANDLER_INFO[name] = (handler, needs_memory)
+
+
+def _register_provider_tool(
+    tool_type: type[Tool], *, bound: bool, categories: tuple[str, ...]
+) -> None:
+    """Expose one provider-neutral library tool through MCP unchanged."""
+
+    def handler(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+        return _run_provider_tool(tool_type, agent, args, bound=bound)
+
+    _register(
+        tool_type.name,
+        tool_type.description,
+        tool_type.parameters,
+        handler,
+        needs_memory=False,
+        categories=categories,
+    )
 
 
 # Read ---- ---------------------------------------------------------------- #
@@ -777,6 +875,7 @@ _register(
     {"type": "object", "properties": {}, "required": []},
     _tool_list_memories,
     needs_memory=False,
+    categories=("core",),
 )
 
 _register(
@@ -791,6 +890,7 @@ _register(
     {"type": "object", "properties": {}, "required": []},
     _tool_refresh_memory,
     needs_memory=False,
+    categories=("core",),
 )
 
 _register(
@@ -801,6 +901,7 @@ _register(
     {"type": "object", "properties": {}, "required": []},
     _tool_graph_overview,
     needs_memory=False,
+    categories=("kg",),
 )
 
 _register(
@@ -823,6 +924,7 @@ _register(
     },
     _tool_search_knowledge_graph,
     needs_memory=False,
+    categories=("kg",),
 )
 
 _register(
@@ -837,6 +939,28 @@ _register(
     {"type": "object", "properties": {}, "required": []},
     _tool_deduplicate_knowledge_graph,
     needs_memory=False,
+    categories=("kg",),
+)
+
+# Immutable conversation-event retrieval. These registrations reuse the same
+# provider-neutral classes as CharacterAgent's internal function-calling loop.
+_register_provider_tool(
+    SearchConversationEvents, bound=True, categories=("events",)
+)
+_register_provider_tool(GetConversationEvents, bound=True, categories=("events",))
+_register_provider_tool(GetEventNeighbors, bound=True, categories=("events",))
+
+# Focused graph inspection complements the existing visualization-oriented
+# search_knowledge_graph MCP tool above.
+_register_provider_tool(GetKnowledgeGraphNodes, bound=True, categories=("kg",))
+_register_provider_tool(GetKnowledgeGraphNeighbors, bound=True, categories=("kg",))
+
+# Time arithmetic is useful in both source-event and graph retrieval flows.
+_register_provider_tool(
+    ResolveTimeRange, bound=False, categories=("events", "kg")
+)
+_register_provider_tool(
+    CalculateTimeDifference, bound=False, categories=("events", "kg")
 )
 
 _register(
@@ -1186,7 +1310,10 @@ _register(
 )
 
 
-def _build_schemas(agent: CharacterAgent) -> list[dict[str, Any]]:
+def _build_schemas(
+    agent: CharacterAgent,
+    categories: Optional[frozenset[str]] = None,
+) -> list[dict[str, Any]]:
     """Clone the registered tools and inject the live memory-name enum.
 
     The schemas above carry ``"memory": {"type": "string"}`` as a placeholder;
@@ -1196,6 +1323,8 @@ def _build_schemas(agent: CharacterAgent) -> list[dict[str, Any]]:
     enum = sorted(agent.memories.keys())
     out = []
     for tool in _TOOLS:
+        if categories is not None and not (tool["categories"] & categories):
+            continue
         schema = {**tool["inputSchema"]}
         props = dict(schema.get("properties", {}))
         if "memory" in props:
@@ -1222,7 +1351,11 @@ class _RpcError(Exception):
         self.message = message
 
 
-def _dispatch(payload: Any, agent: CharacterAgent) -> Optional[dict[str, Any]]:
+def _dispatch(
+    payload: Any,
+    agent: CharacterAgent,
+    categories: Optional[frozenset[str]] = None,
+) -> Optional[dict[str, Any]]:
     """Process a single parsed JSON-RPC envelope; return the response,
     or ``None`` for notifications (the caller returns no wire response).
 
@@ -1252,16 +1385,20 @@ def _dispatch(payload: Any, agent: CharacterAgent) -> Optional[dict[str, Any]]:
     if has_id and method == "ping":
         return {}
     if has_id and method == "tools/list":
-        return {"tools": _build_schemas(agent)}
+        return {"tools": _build_schemas(agent, categories)}
     if has_id and method == "tools/call":
-        return _dispatch_tool_call(params, agent)
+        return _dispatch_tool_call(params, agent, categories)
 
     if has_id:
         raise _RpcError(-32601, f"Method not found: {method!r}")
     return None
 
 
-def _dispatch_tool_call(params: Any, agent: CharacterAgent) -> dict[str, Any]:
+def _dispatch_tool_call(
+    params: Any,
+    agent: CharacterAgent,
+    categories: Optional[frozenset[str]] = None,
+) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise _RpcError(-32600, "tools/call params must be an object.")
     name = params.get("name")
@@ -1273,6 +1410,14 @@ def _dispatch_tool_call(params: Any, agent: CharacterAgent) -> dict[str, Any]:
     handler_entry = _HANDLER_INFO.get(name)
     if handler_entry is None:
         raise _RpcError(-32602, f"Unknown tool: {name!r}.")
+    if categories is not None:
+        tool = next(tool for tool in _TOOLS if tool["name"] == name)
+        if not (tool["categories"] & categories):
+            raise _RpcError(
+                -32602,
+                f"Tool {name!r} is not enabled by ?tools="
+                f"{','.join(sorted(categories))}.",
+            )
     handler, needs_memory = handler_entry
     return _invoke(handler, agent, name, args, needs_memory)
 
@@ -1295,8 +1440,8 @@ def _invoke(
     """
     if not needs_memory:
         try:
-            return _json_result(handler(agent, None, args))
-        except ValueError as e:
+            return _as_tool_result(handler(agent, None, args))
+        except (RuntimeError, TypeError, ValueError) as e:
             return _json_error(str(e))
 
     mem_name = args.get("memory")
@@ -1306,8 +1451,8 @@ def _invoke(
             f"Missing or unknown memory {mem_name!r}. Available: {sorted(agent.memories)}."
         )
     try:
-        return _json_result(handler(agent, mem, args))
-    except ValueError as e:
+        return _as_tool_result(handler(agent, mem, args))
+    except (RuntimeError, TypeError, ValueError) as e:
         return _json_error(str(e))
 
 
@@ -1322,6 +1467,8 @@ def build_router(
 
     Mount it on the existing app in :file:`api.py`; the route is ``POST /mcp``
     and reads the bound character from the ``?character=`` query parameter.
+    ``?tools=core,memory,events,kg`` optionally restricts the advertised and
+    callable tool categories; omit it or use ``tools=all`` for the full set.
 
     ``sync_monitors`` is the live per-character :class:`MemorySync` map (shared
     with the admin router) so the ``refresh_memory`` tool can force an
@@ -1348,6 +1495,17 @@ def build_router(
         if error_response is not None:
             return error_response
         try:
+            categories = _parse_tool_categories(request.query_params.get("tools"))
+        except ValueError as e:
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32602, "message": str(e)},
+                },
+                status_code=400,
+            )
+        try:
             raw = await request.body()
             payload = json.loads(raw.decode("utf-8") or "null")
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -1365,7 +1523,7 @@ def build_router(
                 responses.append({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request."}})
                 continue
             try:
-                result = _dispatch(item, agent)
+                result = _dispatch(item, agent, categories)
             except _RpcError as e:
                 responses.append({"jsonrpc": "2.0", "id": item.get("id"), "error": {"code": e.code, "message": e.message}})
                 continue
@@ -1389,7 +1547,7 @@ def build_router(
             {
                 "error": (
                     "This MCP server runs in JSON mode. POST a JSON-RPC 2.0 body "
-                    "to /mcp?character=<name>."
+                    "to /mcp?character=<name>[&tools=events,kg]."
                 ),
             },
             status_code=405,

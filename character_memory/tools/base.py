@@ -24,6 +24,46 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Union
 
 
+@dataclass(frozen=True)
+class ToolDefinition:
+    """Provider-neutral description of one callable tool.
+
+    ``input_schema`` is standard JSON Schema. Adapters can translate this
+    definition to OpenAI, Anthropic, MCP, or another framework without the
+    tool implementation depending on any of them.
+    """
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.input_schema,
+        }
+
+    def to_openai(self) -> dict[str, Any]:
+        """Render the definition in OpenAI's function-tool envelope."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.input_schema,
+            },
+        }
+
+
+@dataclass
+class ToolOutput:
+    """Framework-neutral output with model text and optional structured data."""
+
+    text: str
+    data: Any = None
+
+
 # --------------------------------------------------------------------------- #
 # Tool model
 # --------------------------------------------------------------------------- #
@@ -52,6 +92,7 @@ class ToolResult:
     call: ToolCall
     text: str
     ok: bool = True
+    data: Any = None
 
 
 class Tool(ABC):
@@ -74,19 +115,16 @@ class Tool(ABC):
     parameters: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
 
     @abstractmethod
-    def run(self, **kwargs: Any) -> str:
-        """Execute the tool with the model-supplied arguments; return text."""
+    def run(self, **kwargs: Any) -> Any:
+        """Execute the tool and return text, structured data, or ToolOutput."""
+
+    def definition(self) -> ToolDefinition:
+        """Return the provider-neutral tool contract."""
+        return ToolDefinition(self.name, self.description, self.parameters)
 
     def schema(self) -> dict[str, Any]:
-        """Render this tool as the OpenAI ``function`` tool envelope."""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
-        }
+        """Compatibility adapter for OpenAI's ``function`` tool envelope."""
+        return self.definition().to_openai()
 
 
 # --------------------------------------------------------------------------- #

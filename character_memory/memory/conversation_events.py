@@ -97,6 +97,113 @@ class ConversationEventMemory(StructuredMemory):
             for item in items
         )
 
+    def search_events(
+        self,
+        query: str,
+        *,
+        user_id: Optional[str] = None,
+        occurred_from: Optional[float] = None,
+        occurred_before: Optional[float] = None,
+        limit: int = 10,
+    ) -> list[MemoryItem]:
+        """Search raw events with optional occurrence-time bounds.
+
+        Time bounds use ``[occurred_from, occurred_before)``. When bounds are
+        supplied the hybrid candidate pass is widened to the complete event
+        index before filtering, so a relevant in-range event cannot be hidden
+        by out-of-range aliases occupying the normal candidate pool.
+        """
+        limit = max(1, int(limit))
+        rows = self.store.select(
+            self.table, {"user_id": user_id} if user_id else None
+        )
+
+        def eligible(row: dict[str, Any]) -> bool:
+            timestamp = row.get("occurred_at")
+            if occurred_from is not None or occurred_before is not None:
+                if timestamp is None:
+                    return False
+                value = float(timestamp)
+                if occurred_from is not None and value < occurred_from:
+                    return False
+                if occurred_before is not None and value >= occurred_before:
+                    return False
+            return True
+
+        rows_by_id = {int(row["id"]): row for row in rows if eligible(row)}
+        if not rows_by_id:
+            return []
+        if not query.strip():
+            ordered = sorted(
+                rows_by_id.values(),
+                key=lambda row: (
+                    row.get("occurred_at") is None,
+                    float(row.get("occurred_at") or 0.0),
+                    int(row["id"]),
+                ),
+            )[:limit]
+            return [self.row_item(row, 0.0) for row in ordered]
+
+        has_time_filter = occurred_from is not None or occurred_before is not None
+        search_k = self.hybrid.count if has_time_filter else max(
+            limit, self.hybrid.candidate_pool
+        )
+        hits = self.hybrid.search(
+            query,
+            k=max(1, search_k),
+            where={"user_id": user_id} if user_id else None,
+        )
+        items: list[MemoryItem] = []
+        seen: set[int] = set()
+        for hit in hits:
+            event_id = hit.metadata.get("id")
+            if event_id is None:
+                continue
+            event_id = int(event_id)
+            row = rows_by_id.get(event_id)
+            if row is None or event_id in seen:
+                continue
+            seen.add(event_id)
+            item = self.row_item(row, hit.score)
+            item.metadata["matched_key_kind"] = hit.metadata.get("key_kind")
+            item.metadata["matched_source_memory"] = hit.metadata.get(
+                "source_memory"
+            )
+            item.metadata["matched_text"] = hit.text
+            items.append(item)
+            if len(items) >= limit:
+                break
+        return items
+
+    def events_by_ids(self, event_ids: list[int]) -> list[MemoryItem]:
+        """Return immutable event values in the caller's requested order."""
+        output: list[MemoryItem] = []
+        for event_id in event_ids:
+            row = self.get_row(int(event_id))
+            if row is not None:
+                output.append(self.row_item(row, self._effective(row)))
+        return output
+
+    def event_neighbors(
+        self, event_id: int, *, before: int = 2, after: int = 2
+    ) -> list[MemoryItem]:
+        """Return nearby events in the same chat, ordered chronologically."""
+        target = self.get_row(int(event_id))
+        if target is None:
+            return []
+        rows = self.store.select(
+            self.table, {"chat_id": target["chat_id"]}, order_by="first_message_id ASC"
+        )
+        index = next(
+            (i for i, row in enumerate(rows) if int(row["id"]) == int(event_id)),
+            None,
+        )
+        if index is None:
+            return []
+        start = max(0, index - max(0, int(before)))
+        stop = min(len(rows), index + max(0, int(after)) + 1)
+        return [self.row_item(row, self._effective(row)) for row in rows[start:stop]]
+
     def index_chunks(self, row: dict[str, Any]) -> list[Chunk]:
         base_meta = self._row_meta(row)
         chunks = [
@@ -172,6 +279,11 @@ class ConversationEventMemory(StructuredMemory):
             groups.append(current)
 
         mapping: dict[int, int] = {}
+        existing = {
+            row["source_message_ids"]: int(row["id"])
+            for row in self.store.select(self.table, {"chat_id": chat_id})
+        }
+        pending: list[tuple[list[int], tuple[str, float, dict[str, Any]]]] = []
         for group in groups:
             user_turn = next((row for row in group if row["role"] == "user"), None)
             event_user = str(
@@ -194,14 +306,31 @@ class ConversationEventMemory(StructuredMemory):
                 ),
                 None,
             )
-            event_id = self.add_event(
-                event_user,
-                chat_id,
-                content,
-                ids,
-                occurred_at=occurred_at,
+            encoded_ids = json.dumps(ids)
+            event_id = existing.get(encoded_ids)
+            if event_id is not None:
+                mapping.update({message_id: event_id for message_id in ids})
+                continue
+            pending.append(
+                (
+                    ids,
+                    (
+                        event_user,
+                        0.5,
+                        {
+                            "chat_id": chat_id,
+                            "content": content,
+                            "occurred_at": occurred_at,
+                            "source_message_ids": encoded_ids,
+                            "first_message_id": ids[0],
+                            "last_message_id": ids[-1],
+                        },
+                    ),
+                )
             )
-            mapping.update({message_id: event_id for message_id in ids})
+        new_ids = self.add_many([entry for _, entry in pending])
+        for (message_ids, _), event_id in zip(pending, new_ids):
+            mapping.update({message_id: event_id for message_id in message_ids})
         return mapping
 
     def add_alias(

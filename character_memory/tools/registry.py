@@ -21,7 +21,7 @@ import inspect
 import json
 from typing import Any, Callable, Iterable, Optional, Union
 
-from .base import Tool, ToolCall, ToolResult
+from .base import Tool, ToolCall, ToolDefinition, ToolOutput, ToolResult
 
 #: Anything :meth:`ToolRegistry.add` accepts.
 ToolLike = Union[Tool, Callable[..., Any], "ToolRegistry", Iterable]
@@ -110,6 +110,10 @@ class ToolRegistry:
         """OpenAI ``tools=[...]`` envelope for every registered tool."""
         return [t.schema() for t in self._tools.values()]
 
+    def definitions(self) -> list[ToolDefinition]:
+        """Provider-neutral definitions for framework adapters."""
+        return [tool.definition() for tool in self._tools.values()]
+
     # -- dispatch ----------------------------------------------------------- #
     def execute(self, name: str, arguments: Any) -> ToolResult:
         """Run the tool named ``name`` with ``arguments`` (dict or JSON string).
@@ -135,10 +139,16 @@ class ToolRegistry:
                 ok=False,
             )
         try:
-            text = tool.run(**kwargs)
-            if text is None:
-                text = ""
-            text = str(text)
+            output = tool.run(**kwargs)
+            if isinstance(output, ToolOutput):
+                text = output.text
+                data = output.data
+            elif isinstance(output, (dict, list, tuple)):
+                data = output
+                text = json.dumps(output, ensure_ascii=False)
+            else:
+                data = None
+                text = "" if output is None else str(output)
         except TypeError as e:
             # Most common failure: the model didn't supply a required kwarg.
             # Surface the signature mismatch rather than a bare traceback.
@@ -152,7 +162,10 @@ class ToolRegistry:
                 call=ToolCall(id="", name=name, arguments=kwargs), text=text, ok=False
             )
         return ToolResult(
-            call=ToolCall(id="", name=name, arguments=kwargs), text=text, ok=True
+            call=ToolCall(id="", name=name, arguments=kwargs),
+            text=text,
+            ok=True,
+            data=data,
         )
 
 

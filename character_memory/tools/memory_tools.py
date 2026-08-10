@@ -40,13 +40,19 @@ def memory_tools(agent: "CharacterAgent") -> list[Tool]:
         tools = memory_tools(agent) + [GetWeather()]
         agent.generate_answer(chat, tools=tools)
     """
-    return [
+    from .event_tools import conversation_event_tools
+
+    tools: list[Tool] = [
         _SearchMemory(agent),
         _GetUserFacts(agent),
         _GetUserSummary(agent),
         _GetUserEmotion(agent),
         _ListKnownUsers(agent),
     ]
+    memories = _agent_memories(agent)
+    if getattr(memories.get("conversation_events"), "enabled", False):
+        tools.extend(conversation_event_tools(agent))
+    return tools
 
 
 # --------------------------------------------------------------------------- #

@@ -32,12 +32,29 @@ from .base import (
     Tool,
     ToolCall,
     ToolCallEvent,
+    ToolDefinition,
+    ToolOutput,
     ToolResult,
     ToolResultEvent,
     ToolStreamEvent,
 )
 from .decorator import tool
+from .event_tools import (
+    CalculateTimeDifference,
+    GetConversationEvents,
+    GetEventNeighbors,
+    ResolveTimeRange,
+    SearchConversationEvents,
+    conversation_event_tools,
+    parse_time,
+)
 from .memory_tools import memory_tools
+from .knowledge_graph_tools import (
+    GetKnowledgeGraphNeighbors,
+    GetKnowledgeGraphNodes,
+    SearchKnowledgeGraph,
+    knowledge_graph_tools,
+)
 from .registry import (
     ToolRegistry,
     get_tool,
@@ -49,6 +66,8 @@ __all__ = [
     # Tool model
     "Tool",
     "ToolCall",
+    "ToolDefinition",
+    "ToolOutput",
     "ToolResult",
     "ToolRegistry",
     # Definition helpers
@@ -58,6 +77,17 @@ __all__ = [
     "global_registry",
     # Built-ins
     "memory_tools",
+    "conversation_event_tools",
+    "knowledge_graph_tools",
+    "SearchConversationEvents",
+    "GetConversationEvents",
+    "GetEventNeighbors",
+    "ResolveTimeRange",
+    "CalculateTimeDifference",
+    "SearchKnowledgeGraph",
+    "GetKnowledgeGraphNodes",
+    "GetKnowledgeGraphNeighbors",
+    "parse_time",
     # Streaming events
     "TextChunk",
     "ToolCallEvent",
