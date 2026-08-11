@@ -6,6 +6,7 @@ The memory layer and the agent only ever talk to this interface.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Union
 
@@ -63,6 +64,25 @@ class RAGSystem(ABC):
     @abstractmethod
     def add_documents(self, chunks: list[Chunk]) -> None:
         """Add `chunks` to an existing index."""
+
+    def delete_documents(self, ids: Iterable[Any]) -> int:
+        """Logically delete documents whose application ``metadata['id']`` matches.
+
+        Mutable backends may implement this without physically rebuilding the
+        index.  The default keeps existing third-party RAG implementations
+        source-compatible; callers that need deletion must fall back to
+        :meth:`build` when this method raises ``NotImplementedError``.
+
+        Returns the number of documents newly marked as deleted.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support deletion")
+
+    def cleanup(self) -> int:
+        """Physically compact logically-deleted documents, returning the count.
+
+        Implementations should preserve existing embeddings where possible.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support cleanup")
 
     @abstractmethod
     def search(self, query: Query, k: int = 5, where: dict | None = None) -> list[Hit]:

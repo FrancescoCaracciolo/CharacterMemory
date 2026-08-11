@@ -397,7 +397,8 @@ class Deduplicator:
         For each item, find a duplicate among the memory's *other* rows (rows
         added earlier in this same batch are treated as existing). Confirmed
         duplicates are either merged into the survivor (consolidation on) or
-        deleted (consolidation off). The RAG index is rebuilt once at the end.
+        deleted (consolidation off). Index removals and survivor updates are
+        applied incrementally at the end.
         """
         report = DedupReport(checked=len(items))
         if not items:
@@ -455,8 +456,10 @@ class Deduplicator:
                 report.skipped += 1
                 report.removed_ids.append(row_id)
 
-        if report.removed_ids or report.updated_ids:
-            memory.rebuild_index()
+        memory.apply_index_changes(
+            removed_ids=report.removed_ids,
+            updated_ids=report.updated_ids,
+        )
         return report
 
     def sweep(
@@ -468,7 +471,7 @@ class Deduplicator:
 
         When ``user_id`` is given, only that user's rows are swept. When it is
         ``None`` and ``per_user`` is set, each user is swept independently;
-        otherwise all rows are compared together. The RAG index is rebuilt once
+        otherwise all rows are compared together. Index deltas are applied once
         at the end.
         """
         cfg = self.config
@@ -487,7 +490,10 @@ class Deduplicator:
             self._sweep_group(memory, uid, report)
 
         report.checked = sum(len(memory.all_rows(u)) for u in groups)
-        memory.rebuild_index()
+        memory.apply_index_changes(
+            removed_ids=report.removed_ids,
+            updated_ids=report.updated_ids,
+        )
         return report
 
     def _sweep_group(

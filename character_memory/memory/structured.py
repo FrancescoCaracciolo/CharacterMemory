@@ -8,6 +8,7 @@ recall/persist/index plumbing lives here.
 """
 
 import time
+from collections.abc import Iterable
 from typing import Any, Callable, Optional
 
 from ..chunking.base import Chunk
@@ -129,7 +130,7 @@ class StructuredMemory(Memory):
     def add_many(
         self, entries: list[tuple[str, float, dict[str, Any]]]
     ) -> list[int]:
-        """Store several rows and rebuild the shared index only once."""
+        """Store several rows and append their search chunks in one batch."""
         row_ids: list[int] = []
         for user_id, importance, fields in entries:
             row_ids.append(
@@ -146,8 +147,47 @@ class StructuredMemory(Memory):
                 )
             )
         if row_ids:
-            self.rebuild_index()
+            rows = [self.get_row(row_id) for row_id in row_ids]
+            chunks = [
+                chunk
+                for row in rows
+                if row is not None
+                for chunk in self.index_chunks(row)
+            ]
+            self.hybrid.add_documents(chunks)
         return row_ids
+
+    def apply_index_changes(
+        self,
+        *,
+        removed_ids: Iterable[int] = (),
+        updated_ids: Iterable[int] = (),
+    ) -> None:
+        """Incrementally mirror row removals/updates into the hybrid index.
+
+        Updated rows are deleted first, then their current search chunks are
+        appended in one embedding batch. Backends without deletion retain the
+        legacy one-shot rebuild fallback.
+        """
+        removed = {int(row_id) for row_id in removed_ids}
+        updated = {int(row_id) for row_id in updated_ids}
+        affected = removed | updated
+        if not affected:
+            return
+        try:
+            self.hybrid.delete_documents(affected)
+        except NotImplementedError:
+            self.rebuild_index()
+            return
+        rows = [self.get_row(row_id) for row_id in sorted(updated)]
+        chunks = [
+            chunk
+            for row in rows
+            if row is not None
+            for chunk in self.index_chunks(row)
+        ]
+        if chunks:
+            self.hybrid.add_documents(chunks)
 
     def rebuild_index(self) -> None:
         rows = self.store.select(self.table)

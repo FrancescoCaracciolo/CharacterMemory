@@ -58,7 +58,13 @@ from .ingest import (
     wire_chat_edges,
 )
 from .nodes import Node, PersonNode
-from .persistence import has_persisted, load_graph, save_graph
+from .persistence import (
+    graph_index_chunks,
+    has_persisted,
+    load_graph,
+    save_graph,
+    sync_hybrid_index,
+)
 
 
 _NodeAddedCallback = Callable[[Node], None]
@@ -150,6 +156,7 @@ class KnowledgeGraphRetriever:
         memories: Iterable[Any],
         *,
         _on_llm_request_done: Optional[Callable[[], None]] = None,
+        _sync_index: bool = True,
     ) -> "KnowledgeGraphRetriever":
         """Full ingest from the given source memories.
 
@@ -215,8 +222,8 @@ class KnowledgeGraphRetriever:
         self._dedup_persons()
         # Link facts and episodes learned in the same chat (low-weight bridges).
         wire_chat_edges(self.graph)
-        # Keep the node-text hybrid index in sync with whatever we just built.
-        self._rebuild_index()
+        if _sync_index:
+            self._sync_index()
         return self
 
     def _has_wiki_nodes(self) -> bool:
@@ -230,6 +237,7 @@ class KnowledgeGraphRetriever:
         sections: Iterable[dict[str, Any]],
         *,
         _on_llm_request_done: Optional[Callable[[], None]] = None,
+        _sync_index: bool = True,
     ) -> "KnowledgeGraphRetriever":
         """Wiki ingest into the graph.
 
@@ -259,7 +267,8 @@ class KnowledgeGraphRetriever:
         else:
             ingest_wiki(self.graph, sections)
         self._dedup_persons()
-        self._rebuild_index()
+        if _sync_index:
+            self._sync_index()
         return self
 
     def _ingest_for_build(
@@ -284,11 +293,16 @@ class KnowledgeGraphRetriever:
             self.ingest(
                 memory_list,
                 _on_llm_request_done=progress.request_done,
+                _sync_index=False,
             )
             self.ingest_wiki(
                 section_list,
                 _on_llm_request_done=progress.request_done,
+                _sync_index=False,
             )
+        # A combined full ingest used to embed once after memories and again
+        # after wiki. Build the authoritative final snapshot exactly once.
+        self._rebuild_index()
         return self
 
     def _build_llm_request_count(
@@ -333,7 +347,12 @@ class KnowledgeGraphRetriever:
         )
         return fact_requests + wiki_requests
 
-    def update(self, extracted_items: dict[str, list]) -> "KnowledgeGraphRetriever":
+    def update(
+        self,
+        extracted_items: dict[str, list],
+        *,
+        sync_index: bool = True,
+    ) -> "KnowledgeGraphRetriever":
         """Incremental ingest for a freshly-extracted batch.
 
         `extracted_items` is the `{memory_name: [MemoryItem, ...]}` dict the
@@ -344,6 +363,8 @@ class KnowledgeGraphRetriever:
         episodes_items = extracted_items.get("episodic") or []
         summary_items = extracted_items.get("user_summary") or []
         emotion_items = extracted_items.get("emotion") or []
+        if not any((facts_items, episodes_items, summary_items, emotion_items)):
+            return self
         # Summaries upsert PersonNodes directly.
         if summary_items:
             for it in summary_items:
@@ -419,10 +440,16 @@ class KnowledgeGraphRetriever:
         # Re-link same-chat facts/episodes across the whole graph: a freshly
         # ingested fact should bridge to pre-existing episodes of that chat.
         wire_chat_edges(self.graph)
-        self._rebuild_index()
+        if sync_index:
+            self._sync_index()
         return self
 
-    def apply_deduplication(self, report: dict[str, DedupReport]) -> "KnowledgeGraphRetriever":
+    def apply_deduplication(
+        self,
+        report: dict[str, DedupReport],
+        *,
+        sync_index: bool = True,
+    ) -> "KnowledgeGraphRetriever":
         """Mirror a per-memory dedup report into graph mutations.
 
         For each memory's report, ``removed_ids`` drop the matching nodes
@@ -435,8 +462,10 @@ class KnowledgeGraphRetriever:
                 self._remove_by_source(mem_name, rid)
             for rid in rep.updated_ids or []:
                 self._refresh_by_source(mem_name, rid)
-        if any(rep.removed_ids or rep.updated_ids for rep in report.values()):
-            self._rebuild_index()
+        if sync_index and any(
+            rep.removed_ids or rep.updated_ids for rep in report.values()
+        ):
+            self._sync_index()
         return self
 
     def deduplicate_persons(self) -> dict[str, list]:
@@ -445,11 +474,13 @@ class KnowledgeGraphRetriever:
         Public entry point (used by the ``deduplicate_knowledge_graph`` MCP
         tool) for a one-time cleanup of an already-built graph: collapses
         any PersonNode that is actually the character into the SelfNode,
-        then folds duplicate PersonNodes sharing a name/alias. Does NOT
-        rebuild the node-text index or persist — the caller does that.
+        then folds duplicate PersonNodes sharing a name/alias. The hybrid
+        index is synchronized incrementally; the caller persists it.
         """
         into_self = self.graph.collapse_into_self(self._character_labels())
         merged = self.graph.merge_duplicate_persons()
+        if into_self or merged:
+            self._sync_index()
         return {"collapsed_into_self": into_self, "merged_persons": merged}
 
     def _dedup_persons(self) -> None:
@@ -831,6 +862,17 @@ class KnowledgeGraphRetriever:
             self.hybrid.build(chunks)
         except Exception:
             # Embeddings unreachable: skip silently; rows are durable in SQLite.
+            pass
+
+    def _sync_index(self) -> None:
+        """Incrementally align node-text search with the in-memory graph."""
+        if self.hybrid is None:
+            return
+        try:
+            sync_hybrid_index(self.hybrid, graph_index_chunks(self.graph))
+        except Exception:
+            # Embeddings unreachable: graph rows remain durable and a later
+            # persistence/load repair can restore the index.
             pass
 
     # ----------------------------------------------------------- introspection

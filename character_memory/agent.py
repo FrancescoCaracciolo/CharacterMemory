@@ -1103,7 +1103,6 @@ class CharacterAgent:
             added = result.pop("__added__", {})
             if isinstance(event_memory, ConversationEventMemory) and event_memory.enabled:
                 event_memory.link_extracted(added, self.memories)
-            self.persist_structured()
             # Knowledge graph: ingest the freshly-added items so its nodes
             # exist before dedup possibly mutates their source rows.
             self._update_knowledge_graph(added)
@@ -1111,6 +1110,15 @@ class CharacterAgent:
             # each memory's existing rows, then mirror the mutations into
             # the knowledge graph.
             self._dedup_added(added)
+            kg = self.memories.get(_KG_MEMORY)
+            if isinstance(kg, KnowledgeGraphMemory):
+                # Ingest and dedup both mutate the graph first; synchronize
+                # their final combined snapshot so transient nodes that dedup
+                # immediately removes are never embedded.
+                kg.retriever._sync_index()
+            # Publish every structured and KG mutation once, after dedup has
+            # produced the final authoritative in-memory indexes.
+            self.persist_structured()
         elif events_changed:
             self.persist_structured()
         # Mark extracted whether or not the extractor returned data: a None
@@ -1146,8 +1154,7 @@ class CharacterAgent:
             return
         # Only the source memories the graph cares about carry weight here;
         # `KnowledgeGraphRetriever.update` ignores the rest.
-        kg.retriever.update(added)
-        kg.persist(os.path.join(self.save_directory, "kg_index"))
+        kg.retriever.update(added, sync_index=False)
 
     def _dedup_added(self, added: dict[str, list]) -> None:
         """Post-extraction step: compact freshly-added items per memory.
@@ -1168,8 +1175,7 @@ class CharacterAgent:
         # are removed/refreshed in lockstep with their source rows.
         kg = self.memories.get(_KG_MEMORY)
         if isinstance(kg, KnowledgeGraphMemory) and reports:
-            kg.retriever.apply_deduplication(reports)
-            kg.persist(os.path.join(self.save_directory, "kg_index"))
+            kg.retriever.apply_deduplication(reports, sync_index=False)
 
     def dedup(
         self,

@@ -608,7 +608,6 @@ def build_admin_router(
             # thread failure or a duplicated run is harmless.
             try:
                 ag._maybe_auto_extract(ch)
-                ag.persist_structured()
             except Exception as exc:  # noqa: BLE001 - never crash on bg work
                 warnings.warn(
                     f"[charactermemory] background extraction failed for "

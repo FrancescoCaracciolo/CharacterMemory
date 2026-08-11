@@ -268,17 +268,23 @@ def _normalise(memory: Any, values: dict[str, Any], *, partial: bool) -> dict[st
 
 
 def _refresh_index(
-    agent: Any, memory: StructuredMemory, *, already_rebuilt: bool = False
+    agent: Any,
+    memory: StructuredMemory,
+    *,
+    updated_ids: tuple[int, ...] = (),
+    removed_ids: tuple[int, ...] = (),
 ) -> None:
-    if not already_rebuilt:
-        try:
-            memory.rebuild_index()
-        except Exception as exc:  # SQLite is still the durable source of truth.
-            warnings.warn(
-                f"Could not refresh index for {memory.name!r}: {exc!r}; "
-                "the database change was saved and the index will refresh on rebuild.",
-                stacklevel=2,
-            )
+    try:
+        memory.apply_index_changes(
+            updated_ids=updated_ids,
+            removed_ids=removed_ids,
+        )
+    except Exception as exc:  # SQLite is still the durable source of truth.
+        warnings.warn(
+            f"Could not refresh index for {memory.name!r}: {exc!r}; "
+            "the database change was saved and the index will refresh on rebuild.",
+            stacklevel=2,
+        )
     try:
         agent.persist_structured()
     except Exception as exc:
@@ -299,18 +305,18 @@ def create_record(agent: Any, memory: Any, values: dict[str, Any]) -> Any:
     importance = clean.pop("importance", getattr(memory, "default_importance", 0.5))
     if isinstance(memory, EpisodicMemory):
         row_id = memory.add_episode(user_id, importance=importance, **clean)
-        _refresh_index(agent, memory, already_rebuilt=True)
+        _refresh_index(agent, memory)
         return row_id
     if memory.name == "user_summary" and hasattr(memory, "add_or_update"):
         aliases = clean.pop("aliases", [])
         row_id = memory.add_or_update(user_id, aliases=aliases, importance=importance, **clean)
-        _refresh_index(agent, memory, already_rebuilt=True)
+        _refresh_index(agent, memory)
         return row_id
     for key, value in list(clean.items()):
         if isinstance(value, list):
             clean[key] = json.dumps(value, ensure_ascii=False)
     row_id = memory.add(user_id, importance, **clean)
-    _refresh_index(agent, memory, already_rebuilt=True)
+    _refresh_index(agent, memory)
     return row_id
 
 
@@ -344,7 +350,7 @@ def update_record(
         else:
             row[key] = json.dumps(value, ensure_ascii=False) if isinstance(value, list) else value
     memory.update_row(row)
-    _refresh_index(agent, memory)
+    _refresh_index(agent, memory, updated_ids=(row_id,))
     return row_id
 
 
@@ -367,5 +373,5 @@ def delete_record(agent: Any, memory: Any, record_id: str) -> Any:
     if memory.get_row(row_id) is None:
         raise KeyError(record_id)
     memory.delete_row(row_id)
-    _refresh_index(agent, memory)
+    _refresh_index(agent, memory, removed_ids=(row_id,))
     return row_id

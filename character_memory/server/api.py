@@ -62,7 +62,8 @@ from .editor import create_record, delete_record, edit_schema, update_record
 # MCP (Model Context Protocol) endpoint: JSON-RPC 2.0 over the Streamable
 # HTTP transport, JSON-only. Mounted at /mcp with ``?character=<name>``
 # binding every call to one CharacterAgent from the AGENTS dict below;
-# optional ``&tools=events,kg`` restricts discovery and dispatch by category.
+# optional ``&tools=heartbeat`` (or another registered category) restricts
+# discovery and dispatch by category.
 from .mcp import build_router as build_mcp_router
 # Admin router: write-side endpoints (create / configure / delete / rebuild /
 # chat) that back the Configure tab of the GUI. Reads live in `adapters.py`.
@@ -255,9 +256,9 @@ app = FastAPI(title="CharacterMemory server")
 
 # Mount the MCP (Model Context Protocol) JSON-RPC 2.0 endpoint. Reads reuse
 # ``adapters.read_memory`` (semantic search + lexical fallback + pagination)
-# so quality matches the GUI; writes commit to SQLite, rebuild the affected
-# memory's hybrid index, and ``persist_structured()`` so the change survives
-# a server restart. ``SYNC_MONITORS`` is wired in so the ``refresh_memory``
+# so quality matches the GUI; writes commit to SQLite, incrementally update the
+# affected memory's hybrid index, and ``persist_structured()`` so the change
+# survives a server restart. ``SYNC_MONITORS`` is wired in so ``refresh_memory``
 # tool can force an immediate cache reload. ``build_mcp_router`` is in :file:`.mcp`.
 app.include_router(build_mcp_router(AGENTS, SYNC_MONITORS))
 
@@ -398,7 +399,6 @@ def save(req: SaveRequest) -> SaveResponse:
     # Force extraction over the chat: anything new gets learned + flagged.
     owner.extract(chat)
     after = len(chat.unextracted())
-    owner.persist_structured()
 
     return SaveResponse(chat_id=chat.id, extracted=before != after)
 

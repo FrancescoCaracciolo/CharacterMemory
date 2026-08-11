@@ -63,8 +63,8 @@ class UserSummaryMemory(StructuredMemory):
         """Insert the user's profile, or merge into the existing one.
 
         On update, new `aliases` are unioned with the stored ones (deduped) and
-        `name`/`summary` are overwritten. The per-user hybrid index is rebuilt so
-        it stays in sync with the single row.
+        `name`/`summary` are overwritten. Only the affected profile's hybrid
+        entry is replaced.
         """
         aliases = self._parse_aliases(aliases)
         existing = self.store.select(
@@ -89,6 +89,7 @@ class UserSummaryMemory(StructuredMemory):
                 }
             )
             row_id = int(row["id"])
+            self.apply_index_changes(updated_ids=[row_id])
         else:
             row_id = self.add(
                 user_id,
@@ -97,7 +98,6 @@ class UserSummaryMemory(StructuredMemory):
                 aliases=json.dumps(aliases, ensure_ascii=False),
                 summary=summary,
             )
-        self.rebuild_index()
         return row_id
 
     def get_summary(self, user_id: str) -> Optional[dict[str, Any]]:

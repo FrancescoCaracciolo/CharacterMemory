@@ -115,6 +115,62 @@ def _upsert_sql(table: str, row: dict[str, Any]) -> tuple[str, list[Any]]:
     return sql, [row[column] for column in columns]
 
 
+def graph_index_chunks(graph: KnowledgeGraph) -> list[Chunk]:
+    """Return the exact searchable node snapshot for ``graph``."""
+    return [
+        Chunk(
+            text=(node.text or "").strip(),
+            source=node.kind,
+            metadata={"id": node.id, "kind": node.kind},
+        )
+        for node in graph.nodes.values()
+        if (node.text or "").strip() and node.id != graph.SELF_ID
+    ]
+
+
+def sync_hybrid_index(hybrid: HybridSearch, chunks: list[Chunk]) -> bool:
+    """Make ``hybrid`` logically equal ``chunks`` using delete/add deltas.
+
+    KG node ids are unique, but the comparison deliberately supports repeated
+    application ids so the helper remains correct if a future node contributes
+    more than one search key. Returns ``True`` when the logical index changed.
+    """
+    current = hybrid.documents
+    if any(chunk.metadata.get("id") is None for chunk in [*current, *chunks]):
+        hybrid.build(chunks)
+        return True
+
+    def signature(chunk: Chunk) -> tuple[str, str, str]:
+        return (chunk.text, chunk.source, str(chunk.metadata.get("kind") or ""))
+
+    current_by_id: dict[Any, list[Chunk]] = {}
+    desired_by_id: dict[Any, list[Chunk]] = {}
+    for chunk in current:
+        current_by_id.setdefault(chunk.metadata["id"], []).append(chunk)
+    for chunk in chunks:
+        desired_by_id.setdefault(chunk.metadata["id"], []).append(chunk)
+
+    changed_ids = {
+        doc_id
+        for doc_id in current_by_id.keys() | desired_by_id.keys()
+        if sorted(map(signature, current_by_id.get(doc_id, [])))
+        != sorted(map(signature, desired_by_id.get(doc_id, [])))
+    }
+    if not changed_ids:
+        return False
+    try:
+        hybrid.delete_documents(changed_ids)
+    except NotImplementedError:
+        hybrid.build(chunks)
+        return True
+    additions = [
+        chunk for chunk in chunks if chunk.metadata["id"] in changed_ids
+    ]
+    if additions:
+        hybrid.add_documents(additions)
+    return True
+
+
 # --------------------------------------------------------------------- write
 def save_graph(
     graph: KnowledgeGraph,
@@ -208,16 +264,7 @@ def save_graph(
         # lock is held, then build/publish the exact same node set to the hybrid
         # index.  This keeps cross-process additions searchable immediately.
         durable = load_graph(store)
-        chunks = [
-            Chunk(
-                text=(node.text or "").strip(),
-                source=node.kind,
-                metadata={"id": node.id, "kind": node.kind},
-            )
-            for node in durable.nodes.values()
-            if (node.text or "").strip() and node.id != durable.SELF_ID
-        ]
-        hybrid.build(chunks)
+        sync_hybrid_index(hybrid, graph_index_chunks(durable))
         if path:
             hybrid.persist(path)
     return durable
@@ -286,4 +333,6 @@ __all__ = [
     "save_graph",
     "load_graph",
     "has_persisted",
+    "graph_index_chunks",
+    "sync_hybrid_index",
 ]
