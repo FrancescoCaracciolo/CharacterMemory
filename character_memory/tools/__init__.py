@@ -37,6 +37,7 @@ from .base import (
     ToolResult,
     ToolResultEvent,
     ToolStreamEvent,
+    TurnEffect,
 )
 from .decorator import tool
 from .event_tools import (
@@ -55,6 +56,7 @@ from .knowledge_graph_tools import (
     SearchKnowledgeGraph,
     knowledge_graph_tools,
 )
+from .world_tools import GetWorldState, SearchWorld, WorldAction, world_tools
 from .registry import (
     ToolRegistry,
     get_tool,
@@ -70,6 +72,7 @@ __all__ = [
     "ToolOutput",
     "ToolResult",
     "ToolRegistry",
+    "TurnEffect",
     # Definition helpers
     "tool",
     "register_tool",
@@ -79,6 +82,10 @@ __all__ = [
     "memory_tools",
     "conversation_event_tools",
     "knowledge_graph_tools",
+    "world_tools",
+    "GetWorldState",
+    "SearchWorld",
+    "WorldAction",
     "SearchConversationEvents",
     "GetConversationEvents",
     "GetEventNeighbors",

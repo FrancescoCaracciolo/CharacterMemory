@@ -30,6 +30,8 @@ import uuid
 import warnings
 from typing import Any, Optional
 
+import yaml
+
 from fastapi import (
     APIRouter,
     File,
@@ -139,6 +141,7 @@ class ConfigPatch(BaseModel):
     persona: Optional[str] = None
     kg_enabled: Optional[bool] = None
     memory: Optional[dict[str, Any]] = None
+    section_order: Optional[list[str]] = None
 
 
 class FileWriteRequest(BaseModel):
@@ -150,6 +153,31 @@ class ChatRequest(BaseModel):
     user: str = "user"
     chat_id: Optional[str] = None
     occurred_at: Optional[float] = None
+
+
+class WorldCommandRequest(BaseModel):
+    kind: str
+    actor_id: Optional[str] = None
+    at: Optional[float] = None
+    location_id: Optional[str] = None
+    activity_kind: Optional[str] = None
+    activity: Optional[str] = None
+    until: Optional[float] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    dedupe_key: Optional[str] = None
+
+
+class WorldFeaturesRequest(BaseModel):
+    values: dict[str, Optional[bool]]
+    actor_id: Optional[str] = None
+
+
+class WorldAdvanceRequest(BaseModel):
+    now: Optional[float] = None
+
+
+class WorldImportRequest(BaseModel):
+    content: str
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +227,13 @@ def build_admin_router(
                 detail=f"Unknown character {name!r}.",
             )
         return agent
+
+    def _require_world(name: str):
+        agent = _require_existing(name)
+        world = agent.world_memory
+        if world is None or not world.enabled:
+            raise HTTPException(status_code=409, detail="WorldMemory is not enabled.")
+        return agent, world
 
     def _bucket_dir(name: str, bucket: str) -> str:
         if bucket not in BUCKETS:
@@ -364,6 +399,7 @@ def build_admin_router(
             "persona": loaded.persona,
             "kg_enabled": os.path.isfile(marker) or mem.enabled_knowledge_graph,
             "memory": memory_view,
+            "section_order": list(loaded.prompts.section_order),
         }
 
     @router.put("/characters/{name}/config")
@@ -378,11 +414,31 @@ def build_admin_router(
         persona = loaded.persona
         if patch.persona is not None:
             persona = patch.persona
+        if patch.section_order is not None:
+            unknown = [name for name in patch.section_order if name not in MEMORY_NAMES]
+            duplicates = [
+                name for i, name in enumerate(patch.section_order)
+                if name in patch.section_order[:i]
+            ]
+            if unknown:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unknown context sections: {sorted(set(unknown))}",
+                )
+            if duplicates:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Duplicate context sections: {sorted(set(duplicates))}",
+                )
+            prompts.section_order = list(patch.section_order)
         if patch.memory:
             mem = cfg.memory
+            enabled_now: list[str] = []
             for key, val in patch.memory.items():
                 if key.startswith("enabled_") and key[len("enabled_"):] in MEMORY_NAMES:
                     setattr(mem, key, bool(val))
+                    if bool(val):
+                        enabled_now.append(key[len("enabled_"):])
                 elif (
                     key.endswith("_k")
                     and key[:-2] in MEMORY_NAMES
@@ -397,11 +453,20 @@ def build_admin_router(
                         mem.knowledge_graph_token_budget = max(0, int(val))
                     except (TypeError, ValueError):
                         pass
+            # Older GUI/API clients do not submit ``section_order``. Keep an
+            # enabled memory from remaining silently absent in that case;
+            # explicit section-order patches still retain full subset control.
+            if patch.section_order is None:
+                for memory_name in enabled_now:
+                    if memory_name not in prompts.section_order:
+                        prompts.section_order.append(memory_name)
         # KG toggle: set the YAML field AND manage the `.knowledge_graph`
         # marker the discovery step consults.
         marker = os.path.join(char_dir, ".knowledge_graph")
         if patch.kg_enabled is True:
             cfg.memory.enabled_knowledge_graph = True
+            if patch.section_order is None and "knowledge_graph" not in prompts.section_order:
+                prompts.section_order.append("knowledge_graph")
             if not os.path.isfile(marker):
                 with open(marker, "w", encoding="utf-8") as f:
                     f.write("# knowledge graph enabled via the configurator\n")
@@ -567,6 +632,109 @@ def build_admin_router(
         monitor = sync_monitors.get(name)
         reloaded = bool(monitor.check_now()) if monitor is not None else False
         return {"character": name, "reloaded": reloaded}
+
+    # ----------------------------- world ----------------------------- #
+    @router.get("/characters/{name}/world")
+    def get_world(name: str) -> dict[str, Any]:
+        """Authored seed plus a read-only projected state and event summary."""
+        _agent, world = _require_world(name)
+        return {
+            "seed": world.seed_view(),
+            "snapshot": world.snapshot(commit=False).to_dict(),
+            "actors": [
+                {
+                    **actor,
+                    "state": world.state_store.state(actor["id"]),
+                    "resolved_features": world.state_store.effective_features(actor["id"]),
+                }
+                for actor in world.state_store.actors()
+            ],
+            "events": world.list_events(limit=50),
+        }
+
+    @router.put("/characters/{name}/world/seed")
+    def put_world_seed(name: str, seed: dict[str, Any]) -> dict[str, Any]:
+        agent, world = _require_world(name)
+        try:
+            saved = world.save_seed(seed)
+            agent.persist_structured()
+            return {"saved": True, "seed": saved, "snapshot": world.snapshot().to_dict()}
+        except (OSError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/characters/{name}/world/import")
+    def import_world_seed(name: str, req: WorldImportRequest) -> dict[str, Any]:
+        agent, world = _require_world(name)
+        try:
+            seed = yaml.safe_load(req.content)
+            if not isinstance(seed, dict):
+                raise ValueError("Imported world must be a YAML/JSON object")
+            saved = world.save_seed(seed)
+            agent.persist_structured()
+            return {"saved": True, "seed": saved, "snapshot": world.snapshot().to_dict()}
+        except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/characters/{name}/world/advance")
+    def advance_world(
+        name: str, req: Optional[WorldAdvanceRequest] = None
+    ) -> dict[str, Any]:
+        agent, world = _require_world(name)
+        now = req.now if req is not None else None
+        try:
+            events = world.advance(now)
+            agent.persist_structured()
+            return {
+                "events": [vars(event) for event in events],
+                "snapshot": world.snapshot(commit=False, now=now).to_dict(),
+            }
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/characters/{name}/world/commands")
+    def apply_world_command(name: str, req: WorldCommandRequest) -> dict[str, Any]:
+        from character_memory.memory.world import WorldCommand
+
+        agent, world = _require_world(name)
+        command = WorldCommand(
+            kind=req.kind,
+            actor_id=req.actor_id or world.observer_id,
+            at=req.at,
+            location_id=req.location_id,
+            activity_kind=req.activity_kind,
+            activity=req.activity,
+            until=req.until,
+            payload=req.payload,
+            source="admin",
+            dedupe_key=req.dedupe_key,
+        )
+        try:
+            event = world.apply_command(command)
+            agent.persist_structured()
+            return {"event": vars(event), "snapshot": world.snapshot().to_dict()}
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.patch("/characters/{name}/world/features")
+    def patch_world_features(name: str, req: WorldFeaturesRequest) -> dict[str, Any]:
+        agent, world = _require_world(name)
+        try:
+            resolved = world.set_features(req.values, actor_id=req.actor_id)
+            agent.persist_structured()
+            return {
+                "actor_id": req.actor_id,
+                "resolved_features": resolved,
+                "snapshot": world.snapshot().to_dict(),
+            }
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.get("/characters/{name}/world/events")
+    def get_world_events(
+        name: str, limit: int = Query(100, ge=1, le=1000), before: Optional[float] = None
+    ) -> dict[str, Any]:
+        _agent, world = _require_world(name)
+        return {"events": world.list_events(limit=limit, before=before)}
 
     # ----------------------------- mini chat ----------------------------- #
     @router.post("/characters/{name}/chat")

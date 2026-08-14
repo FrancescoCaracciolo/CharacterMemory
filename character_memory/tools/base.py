@@ -62,6 +62,15 @@ class ToolOutput:
 
     text: str
     data: Any = None
+    effects: list["TurnEffect"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TurnEffect:
+    """A validated state change staged until the visible turn is committed."""
+
+    kind: str
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,6 +102,7 @@ class ToolResult:
     text: str
     ok: bool = True
     data: Any = None
+    effects: list[TurnEffect] = field(default_factory=list)
 
 
 class Tool(ABC):
@@ -113,6 +123,7 @@ class Tool(ABC):
     name: str = "tool"
     description: str = ""
     parameters: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
+    requires_persisted_chat: bool = False
 
     @abstractmethod
     def run(self, **kwargs: Any) -> Any:

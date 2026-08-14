@@ -17,6 +17,10 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
         self.config = cfg
         self._client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key, timeout=cfg.timeout)
         self._dim: Optional[int] = cfg.dim
+        # Context assembly asks several independent indexes to embed the same
+        # small query batch. Keep a tiny process-local cache so only the first
+        # one reaches the embedding server; never retain bulk indexing batches.
+        self._cache: dict[tuple[str, ...], np.ndarray] = {}
 
     @property
     def dim(self) -> int:
@@ -31,6 +35,13 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
         else:
             single = False
         texts = list(texts)
+        key = tuple(texts)
+        cacheable = len(texts) <= 8
+        if cacheable:
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached.copy()
+
         vecs: list[list[float]] = []
         bs = self.config.batch_size
         for i in range(0, len(texts), bs):
@@ -40,4 +51,8 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
         arr = np.asarray(vecs, dtype=np.float32)
         if single:
             arr = arr[:1]
+        if cacheable:
+            if len(self._cache) >= 16:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = arr.copy()
         return arr

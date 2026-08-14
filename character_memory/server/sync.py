@@ -37,9 +37,10 @@ touches last):
 
 Every learning pass ends with :meth:`CharacterAgent.persist_structured` (or
 the write-tool's ``_persist_after_write``), which rewrites these files via
-``HybridSearch.persist``'s temp-write + ``os.replace``. So the mtime of the
-index file is a reliable "something changed" signal that fires exactly once
-per committed write — in this process *or* another.
+``HybridSearch.persist``'s temp-write + ``os.replace``. ``nodes.json`` is
+published last, after the matching FAISS file, and readers take the same
+index lock while loading both. Its mtime is therefore a commit signal that
+fires exactly once per completed write — in this process *or* another.
 
 We deliberately do **not** watch ``memory.db`` directly: SQLite runs in WAL
 mode (``PRAGMA journal_mode=WAL``) for cross-process concurrency, and under
@@ -61,8 +62,9 @@ file is newer than what we last loaded. Because the write paths
 (``_persist_after_write`` / ``persist_structured``) advance the mtime as
 their *final* atomic step (temp-write + ``os.replace``), the poller either
 sees the old mtime (no reload — correct, nothing new committed yet) or the
-new mtime (reload — correct, loads the freshly-persisted state). There is
-no window in which the poller loads stale disk over fresh in-RAM state.
+new mtime (reload — correct, loads the freshly-persisted state). The shared
+index lock also prevents a manual/direct load from combining files from two
+different publications.
 
 A per-agent :class:`threading.RLock` serializes the poller against a manual
 :meth:`check_now` (from the ``/refresh`` endpoint) so two concurrent reloads
@@ -84,6 +86,7 @@ from ..agent import CharacterAgent
 from ..memory.character_base import RAGMemory
 from ..memory.knowledge_graph_memory import KnowledgeGraphMemory
 from ..memory.structured import StructuredMemory
+from ..memory.world import WorldMemory
 
 
 def _mtime(path: str) -> float:
@@ -233,7 +236,7 @@ class MemorySync:
                 if self._reload_kg():
                     reloaded = True
                     self._index_mtimes[name] = m
-            elif isinstance(mem, (StructuredMemory, RAGMemory)):
+            elif isinstance(mem, (StructuredMemory, RAGMemory, WorldMemory)):
                 if self._safe_load(mem, name, self._index_dir(name)):
                     reloaded = True
                     self._index_mtimes[name] = m

@@ -16,7 +16,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=clubhouse-8">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=section-order-1">
   <!-- The knowledge-graph view is a self-contained canvas force-renderer (no CDN). -->
 </head>
 <body>
@@ -296,6 +296,7 @@
           </div>
           <nav class="editor-tabs" role="tablist">
             <button class="etab active" data-edit="persona" role="tab">Persona &amp; memories</button>
+            <button class="etab" data-edit="world" role="tab">World</button>
             <button class="etab" data-edit="files" role="tab">Files</button>
             <button class="etab" data-edit="chat" role="tab">Chat</button>
           </nav>
@@ -314,10 +315,18 @@
 
           <div class="cfg-block">
             <div class="cfg-block-head">
-              <label class="cfg-label">Memories</label>
-              <button id="cfg-save-memory" class="btn primary">Save memories</button>
+              <div>
+                <label class="cfg-label">Memories &amp; context order</label>
+                <div class="cfg-hint">Enable memory systems, then choose which sections reach <code>/context</code> and in what order.</div>
+              </div>
+              <button id="cfg-save-memory" class="btn primary">Save memories &amp; order</button>
             </div>
             <div id="cfg-memory-list" class="cfg-memory-list"></div>
+            <div class="cfg-section-order-head">
+              <span class="cfg-label">Section order</span>
+              <span class="cfg-hint">Checked sections are returned by <code>/context</code>. Use the arrows to reorder them.</span>
+            </div>
+            <div id="cfg-section-order" class="cfg-section-order" aria-label="Context section order"></div>
           </div>
 
           <div class="cfg-block">
@@ -340,6 +349,71 @@
               <button id="cfg-rebuild" class="btn ghost">⟳ Rebuild indexes</button>
             </div>
             <div id="cfg-build-status" class="cfg-build-status"></div>
+          </div>
+        </div>
+
+        <!-- Private world -->
+        <div class="edit-pane hidden" data-edit="world">
+          <div id="cfg-world-disabled" class="cfg-block hidden">
+            <p>Enable <b>World</b> under Persona &amp; memories, save, then open this tab.</p>
+          </div>
+          <div id="cfg-world-editor">
+            <div class="cfg-block">
+              <div class="cfg-block-head">
+                <label class="cfg-label">World subsystems</label>
+                <button id="cfg-world-save-features" class="btn primary">Save switches</button>
+              </div>
+              <div id="cfg-world-features" class="cfg-memory-list"></div>
+              <label class="cfg-label" for="cfg-world-actor">Actor overrides</label>
+              <select id="cfg-world-actor" class="user-filter"><option value="">World defaults</option></select>
+              <span class="cfg-hint">Actor controls are tri-state: inherit, on, or off.</span>
+            </div>
+            <div class="cfg-block">
+              <div class="cfg-block-head">
+                <label class="cfg-label">Projected state</label>
+                <button id="cfg-world-advance" class="btn ghost">Advance now</button>
+              </div>
+              <pre id="cfg-world-state" class="world-json"></pre>
+            </div>
+            <div class="cfg-block">
+              <div class="cfg-block-head">
+                <div>
+                  <label class="cfg-label">World elements</label>
+                  <div class="cfg-hint">Add and edit the places, people, schedules, and facts that make up this world.</div>
+                </div>
+                <button id="cfg-world-save-seed" class="btn primary tight">Save world</button>
+              </div>
+              <div class="world-add-bar" aria-label="Add a world element">
+                <span class="world-add-label">Quick add</span>
+                <button class="btn ghost tight" type="button" data-world-add="locations">＋ Location</button>
+                <button class="btn ghost tight" type="button" data-world-add="actors">＋ Actor</button>
+                <button class="btn ghost tight" type="button" data-world-add="routines">＋ Routine</button>
+                <button class="btn ghost tight" type="button" data-world-add="facts">＋ Fact</button>
+              </div>
+              <div id="cfg-world-elements" class="world-elements"></div>
+              <details id="cfg-world-source-panel" class="world-source-panel">
+                <summary>Advanced source editor</summary>
+                <div class="world-source-head">
+                  <span class="cfg-hint">Edit or replace the complete world as JSON or YAML.</span>
+                  <span class="world-source-actions">
+                    <button id="cfg-world-apply-source" class="btn ghost tight" type="button">Apply JSON to form</button>
+                    <button id="cfg-world-export" class="btn ghost tight" type="button">Export</button>
+                    <button id="cfg-world-import" class="btn ghost tight" type="button">Import</button>
+                  </span>
+                </div>
+                <textarea id="cfg-world-seed" class="cfg-file-content world-seed" spellcheck="false"></textarea>
+              </details>
+              <input id="cfg-world-import-file" type="file" accept=".json,.yaml,.yml,application/json" hidden>
+            </div>
+            <div class="cfg-block">
+              <label class="cfg-label">Manual command</label>
+              <div class="world-command-row">
+                <select id="cfg-world-command"><option>move</option><option>start_activity</option><option>eat</option><option>sleep</option><option>wake</option></select>
+                <input id="cfg-world-command-value" placeholder="location or activity">
+                <button id="cfg-world-command-run" class="btn ghost">Apply</button>
+              </div>
+            </div>
+            <div class="cfg-block"><label class="cfg-label">Event history</label><pre id="cfg-world-events" class="world-json"></pre></div>
           </div>
         </div>
 
@@ -463,6 +537,6 @@
     </div>
   </div>
   <script src="/gui/static/app.js?v=clubhouse-8"></script>
-  <script src="/gui/static/config.js?v=clubhouse-1"></script>
+  <script src="/gui/static/config.js?v=section-order-1"></script>
 </body>
 </html>

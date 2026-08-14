@@ -167,6 +167,16 @@ class KnowledgeGraphConfig:
 
 
 @dataclass
+class WorldConfig:
+    """Configuration for the optional private character-world simulation."""
+
+    seed_file: str = "world.yaml"
+    auto_advance: bool = True
+    extract_updates: bool = True
+    allow_model_actions: bool = False
+
+
+@dataclass
 class MemoryConfig:
     """Per-memory toggles and retrieval knobs.
 
@@ -183,6 +193,7 @@ class MemoryConfig:
     enabled_emotion: bool = True
     enabled_heartbeat: bool = True
     enabled_user_summary: bool = True
+    enabled_world: bool = False
     #: Knowledge-graph retriever is OFF by default; opt in per character
     #: (e.g. the Kurisu asset flips this True) or via config.
     enabled_knowledge_graph: bool = False
@@ -198,6 +209,7 @@ class MemoryConfig:
     conversation_events_k: int = 4
     heartbeat_k: int = 4
     user_summary_k: int = 2
+    world_k: int = 4
     knowledge_graph_token_budget: int = 1_000
 
     # Structured Memory behavior
@@ -227,6 +239,9 @@ class MemoryConfig:
 
     # KNOWLEDGE GRAPH (optional, off by default — see enabled_knowledge_graph)
     knowledge_graph: KnowledgeGraphConfig = field(default_factory=KnowledgeGraphConfig)
+
+    # PRIVATE WORLD SIMULATION
+    world: WorldConfig = field(default_factory=WorldConfig)
 
     # HISTORY-AWARE RETRIEVAL
     # Retrieval normally uses only the last user message as the query. These

@@ -12,6 +12,17 @@ from .structured import StructuredMemory
 from .user_directives import UserDirectiveMemory
 from .user_facts import UserFactMemory
 from .user_summary import UserSummaryMemory
+from .world import (
+    FEATURE_DEFAULTS,
+    RuleBasedWorldSimulator,
+    WorldCommand,
+    WorldEvent,
+    WorldMemory,
+    WorldRecordMemory,
+    WorldSimulator,
+    WorldSnapshot,
+    WorldStateStore,
+)
 
 __all__ = [
     "Memory",
@@ -36,4 +47,13 @@ __all__ = [
     "Extractor",
     "Deduplicator",
     "DedupReport",
+    "FEATURE_DEFAULTS",
+    "WorldCommand",
+    "WorldEvent",
+    "WorldSnapshot",
+    "WorldStateStore",
+    "WorldRecordMemory",
+    "WorldSimulator",
+    "RuleBasedWorldSimulator",
+    "WorldMemory",
 ]

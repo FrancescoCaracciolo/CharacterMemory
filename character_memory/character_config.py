@@ -71,6 +71,7 @@ from .config import (
     KnowledgeGraphConfig,
     LLMConfig,
     MemoryConfig,
+    WorldConfig,
 )
 from .prompts import PromptConfig
 
@@ -163,6 +164,7 @@ _SUBCONFIG_TYPES = {
     MemoryConfig: "memory",
     DedupConfig: "dedup",
     KnowledgeGraphConfig: "knowledge_graph",
+    WorldConfig: "world",
 }
 
 
@@ -216,7 +218,7 @@ def _build_subconfig(cls: type, data: Optional[dict[str, Any]]) -> Any:
 
 
 def _build_memory_config(data: Optional[dict[str, Any]]) -> MemoryConfig:
-    """Build a MemoryConfig, recursing into its dedup/knowledge_graph sub-configs."""
+    """Build a MemoryConfig, including all nested memory sub-configs."""
     if data is None:
         return MemoryConfig()
     if not isinstance(data, dict):
@@ -231,6 +233,10 @@ def _build_memory_config(data: Optional[dict[str, Any]]) -> MemoryConfig:
         elif f.name == "knowledge_graph":
             kwargs["knowledge_graph"] = _build_subconfig(
                 KnowledgeGraphConfig, raw if isinstance(raw, dict) else None
+            )
+        elif f.name == "world":
+            kwargs["world"] = _build_subconfig(
+                WorldConfig, raw if isinstance(raw, dict) else None
             )
         elif isinstance(raw, dict) and f.type in (dict, "dict"):
             kwargs[f.name] = dict(raw)

@@ -38,6 +38,7 @@ class PromptConfig:
     user_summary_header: str = "Summary of this user"
     user_summary_header_multi: str = "Summaries of these users"
     emotion_header: str = "Emotional state"
+    world_header: str = "Current World"
     knowledge_graph_header: str = "Activated knowledge (graph)"
     knowledge_graph_header_multi: str = "Activated knowledge (graph)"
 
@@ -119,6 +120,7 @@ class PromptConfig:
         default_factory=lambda: [
             "character_info",
             "emotion",
+            "world",
             "user_directives",
             "user_facts",
             "episodic",

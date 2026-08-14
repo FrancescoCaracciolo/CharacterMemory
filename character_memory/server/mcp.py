@@ -4,7 +4,7 @@ A lightweight MCP-conformant JSON-RPC 2.0 server that lets MCP clients
 (Claude Desktop, MCP Inspector, the Python ``mcp`` client, …) edit and
 search a character's memories. The endpoint is ``POST /mcp`` with a
 required ``?character=<name>`` query parameter and an optional category
-selection such as ``?character=Kurisu&tools=events,kg``; one
+selection such as ``?character=Kurisu&tools=heartbeat``; one
 ``CharacterAgent`` per character is reused from the global registry that
 :mod:`.api` builds at startup.
 
@@ -18,9 +18,9 @@ response is a regular JSON envelope. Logic-only tools (search/list) reuse
 :func:`character_memory.server.adapters.read_memory` so search quality
 and pagination are exactly what the GUI sees.
 
-Write tools commit to the character's SQLite store, then rebuild the
-affected memory's hybrid index (``StructuredMemory.rebuild_index``) and
-``agent.persist_structured()`` so RAG retrieval stays in sync — without
+Write tools commit to the character's SQLite store, incrementally update the
+affected memory's hybrid index, and call ``agent.persist_structured()`` so RAG
+retrieval stays in sync — without
 that step the next ``search_memory`` call would rank against the old text
 (see the gotcha note in :file:`character_memory/agent.py`).
 """
@@ -47,6 +47,7 @@ from ..memory.character_base import RAGMemory
 from ..memory.emotion import EmotionStatus
 from ..memory.knowledge_graph_memory import KnowledgeGraphMemory
 from ..memory.structured import StructuredMemory
+from ..memory.world import WorldCommand, WorldMemory
 from ..tools import (
     CalculateTimeDifference,
     GetConversationEvents,
@@ -66,7 +67,7 @@ from .sync import MemorySync
 SERVER_NAME = "character-memory-mcp"
 SERVER_VERSION = "0.2.0"
 PROTOCOL_VERSION = "2024-11-05"  # MCP protocol version this server speaks.
-TOOL_CATEGORIES = frozenset({"core", "memory", "events", "kg"})
+TOOL_CATEGORIES = frozenset({"core", "memory", "events", "kg", "heartbeat", "world"})
 
 # --------------------------------------------------------------------------- #
 # Small utilities
@@ -225,23 +226,28 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0, default: float = 0.5) ->
     return max(lo, min(hi, x))
 
 
-def _persist_after_write(agent: CharacterAgent, mem: Any) -> None:
-    """Common post-write plumbing.
+def _persist_after_write(
+    agent: CharacterAgent,
+    mem: Any,
+    *,
+    updated_ids: tuple[int, ...] = (),
+    removed_ids: tuple[int, ...] = (),
+) -> None:
+    """Incrementally refresh an affected index, then persist all memories.
 
-    For SQLite-backed memories that own a hybrid index, ``rebuild_index``
-    re-embeds the rows so search results match the new text. ``rebuild_index``
-    may raise if the embedder is unreachable; we don't block the write on
-    that — the row is in durable SQLite, the next agent load will rebuild
-    from ``nodes.json`` if needed. Warnings are emitted on failure so an
-    operator can spot a misconfigured embedder, but silent disk loss is
-    not acceptable for ``persist_structured``.
+    Adds already update their index through ``StructuredMemory.add``. Updates
+    and removals are mirrored here; unsupported RAG backends fall back to one
+    full rebuild through ``apply_index_changes``.
     """
     if isinstance(mem, StructuredMemory):
         try:
-            mem.rebuild_index()
+            mem.apply_index_changes(
+                updated_ids=updated_ids,
+                removed_ids=removed_ids,
+            )
         except Exception as e:
             warnings.warn(
-                f"rebuild_index for {mem.name!r} failed: {e!r}; the in-RAM "
+                f"index update for {mem.name!r} failed: {e!r}; the in-RAM "
                 f"index is stale but the SQLite row is durable.",
                 stacklevel=2,
             )
@@ -256,10 +262,7 @@ def _persist_after_write(agent: CharacterAgent, mem: Any) -> None:
 
 
 def _persist_only(agent: CharacterAgent) -> None:
-    """Like :func:`_persist_after_write` but skips ``rebuild_index`` — used
-    by :func:`_tool_set_user_summary`, whose ``add_or_update`` already
-    rebuilds its own single-row-per-user index. Calling ``rebuild_index``
-    twice would re-embed every summary for no benefit."""
+    """Persist after a write whose in-memory index is already synchronized."""
     try:
         agent.persist_structured()
     except Exception as e:
@@ -345,7 +348,6 @@ def _tool_deduplicate_knowledge_graph(agent: CharacterAgent, mem: Any, args: dic
         )
     before = kg.retriever.overview()
     report = kg.retriever.deduplicate_persons()
-    kg.retriever._rebuild_index()
     try:
         kg.persist(os.path.join(agent.save_directory, "kg_index"))
     except Exception as e:  # noqa: BLE001 - surface persistence failure to the caller
@@ -456,6 +458,104 @@ def _tool_search_memory_by_date(agent: CharacterAgent, mem: Any, args: dict) -> 
     return page
 
 
+def _heartbeat_page(agent: CharacterAgent, *, query: str = "", limit: Any = 10) -> dict:
+    """Read heartbeat reports through the shared GUI/MCP adapter."""
+    mem = agent.memories.get("heartbeat")
+    if not isinstance(mem, StructuredMemory) or mem.name != "heartbeat":
+        return _json_error(
+            f"Character {agent.character_name!r} does not have heartbeat memory."
+        )
+    size = max(1, min(200, int(limit or 10)))
+    return read_memory(
+        agent,
+        "heartbeat",
+        page=1,
+        size=size,
+        q=query or None,
+    )
+
+
+def _tool_list_heartbeats(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    """List the latest heartbeat reports, newest first."""
+    return _heartbeat_page(agent, limit=_args(args, "limit", 10))
+
+
+def _tool_search_heartbeats(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    """Hybrid-search heartbeat reports without changing recall counters."""
+    query = str(_args(args, "query", "") or "").strip()
+    if not query:
+        return _json_error("query is required.")
+    return _heartbeat_page(
+        agent,
+        query=query,
+        limit=_args(args, "limit", 10),
+    )
+
+
+def _world(agent: CharacterAgent) -> WorldMemory:
+    world = agent.world_memory
+    if world is None or not world.enabled:
+        raise ValueError(f"Character {agent.character_name!r} does not have WorldMemory enabled.")
+    return world
+
+
+def _tool_get_world_state(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    return _world(agent).snapshot(commit=False).to_dict()
+
+
+def _tool_search_world_records(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    query = str(_args(args, "query", "") or "").strip()
+    if not query:
+        raise ValueError("query is required.")
+    return {"records": _world(agent).search_visible(query, limit=int(_args(args, "limit", 4)))}
+
+
+def _tool_list_world_events(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    return {"events": _world(agent).list_events(limit=int(_args(args, "limit", 100)))}
+
+
+def _tool_advance_world(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    world = _world(agent)
+    events = world.advance(_args(args, "now", None))
+    agent.persist_structured()
+    return {"events": [vars(event) for event in events], "snapshot": world.snapshot().to_dict()}
+
+
+def _tool_apply_world_command(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    world = _world(agent)
+    values = dict(args)
+    values.setdefault("actor_id", world.observer_id)
+    values.setdefault("source", "mcp")
+    event = world.apply_command(world.validate_command_dict(values))
+    agent.persist_structured()
+    return {"event": vars(event), "snapshot": world.snapshot().to_dict()}
+
+
+def _tool_upsert_world_fact(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    world = _world(agent)
+    row_id = world.add_fact(
+        str(_args(args, "content", "") or ""),
+        subject_id=_args(args, "subject_id", None),
+        location_id=_args(args, "location_id", None),
+        visibility=str(_args(args, "visibility", "known")),
+        importance=_clip(_args(args, "importance", 0.6)),
+        source="mcp",
+        dedupe_key=_args(args, "dedupe_key", None),
+    )
+    agent.persist_structured()
+    return {"id": row_id}
+
+
+def _tool_set_world_features(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    world = _world(agent)
+    values = _args(args, "values", {})
+    if not isinstance(values, dict):
+        raise ValueError("values must be an object of feature -> true/false/null.")
+    resolved = world.set_features(values, actor_id=_args(args, "actor_id", None))
+    agent.persist_structured()
+    return {"resolved_features": resolved, "actor_id": _args(args, "actor_id", None)}
+
+
 # --------------------------------------------------------------------------- #
 # Write tools — one set per memory type
 # --------------------------------------------------------------------------- #
@@ -499,7 +599,7 @@ def _tool_update_fact(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     if _args(args, "confidence", None) is not None:
         row["confidence"] = _clip(args["confidence"])
     mem.update_row(row)
-    _persist_after_write(agent, mem)
+    _persist_after_write(agent, mem, updated_ids=(row_id,))
     return {"id": row_id, "memory": mem.name, "updated": True}
 
 
@@ -513,7 +613,7 @@ def _tool_delete_fact(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     if mem.get_row(row_id) is None:
         return _json_error(f"No fact with id={row_id}.")
     mem.delete_row(row_id)
-    _persist_after_write(agent, mem)
+    _persist_after_write(agent, mem, removed_ids=(row_id,))
     return {"id": row_id, "memory": mem.name, "deleted": True}
 
 
@@ -556,7 +656,7 @@ def _tool_update_directive(agent: CharacterAgent, mem: Any, args: dict) -> dict:
             kws = [k.strip() for k in kws.split(",") if k.strip()]
         row["retrieval_keywords"] = json.dumps(list(kws), ensure_ascii=False)
     mem.update_row(row)
-    _persist_after_write(agent, mem)
+    _persist_after_write(agent, mem, updated_ids=(row_id,))
     return {"id": row_id, "memory": mem.name, "updated": True}
 
 
@@ -570,7 +670,7 @@ def _tool_delete_directive(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     if mem.get_row(row_id) is None:
         return _json_error(f"No directive with id={row_id}.")
     mem.delete_row(row_id)
-    _persist_after_write(agent, mem)
+    _persist_after_write(agent, mem, removed_ids=(row_id,))
     return {"id": row_id, "memory": mem.name, "deleted": True}
 
 
@@ -613,7 +713,7 @@ def _tool_update_episode(agent: CharacterAgent, mem: Any, args: dict) -> dict:
             allowed_axes=getattr(mem, "emotion_baseline", None),
         )
     mem.update_row(row)
-    _persist_after_write(agent, mem)
+    _persist_after_write(agent, mem, updated_ids=(row_id,))
     return {"id": row_id, "memory": mem.name, "updated": True}
 
 
@@ -627,7 +727,7 @@ def _tool_delete_episode(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     if mem.get_row(row_id) is None:
         return _json_error(f"No episode with id={row_id}.")
     mem.delete_row(row_id)
-    _persist_after_write(agent, mem)
+    _persist_after_write(agent, mem, removed_ids=(row_id,))
     return {"id": row_id, "memory": mem.name, "deleted": True}
 
 
@@ -663,7 +763,7 @@ def _tool_update_heartbeat(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     if _args(args, "importance", None) is not None:
         row["importance"] = _clip(args["importance"])
     mem.update_row(row)
-    _persist_after_write(agent, mem)
+    _persist_after_write(agent, mem, updated_ids=(row_id,))
     return {"id": row_id, "memory": mem.name, "updated": True}
 
 
@@ -677,7 +777,7 @@ def _tool_delete_heartbeat(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     if mem.get_row(row_id) is None:
         return _json_error(f"No heartbeat entry with id={row_id}.")
     mem.delete_row(row_id)
-    _persist_after_write(agent, mem)
+    _persist_after_write(agent, mem, removed_ids=(row_id,))
     return {"id": row_id, "memory": mem.name, "deleted": True}
 
 
@@ -698,9 +798,8 @@ def _tool_set_user_summary(agent: CharacterAgent, mem: Any, args: dict) -> dict:
         summary=summary,
         importance=_clip(_args(args, "importance", 1.0), default=1.0),
     )
-    # ``add_or_update`` already rebuilt this memory's hybrid index (provided
-    # on UserSummaryMemory.update path is rebuild_index); just flush the
-    # structured indexes to disk so the change survives a restart.
+    # ``add_or_update`` already synchronized this profile's hybrid entry; just
+    # flush the structured indexes to disk so the change survives a restart.
     _persist_only(agent)
     return {"id": row_id, "memory": mem.name, "user_id": user_id}
 
@@ -745,6 +844,48 @@ def _tool_get_user_emotion(agent: CharacterAgent, mem: Any, args: dict) -> dict:
         "current_mood": mem.get_current_mood(),
         "state": mem.get_user_state(user_id),
         "comment": mem.get_user_comment(user_id),
+    }
+
+
+def _character_emotion(agent: CharacterAgent) -> EmotionStatus | dict:
+    """Return the character-wide emotion memory or an MCP error result."""
+    mem = agent.memories.get("emotion")
+    if not isinstance(mem, EmotionStatus):
+        return _json_error(
+            f"Character {agent.character_name!r} does not have emotion memory."
+        )
+    return mem
+
+
+def _tool_set_character_emotion(
+    agent: CharacterAgent, mem: Any, args: dict
+) -> dict:
+    """Replace the character's persisted current mood."""
+    emotion = _character_emotion(agent)
+    if isinstance(emotion, dict):
+        return emotion
+    current_mood = _args(args, "current_mood", None)
+    if current_mood is None:
+        return _json_error("current_mood is required.")
+    updated = emotion.set_current_mood(current_mood)
+    return {
+        "character": agent.character_name,
+        "baseline": dict(emotion.baseline),
+        "current_mood": updated,
+    }
+
+
+def _tool_get_character_emotion(
+    agent: CharacterAgent, mem: Any, args: dict
+) -> dict:
+    """Return the character's resting baseline and persisted current mood."""
+    emotion = _character_emotion(agent)
+    if isinstance(emotion, dict):
+        return emotion
+    return {
+        "character": agent.character_name,
+        "baseline": dict(emotion.baseline),
+        "current_mood": emotion.get_current_mood(),
     }
 
 
@@ -1170,6 +1311,48 @@ _register(
 
 # heartbeat ---- ----------------------------------------------------------- #
 _register(
+    "list_heartbeats",
+    "List the character's latest heartbeat reports in newest-first order. "
+    "`limit` controls how many reports are returned (1..200, default 10).",
+    {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 10,
+            },
+        },
+        "required": [],
+    },
+    _tool_list_heartbeats,
+    needs_memory=False,
+    categories=("memory", "heartbeat"),
+)
+_register(
+    "search_heartbeats",
+    "Semantic + lexical search over the character's heartbeat reports. "
+    "Returns the best matching reports without modifying recall counters; "
+    "`limit` is 1..200 (default 10).",
+    {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 10,
+            },
+        },
+        "required": ["query"],
+    },
+    _tool_search_heartbeats,
+    needs_memory=False,
+    categories=("memory", "heartbeat"),
+)
+_register(
     "add_heartbeat",
     "Add an entry to `heartbeat` (the character's autonomous journal). "
     "`kind` is \"discovery\" (default) or \"action\".",
@@ -1184,6 +1367,7 @@ _register(
         "required": ["memory", "summary"],
     },
     _tool_add_heartbeat,
+    categories=("memory", "heartbeat"),
 )
 _register(
     "update_heartbeat",
@@ -1200,6 +1384,7 @@ _register(
         "required": ["memory", "id"],
     },
     _tool_update_heartbeat,
+    categories=("memory", "heartbeat"),
 )
 _register(
     "delete_heartbeat",
@@ -1210,6 +1395,7 @@ _register(
         "required": ["memory", "id"],
     },
     _tool_delete_heartbeat,
+    categories=("memory", "heartbeat"),
 )
 
 # user_summary ---- ------------------------------------------------------- #
@@ -1234,6 +1420,36 @@ _register(
 )
 
 # emotion ---- ------------------------------------------------------------- #
+_register(
+    "set_character_emotion",
+    "Replace the character's own current mood with an absolute snapshot over "
+    "the configured baseline axes. Values are clamped to 0..1; unknown axes "
+    "are rejected, and omitted configured axes are reset to zero.",
+    {
+        "type": "object",
+        "properties": {
+            "current_mood": {
+                "type": "object",
+                "description": "Absolute character-wide mood over configured emotion axes.",
+                "additionalProperties": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+            },
+        },
+        "required": ["current_mood"],
+    },
+    _tool_set_character_emotion,
+    needs_memory=False,
+)
+_register(
+    "get_character_emotion",
+    "Return the character's configured resting baseline and persisted current mood.",
+    {"type": "object", "properties": {}, "required": []},
+    _tool_get_character_emotion,
+    needs_memory=False,
+)
 _register(
     "set_user_emotion",
     "Update a user's emotion state in `emotion`. Supply `deltas` (an object "
@@ -1307,6 +1523,63 @@ _register(
         "required": ["memory", "text"],
     },
     _tool_add_dialogue,
+)
+
+# private world ----------------------------------------------------------- #
+_register(
+    "get_world_state", "Return the observer-filtered projected world state.",
+    {"type": "object", "properties": {}, "required": []},
+    _tool_get_world_state, needs_memory=False, categories=("world",),
+)
+_register(
+    "search_world_records", "Search facts and events visible to the observer.",
+    {"type": "object", "properties": {
+        "query": {"type": "string"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 4},
+    }, "required": ["query"]},
+    _tool_search_world_records, needs_memory=False, categories=("world",),
+)
+_register(
+    "list_world_events", "List public or witnessed world events, newest first.",
+    {"type": "object", "properties": {
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
+    }, "required": []},
+    _tool_list_world_events, needs_memory=False, categories=("world",),
+)
+_register(
+    "advance_world", "Commit deterministic world simulation through an optional epoch time.",
+    {"type": "object", "properties": {"now": {"type": "number"}}, "required": []},
+    _tool_advance_world, needs_memory=False, categories=("world",),
+)
+_register(
+    "apply_world_command", "Apply a validated command to a configured actor.",
+    {"type": "object", "properties": {
+        "kind": {"type": "string", "enum": sorted(["move", "start_activity", "eat", "sleep", "wake", "schedule"])},
+        "actor_id": {"type": "string"}, "at": {"type": "number"},
+        "location_id": {"type": "string"}, "activity_kind": {"type": "string"},
+        "activity": {"type": "string"}, "until": {"type": "number"},
+        "payload": {"type": "object"}, "dedupe_key": {"type": "string"},
+    }, "required": ["kind"]},
+    _tool_apply_world_command, needs_memory=False, categories=("world",),
+)
+_register(
+    "upsert_world_fact", "Add an authored or learned fact to the world ledger.",
+    {"type": "object", "properties": {
+        "content": {"type": "string"}, "subject_id": {"type": "string"},
+        "location_id": {"type": "string"},
+        "visibility": {"type": "string", "enum": ["public", "known", "local", "private"]},
+        "importance": {"type": "number", "minimum": 0, "maximum": 1},
+        "dedupe_key": {"type": "string"},
+    }, "required": ["content"]},
+    _tool_upsert_world_fact, needs_memory=False, categories=("world",),
+)
+_register(
+    "set_world_features", "Patch world defaults or actor tri-state overrides.",
+    {"type": "object", "properties": {
+        "actor_id": {"type": "string"},
+        "values": {"type": "object", "additionalProperties": {"type": ["boolean", "null"]}},
+    }, "required": ["values"]},
+    _tool_set_world_features, needs_memory=False, categories=("world",),
 )
 
 
@@ -1467,7 +1740,7 @@ def build_router(
 
     Mount it on the existing app in :file:`api.py`; the route is ``POST /mcp``
     and reads the bound character from the ``?character=`` query parameter.
-    ``?tools=core,memory,events,kg`` optionally restricts the advertised and
+    ``?tools=core,memory,heartbeat,events,kg`` optionally restricts the advertised and
     callable tool categories; omit it or use ``tools=all`` for the full set.
 
     ``sync_monitors`` is the live per-character :class:`MemorySync` map (shared
@@ -1547,7 +1820,7 @@ def build_router(
             {
                 "error": (
                     "This MCP server runs in JSON mode. POST a JSON-RPC 2.0 body "
-                    "to /mcp?character=<name>[&tools=events,kg]."
+                    "to /mcp?character=<name>[&tools=<categories>]."
                 ),
             },
             status_code=405,

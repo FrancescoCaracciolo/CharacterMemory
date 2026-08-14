@@ -54,6 +54,7 @@ from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
 from .memory.user_summary import UserSummaryMemory
+from .memory.world import WorldMemory, WorldSnapshot
 from .knowledge_graph.nodes import Node
 from .character_config import load_from_character_dir
 from .prompts import PromptConfig
@@ -66,8 +67,10 @@ from .tools.base import (
     ToolCallEvent,
     ToolResult,
     ToolResultEvent,
+    TurnEffect,
 )
 from .tools.memory_tools import memory_tools as _build_memory_tools
+from .tools.world_tools import world_tools as _build_world_tools
 from .tools.registry import ToolRegistry
 
 _INFO_GLOB = "Information"
@@ -82,6 +85,7 @@ _STRUCTURED_MEMORIES = (
     "conversation_events",
     "heartbeat",
     "user_summary",
+    "world",
 )
 _DEDUP_MEMORIES = (
     "user_facts", "user_directives", "episodic", "heartbeat", "user_summary"
@@ -332,6 +336,17 @@ class CharacterAgent:
             half_life=half, sticky_threshold=sticky,
         )
         self.memories["emotion"] = emotion
+        if m.is_enabled("world"):
+            self.memories["world"] = WorldMemory(
+                self.store,
+                hybrid(),
+                character_name=self.character_name,
+                character_dir=self.character_dir,
+                config=m.world,
+                enabled=True,
+                half_life=half,
+                sticky_threshold=sticky,
+            )
         self.memories["user_summary"] = UserSummaryMemory(
             self.store, hybrid(), enabled=m.is_enabled("user_summary"),
             half_life=half, sticky_threshold=sticky,
@@ -864,17 +879,20 @@ class CharacterAgent:
             self._after_generate(chat, save, reply, auto_extract)
             return reply
 
+        if any(tool.requires_persisted_chat for tool in registry) and (chat is None or not save):
+            raise ValueError("Deferred-effect tools require a persisted Chat with save=True")
+
         if stream:
             return self._stream_answer_with_tools(
                 messages, registry, chat, save, uid,
                 max_tool_iterations=max_tool_iterations, tool_choice=tool_choice,
                 auto_extract=auto_extract,
             )
-        reply = self._generate_with_tools(
+        reply, effects = self._generate_with_tools(
             messages, registry,
             max_tool_iterations=max_tool_iterations, tool_choice=tool_choice,
         )
-        self._after_generate(chat, save, reply, auto_extract)
+        self._after_generate(chat, save, reply, auto_extract, effects=effects)
         return reply
 
     # ------------------------------------------------------------------ #
@@ -887,7 +905,7 @@ class CharacterAgent:
         *,
         max_tool_iterations: int,
         tool_choice: Optional[Any],
-    ) -> str:
+    ) -> tuple[str, list[TurnEffect]]:
         """Non-streaming model↔tool loop; returns the final assistant text.
 
         Each round appends the assistant tool-call message + one ``tool``-role
@@ -898,12 +916,13 @@ class CharacterAgent:
         """
         assert self.llm is not None
         schemas = registry.schemas()
+        effects: list[TurnEffect] = []
         for _ in range(max(1, max_tool_iterations)):
             resp = self.llm.chat_with_tools(
                 messages, schemas, tool_choice=tool_choice,
             )
             if not resp.has_tool_calls:
-                return resp.content
+                return resp.content, effects
             # Append the assistant turn carrying the tool calls (the API needs
             # the exact tool_calls payload echoed back), then the results.
             messages.append(self._assistant_tool_message(resp.content, resp.tool_calls))
@@ -911,6 +930,7 @@ class CharacterAgent:
                 result = registry.execute(tc.name, tc.arguments)
                 # Stamp the correlation id so the backend can pair request/result.
                 result.call.id = tc.id
+                effects.extend(result.effects)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -919,7 +939,7 @@ class CharacterAgent:
                 })
         # Out of iterations: ask once more for a plain-text answer, no tools.
         resp = self.llm.chat_with_tools(messages, schemas, tool_choice="none")
-        return resp.content
+        return resp.content, effects
 
     def _stream_answer_with_tools(
         self,
@@ -947,6 +967,7 @@ class CharacterAgent:
         assert self.llm is not None
         schemas = registry.schemas()
         collected: list[str] = []
+        effects: list[TurnEffect] = []
         for _ in range(max(1, max_tool_iterations)):
             round_calls: list[ToolCall] = []
             round_content: list[str] = []
@@ -965,7 +986,9 @@ class CharacterAgent:
             if not has_calls:
                 # Plain-text reply (streamed above); done.
                 if save and chat is not None:
-                    self._after_generate(chat, True, "".join(collected), auto_extract)
+                    self._after_generate(
+                        chat, True, "".join(collected), auto_extract, effects=effects
+                    )
                 return
             # The ToolCallEvent carried the completed calls; use them to extend
             # the transcript and execute the tools (one ToolResultEvent each).
@@ -974,6 +997,7 @@ class CharacterAgent:
             for tc in round_calls:
                 result = registry.execute(tc.name, tc.arguments)
                 result.call.id = tc.id
+                effects.extend(result.effects)
                 yield ToolResultEvent(result)
                 messages.append({
                     "role": "tool",
@@ -987,7 +1011,9 @@ class CharacterAgent:
                 collected.append(ev.text)
                 yield ev
         if save and chat is not None:
-            self._after_generate(chat, True, "".join(collected), auto_extract)
+            self._after_generate(
+                chat, True, "".join(collected), auto_extract, effects=effects
+            )
 
     @staticmethod
     def _assistant_tool_message(content: str, calls: list[ToolCall]) -> dict:
@@ -1020,6 +1046,44 @@ class CharacterAgent:
         """
         return _build_memory_tools(self)
 
+    def world_tools(self, include_actions: Optional[bool] = None) -> list[Tool]:
+        """Perception-filtered world tools, optionally including deferred actions."""
+        return _build_world_tools(self, include_actions=include_actions)
+
+    @property
+    def world_memory(self) -> Optional[WorldMemory]:
+        """The configured private world, or ``None`` for custom agent builds."""
+        memory = self.memories.get("world")
+        return memory if isinstance(memory, WorldMemory) else None
+
+    def world_snapshot(
+        self, *, commit: bool = False, now: Optional[float] = None
+    ) -> WorldSnapshot:
+        """Return the observer-filtered exact world snapshot."""
+        self._require_loaded()
+        world = self.world_memory
+        if world is None or not world.enabled:
+            raise RuntimeError("WorldMemory is not enabled for this character")
+        return world.snapshot(commit=commit, now=now)
+
+    def advance_world(self, now: Optional[float] = None):
+        """Commit deterministic world progress through ``now``."""
+        self._require_loaded()
+        world = self.world_memory
+        if world is None or not world.enabled:
+            raise RuntimeError("WorldMemory is not enabled for this character")
+        return world.advance(now)
+
+    def set_world_features(
+        self, values: dict[str, Optional[bool]], actor_id: Optional[str] = None
+    ) -> dict[str, bool]:
+        """Patch world defaults or one actor's tri-state overrides."""
+        self._require_loaded()
+        world = self.world_memory
+        if world is None or not world.enabled:
+            raise RuntimeError("WorldMemory is not enabled for this character")
+        return world.set_features(values, actor_id=actor_id)
+
     def _stream_answer(
         self,
         messages: list[dict[str, str]],
@@ -1037,11 +1101,19 @@ class CharacterAgent:
             self._after_generate(chat, True, "".join(collected), auto_extract)
 
     def _after_generate(
-        self, chat: Optional[Chat], save: bool, reply: str, auto_extract: bool = True
+        self, chat: Optional[Chat], save: bool, reply: str, auto_extract: bool = True,
+        *, effects: Optional[list[TurnEffect]] = None,
     ) -> None:
         if chat is None or not save:
             return
-        chat.add_message("assistant", reply)
+        staged = list(effects or [])
+        if staged:
+            world = self.world_memory
+            if world is None or not world.enabled:
+                raise RuntimeError("A turn staged world effects but WorldMemory is unavailable")
+            world.commit_turn(chat.id, reply, staged)
+        else:
+            chat.add_message("assistant", reply)
         # Auto-extraction (a second LLM call on the configured interval) can be
         # deferred by the caller when it wants the reply back the instant the
         # answer is generated — e.g. the configurator's mini-chat, which runs

@@ -143,12 +143,15 @@ class ToolRegistry:
             if isinstance(output, ToolOutput):
                 text = output.text
                 data = output.data
+                effects = list(output.effects)
             elif isinstance(output, (dict, list, tuple)):
                 data = output
                 text = json.dumps(output, ensure_ascii=False)
+                effects = []
             else:
                 data = None
                 text = "" if output is None else str(output)
+                effects = []
         except TypeError as e:
             # Most common failure: the model didn't supply a required kwarg.
             # Surface the signature mismatch rather than a bare traceback.
@@ -166,6 +169,7 @@ class ToolRegistry:
             text=text,
             ok=True,
             data=data,
+            effects=effects,
         )
 
 

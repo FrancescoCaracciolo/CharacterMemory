@@ -37,12 +37,38 @@ const MEMORIES = [
   { name: "heartbeat", title: "Heartbeat journal", k: true },
   { name: "user_summary", title: "User summary", k: true },
   { name: "emotion", title: "Emotion tracking", k: false },
+  { name: "world", title: "Private world", k: true },
+];
+
+const DEFAULT_SECTION_ORDER = [
+  "character_info", "emotion", "world", "user_directives", "user_facts",
+  "episodic", "conversation_events", "heartbeat", "user_summary",
+  "knowledge_graph", "dialogue_style",
+];
+const SECTION_TITLES = Object.fromEntries([
+  ...MEMORIES.map((memory) => [memory.name, memory.title]),
+  ["knowledge_graph", "Knowledge graph"],
+]);
+
+const WORLD_FEATURES = ["locations", "activities", "routines", "hunger", "energy", "sleep", "autonomous_needs"];
+const WORLD_ACTIVITY_KINDS = ["idle", "work", "school", "travel", "eat", "sleep", "leisure", "social", "other"];
+const WORLD_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const WORLD_SECTIONS = [
+  { name: "locations", title: "Locations", singular: "location", icon: "⌂" },
+  { name: "actors", title: "Actors", singular: "actor", icon: "◉" },
+  { name: "routines", title: "Routines", singular: "routine", icon: "↻" },
+  { name: "facts", title: "Facts", singular: "fact", icon: "✦" },
 ];
 
 const cfgState = {
   characters: [],
   active: null,           // active character name
   config: null,           // merged config for the active character
+  world: null,
+  worldDraft: null,
+  worldSourceDirty: false,
+  worldOpen: new Set(),
+  worldNew: null,
   bucket: "information",  // active files bucket
   file: null,             // {name} of the selected file
   chat: {                 // mini-chat state, per character
@@ -75,13 +101,20 @@ function flash(btn, msg, ok = true) {
 }
 
 function showError(msg) {
+  const activeEditor = document.querySelector(".editor-tabs .etab.active")?.dataset.edit;
   const log = $("chat-log");
-  if (log) {
+  if (log && activeEditor === "chat") {
     log.appendChild(el("div", { class: "chat-error" }, "⚠ " + msg));
     log.scrollTop = log.scrollHeight;
-  } else {
-    alert(msg);
+    return;
   }
+  const node = $("toast");
+  if (!node) { alert(msg); return; }
+  node.textContent = msg;
+  node.classList.remove("hidden");
+  node.classList.add("bad");
+  clearTimeout(showError.timer);
+  showError.timer = setTimeout(() => node.classList.add("hidden"), 3600);
 }
 
 // --------------------------------------------------------------- character list
@@ -127,6 +160,551 @@ async function selectCharacter(name) {
   renderChat();
 }
 
+async function loadWorld() {
+  if (!cfgState.active) return;
+  try {
+    cfgState.world = await getJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/world`);
+    $("cfg-world-disabled").classList.add("hidden");
+    $("cfg-world-editor").classList.remove("hidden");
+    renderWorld();
+  } catch (e) {
+    cfgState.world = null;
+    $("cfg-world-disabled").classList.remove("hidden");
+    $("cfg-world-editor").classList.add("hidden");
+  }
+}
+
+function selectedWorldActor() { return $("cfg-world-actor").value || null; }
+
+function cloneWorldSeed(seed) {
+  const draft = JSON.parse(JSON.stringify(seed || {}));
+  for (const { name } of WORLD_SECTIONS) {
+    if (!Array.isArray(draft[name])) draft[name] = [];
+  }
+  return draft;
+}
+
+function markWorldDirty() {
+  $("cfg-world-save-seed").classList.add("dirty");
+}
+
+function syncWorldSource({ dirty = true } = {}) {
+  if (!cfgState.worldDraft) return;
+  $("cfg-world-seed").value = JSON.stringify(cfgState.worldDraft, null, 2);
+  cfgState.worldSourceDirty = false;
+  if (dirty) markWorldDirty();
+  else $("cfg-world-save-seed").classList.remove("dirty");
+}
+
+function renderWorld() {
+  const data = cfgState.world;
+  if (!data) return;
+  cfgState.worldDraft = cloneWorldSeed(data.seed);
+  cfgState.worldSourceDirty = false;
+  cfgState.worldNew = null;
+  const actorSelect = $("cfg-world-actor");
+  const selected = actorSelect.value;
+  clear(actorSelect);
+  actorSelect.appendChild(el("option", { value: "" }, "World defaults"));
+  for (const actor of data.actors || []) actorSelect.appendChild(el("option", { value: actor.id }, actor.name));
+  actorSelect.value = (data.actors || []).some((a) => a.id === selected) ? selected : "";
+  renderWorldFeatures();
+  $("cfg-world-state").textContent = JSON.stringify(data.snapshot, null, 2);
+  $("cfg-world-events").textContent = JSON.stringify(data.events || [], null, 2);
+  renderWorldElements();
+  syncWorldSource({ dirty: false });
+}
+
+function worldOptions(items, { blank = "None" } = {}) {
+  return [
+    { value: "", label: blank },
+    ...items.map((item) => ({ value: item.id, label: item.name ? `${item.name} · ${item.id}` : item.id })),
+  ];
+}
+
+function worldField(item, field, label, {
+  type = "text", options = null, wide = false, placeholder = "", min = null,
+  max = null, step = null, transform = null, hint = "", onCommit = null,
+  afterInput = null,
+} = {}) {
+  const wrap = el("div", { class: `world-field${wide ? " wide" : ""}` });
+  wrap.appendChild(el("span", { class: "world-field-label" }, label));
+  let control;
+  if (type === "textarea") {
+    control = el("textarea", { class: "world-input world-textarea", placeholder, rows: 3 });
+    control.value = item[field] == null ? "" : String(item[field]);
+  } else if (type === "select") {
+    control = el("select", { class: "world-input" });
+    for (const option of options || []) {
+      control.appendChild(el("option", { value: option.value }, option.label));
+    }
+    control.value = item[field] == null ? "" : String(item[field]);
+  } else if (type === "checkbox") {
+    control = el("input", { type: "checkbox", checked: !!item[field] });
+    const check = el("label", { class: "world-check" }, [control, el("span", {}, hint || label)]);
+    wrap.appendChild(check);
+  } else {
+    control = el("input", {
+      class: "world-input", type, placeholder, min, max, step,
+      value: item[field] == null ? "" : String(item[field]),
+    });
+  }
+  if (type !== "checkbox") wrap.appendChild(control);
+  if (hint && type !== "checkbox") wrap.appendChild(el("small", {}, hint));
+
+  const initialValue = item[field];
+  const read = () => {
+    if (type === "checkbox") return control.checked;
+    const raw = control.value;
+    if (transform) return transform(raw);
+    if (type === "number") return raw === "" ? null : Number(raw);
+    if (type === "select") return raw || null;
+    return raw;
+  };
+  control.addEventListener("input", () => {
+    const previous = item[field];
+    item[field] = read();
+    if (afterInput) afterInput(previous, item[field]);
+    syncWorldSource();
+  });
+  if (onCommit) {
+    control.addEventListener("change", () => {
+      onCommit(initialValue, item[field]);
+      renderWorldElements();
+      syncWorldSource();
+    });
+  }
+  return wrap;
+}
+
+function worldDaysField(item) {
+  const wrap = el("div", { class: "world-field wide" }, [
+    el("span", { class: "world-field-label" }, "Active days"),
+  ]);
+  const days = new Set((item.days || []).map(Number));
+  const choices = el("div", { class: "world-days" });
+  WORLD_DAYS.forEach((name, day) => {
+    const input = el("input", { type: "checkbox", checked: days.has(day) });
+    input.addEventListener("change", () => {
+      if (input.checked) days.add(day); else days.delete(day);
+      item.days = [...days].sort();
+      syncWorldSource();
+    });
+    choices.appendChild(el("label", {}, [input, el("span", {}, name)]));
+  });
+  wrap.appendChild(choices);
+  return wrap;
+}
+
+function rewriteWorldReferences(collection, previous, next) {
+  if (!previous || previous === next) return;
+  const draft = cfgState.worldDraft;
+  if (collection === "locations") {
+    for (const location of draft.locations) if (location.parent_id === previous) location.parent_id = next || null;
+    for (const actor of draft.actors) {
+      if (actor.home_location === previous) actor.home_location = next || null;
+      if (actor.location_id === previous) actor.location_id = next || null;
+    }
+    for (const routine of draft.routines) if (routine.location_id === previous) routine.location_id = next || null;
+    for (const fact of draft.facts) if (fact.location_id === previous) fact.location_id = next || null;
+  } else if (collection === "actors") {
+    if (draft.observer_id === previous) draft.observer_id = next;
+    for (const routine of draft.routines) if (routine.actor_id === previous) routine.actor_id = next || null;
+    for (const fact of draft.facts) if (fact.subject_id === previous) fact.subject_id = next || null;
+  }
+}
+
+function worldElementSummary(section, item, index) {
+  let title = item.name;
+  if (section.name === "routines") title = item.activity;
+  if (section.name === "facts") title = item.content;
+  title = String(title || `New ${section.singular}`).trim();
+  if (title.length > 72) title = title.slice(0, 69) + "…";
+  return el("summary", { class: "world-element-summary" }, [
+    el("span", { class: "world-element-icon", "aria-hidden": "true" }, section.icon),
+    el("span", { class: "world-element-title" }, title),
+    item.id ? el("code", {}, item.id) : el("span", { class: "world-missing-id" }, `#${index + 1}`),
+    el("span", { class: "world-chevron", "aria-hidden": "true" }, "⌄"),
+  ]);
+}
+
+function renderLocationFields(item) {
+  const locations = cfgState.worldDraft.locations;
+  return [
+    worldField(item, "name", "Name", { placeholder: "Research lab" }),
+    worldField(item, "id", "ID", {
+      placeholder: "research_lab", hint: "Stable identifier used by actors and routines.",
+      transform: (value) => value.trim(),
+      onCommit: (previous, next) => rewriteWorldReferences("locations", previous, next),
+    }),
+    worldField(item, "description", "Description", {
+      type: "textarea", wide: true, placeholder: "What this place is like…",
+    }),
+    worldField(item, "parent_id", "Inside / parent", {
+      type: "select", options: worldOptions(locations.filter((location) => location !== item)),
+    }),
+    worldField(item, "timezone", "Timezone override", { placeholder: "Europe/Rome", transform: (value) => value.trim() || null }),
+    worldField(item, "tags", "Tags", {
+      wide: true, placeholder: "indoors, science, private",
+      transform: (value) => value.split(",").map((tag) => tag.trim()).filter(Boolean),
+    }),
+  ];
+}
+
+function renderActorFields(item) {
+  const locations = cfgState.worldDraft.locations;
+  return [
+    worldField(item, "name", "Name", { placeholder: "Mayuri Shiina" }),
+    worldField(item, "id", "ID", {
+      placeholder: "mayuri", hint: "Stable identifier used by routines and facts.",
+      transform: (value) => value.trim(),
+      onCommit: (previous, next) => rewriteWorldReferences("actors", previous, next),
+    }),
+    worldField(item, "home_location", "Home location", {
+      type: "select", options: worldOptions(locations),
+      afterInput: (previous, next) => { if (!item.location_id || item.location_id === previous) item.location_id = next; },
+    }),
+    worldField(item, "timezone", "Timezone", { placeholder: cfgState.worldDraft.timezone || "UTC", transform: (value) => value.trim() || null }),
+    worldField(item, "public_activity", "Public activity", {
+      type: "checkbox", hint: "Other actors can see this actor's activity from elsewhere.", wide: true,
+    }),
+  ];
+}
+
+function renderRoutineFields(item) {
+  const draft = cfgState.worldDraft;
+  return [
+    worldField(item, "activity", "Activity", { placeholder: "working in the lab" }),
+    worldField(item, "id", "ID", { placeholder: "weekday_lab", transform: (value) => value.trim() }),
+    worldField(item, "actor_id", "Actor", { type: "select", options: worldOptions(draft.actors, { blank: "Choose an actor" }) }),
+    worldField(item, "activity_kind", "Kind", {
+      type: "select", options: WORLD_ACTIVITY_KINDS.map((kind) => ({ value: kind, label: kind })),
+    }),
+    worldField(item, "location_id", "Location", { type: "select", options: worldOptions(draft.locations) }),
+    worldField(item, "start_local", "Starts at", { type: "time" }),
+    worldField(item, "duration_minutes", "Duration (minutes)", { type: "number", min: 1, step: 5 }),
+    worldField(item, "priority", "Priority", { type: "number", step: 1, hint: "Higher wins when routines overlap." }),
+    worldDaysField(item),
+    worldField(item, "enabled", "Enabled", { type: "checkbox", hint: "Use this routine in the simulation." }),
+    worldField(item, "interruptible", "Interruptible", { type: "checkbox", hint: "Commands may interrupt this routine." }),
+  ];
+}
+
+function renderFactFields(item) {
+  const draft = cfgState.worldDraft;
+  return [
+    worldField(item, "content", "Fact", { type: "textarea", wide: true, placeholder: "The lab's front door locks after midnight." }),
+    worldField(item, "id", "ID", { placeholder: "lab_door", transform: (value) => value.trim() }),
+    worldField(item, "visibility", "Visibility", {
+      type: "select", options: [
+        { value: "known", label: "Known · always known by this character" },
+        { value: "public", label: "Public · visible to everyone" },
+        { value: "local", label: "Local · visible only at its location" },
+        { value: "private", label: "Private · stored but not perceived" },
+      ],
+    }),
+    worldField(item, "subject_id", "Subject actor", { type: "select", options: worldOptions(draft.actors) }),
+    worldField(item, "location_id", "Location", { type: "select", options: worldOptions(draft.locations) }),
+    worldField(item, "importance", "Importance", { type: "number", min: 0, max: 1, step: 0.05 }),
+  ];
+}
+
+function renderWorldElement(section, item, index) {
+  const key = `${section.name}:${index}`;
+  const isNew = cfgState.worldNew && cfgState.worldNew.collection === section.name && cfgState.worldNew.index === index;
+  const card = el("details", {
+    class: `world-element-card${isNew ? " is-new" : ""}`,
+    open: isNew || cfgState.worldOpen.has(key),
+  });
+  card.appendChild(worldElementSummary(section, item, index));
+  const body = el("div", { class: "world-element-body" });
+  const tools = el("div", { class: "world-element-tools" }, [
+    el("span", { class: "cfg-hint" }, `Edit ${section.singular}`),
+    el("button", {
+      class: "btn danger ghost tight", type: "button",
+      disabled: section.name === "actors" && item.id === cfgState.worldDraft.observer_id,
+      title: section.name === "actors" && item.id === cfgState.worldDraft.observer_id ? "The observer actor cannot be removed" : "",
+      onclick: () => removeWorldElement(section.name, index),
+    }, "Remove"),
+  ]);
+  body.appendChild(tools);
+  const fields = el("div", { class: "world-element-fields" });
+  let children = [];
+  if (section.name === "locations") children = renderLocationFields(item);
+  else if (section.name === "actors") children = renderActorFields(item);
+  else if (section.name === "routines") children = renderRoutineFields(item);
+  else children = renderFactFields(item);
+  for (const child of children) fields.appendChild(child);
+  body.appendChild(fields);
+  card.appendChild(body);
+  card.addEventListener("toggle", () => {
+    if (card.open) cfgState.worldOpen.add(key); else cfgState.worldOpen.delete(key);
+  });
+  return card;
+}
+
+function renderWorldElements() {
+  const root = $("cfg-world-elements");
+  clear(root);
+  if (!cfgState.worldDraft) return;
+  for (const section of WORLD_SECTIONS) {
+    const items = cfgState.worldDraft[section.name];
+    const group = el("section", { class: "world-element-group" });
+    group.appendChild(el("div", { class: "world-element-group-head" }, [
+      el("div", {}, [
+        el("span", { class: "world-element-group-icon", "aria-hidden": "true" }, section.icon),
+        el("strong", {}, section.title),
+        el("span", { class: "world-count" }, String(items.length)),
+      ]),
+      el("button", {
+        class: "btn ghost tight", type: "button", onclick: () => addWorldElement(section.name),
+      }, `＋ Add ${section.singular}`),
+    ]));
+    const list = el("div", { class: "world-element-list" });
+    if (!items.length) {
+      list.appendChild(el("button", {
+        class: "world-element-empty", type: "button", onclick: () => addWorldElement(section.name),
+      }, `No ${section.name} yet — add one`));
+    } else {
+      items.forEach((item, index) => list.appendChild(renderWorldElement(section, item, index)));
+    }
+    group.appendChild(list);
+    root.appendChild(group);
+  }
+  if (cfgState.worldNew) {
+    requestAnimationFrame(() => {
+      const card = root.querySelector(".world-element-card.is-new");
+      if (!card) return;
+      card.scrollIntoView({ behavior: "smooth", block: "center" });
+      const input = card.querySelector("input:not([type=checkbox]), textarea");
+      if (input) { input.focus(); if (input.select) input.select(); }
+      cfgState.worldNew = null;
+    });
+  }
+}
+
+function uniqueWorldId(collection, base) {
+  const used = new Set((cfgState.worldDraft[collection] || []).map((item) => item.id));
+  let id = base; let suffix = 2;
+  while (used.has(id)) id = `${base}_${suffix++}`;
+  return id;
+}
+
+function applyWorldSource() {
+  let parsed;
+  try { parsed = JSON.parse($("cfg-world-seed").value); }
+  catch (e) { throw new Error("The visual editor can apply JSON directly. Save valid YAML to import it."); }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("World source must be an object.");
+  cfgState.worldDraft = cloneWorldSeed(parsed);
+  cfgState.worldSourceDirty = false;
+  renderWorldElements();
+  syncWorldSource();
+  flash($("cfg-world-apply-source"), "Applied", true);
+}
+
+function ensureWorldDraft() {
+  if (cfgState.worldSourceDirty) applyWorldSource();
+  if (!cfgState.worldDraft) throw new Error("Load a world before adding elements.");
+}
+
+function addWorldElement(collection) {
+  try { ensureWorldDraft(); } catch (e) { showError(e.message); return; }
+  const draft = cfgState.worldDraft;
+  let item;
+  if (collection === "locations") {
+    const id = uniqueWorldId(collection, "new_location");
+    item = { id, name: "New location", description: "", parent_id: null, timezone: null, tags: [] };
+  } else if (collection === "actors") {
+    const id = uniqueWorldId(collection, "new_actor");
+    const home = draft.locations[0]?.id || null;
+    item = {
+      id, name: "New actor", home_location: home, location_id: home,
+      timezone: draft.timezone || "UTC", public_activity: false, features: {}, metadata: {},
+    };
+  } else if (collection === "routines") {
+    const id = uniqueWorldId(collection, "new_routine");
+    item = {
+      id, actor_id: draft.observer_id || draft.actors[0]?.id || null,
+      days: [0, 1, 2, 3, 4, 5, 6], start_local: "09:00", duration_minutes: 60,
+      location_id: draft.locations[0]?.id || null, activity_kind: "other",
+      activity: "new activity", priority: 0, interruptible: true, enabled: true,
+    };
+  } else {
+    const id = uniqueWorldId(collection, "new_fact");
+    item = { id, content: "", subject_id: null, location_id: null, visibility: "known", importance: 0.8 };
+  }
+  draft[collection].push(item);
+  cfgState.worldNew = { collection, index: draft[collection].length - 1 };
+  syncWorldSource();
+  renderWorldElements();
+}
+
+function removeWorldElement(collection, index) {
+  const draft = cfgState.worldDraft;
+  const item = draft[collection][index];
+  if (!item) return;
+  if (collection === "actors" && item.id === draft.observer_id) {
+    showError("The observer actor cannot be removed. Choose another observer in the advanced source first.");
+    return;
+  }
+  const label = item.name || item.activity || item.content || item.id || `this ${collection.slice(0, -1)}`;
+  if (!confirm(`Remove “${String(label).slice(0, 80)}” from the world? The change is applied when you save.`)) return;
+  draft[collection].splice(index, 1);
+  if (collection === "locations") rewriteWorldReferences("locations", item.id, null);
+  if (collection === "actors") {
+    draft.routines = draft.routines.filter((routine) => routine.actor_id !== item.id);
+    for (const fact of draft.facts) if (fact.subject_id === item.id) fact.subject_id = null;
+  }
+  cfgState.worldOpen.clear();
+  syncWorldSource();
+  renderWorldElements();
+}
+
+function renderWorldFeatures() {
+  const box = $("cfg-world-features"); clear(box);
+  const actorId = selectedWorldActor();
+  const actor = actorId && (cfgState.world.actors || []).find((a) => a.id === actorId);
+  const defaults = cfgState.world.seed.features || {};
+  const overrides = actor ? ((cfgState.world.seed.actors || []).find((a) => a.id === actorId)?.features || {}) : {};
+  for (const name of WORLD_FEATURES) {
+    const select = el("select", { class: "user-filter", "data-world-feature": name });
+    if (actorId) {
+      select.appendChild(el("option", { value: "" }, `inherit (${defaults[name] === false ? "off" : "on"})`));
+      select.appendChild(el("option", { value: "true" }, "on"));
+      select.appendChild(el("option", { value: "false" }, "off"));
+      select.value = Object.prototype.hasOwnProperty.call(overrides, name) ? String(!!overrides[name]) : "";
+    } else {
+      select.appendChild(el("option", { value: "true" }, "on"));
+      select.appendChild(el("option", { value: "false" }, "off"));
+      select.value = String(defaults[name] !== false);
+    }
+    box.appendChild(el("label", { class: "mem-row" }, [el("span", { class: "mem-row-title" }, name.replaceAll("_", " ")), select]));
+  }
+  const resolved = actor ? actor.resolved_features : defaults;
+  const commands = [];
+  if (resolved.locations !== false) commands.push("move");
+  if (resolved.activities !== false) commands.push("start_activity");
+  if (resolved.hunger !== false || resolved.activities !== false) commands.push("eat");
+  if (resolved.sleep !== false) commands.push("sleep", "wake");
+  const command = $("cfg-world-command"); clear(command);
+  for (const name of commands) command.appendChild(el("option", {}, name));
+  command.disabled = commands.length === 0;
+  $("cfg-world-command-run").disabled = commands.length === 0;
+}
+
+async function saveWorldFeatures() {
+  const actorId = selectedWorldActor();
+  const values = {};
+  document.querySelectorAll("[data-world-feature]").forEach((input) => {
+    values[input.dataset.worldFeature] = input.value === "" ? null : input.value === "true";
+  });
+  await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/world/features`, {
+    method: "PATCH", body: { actor_id: actorId, values },
+  });
+  await loadWorld();
+}
+
+async function saveWorldSeed() {
+  if (cfgState.worldSourceDirty) {
+    let parsed;
+    try { parsed = JSON.parse($("cfg-world-seed").value); }
+    catch (e) {
+      await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/world/import`, {
+        body: { content: $("cfg-world-seed").value },
+      });
+      await loadWorld();
+      flash($("cfg-world-save-seed"), "Saved", true);
+      return;
+    }
+    cfgState.worldDraft = cloneWorldSeed(parsed);
+  }
+  validateWorldDraft(cfgState.worldDraft);
+  await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/world/seed`, {
+    method: "PUT", body: cfgState.worldDraft,
+  });
+  await loadWorld();
+  flash($("cfg-world-save-seed"), "Saved", true);
+}
+
+function validateWorldDraft(seed) {
+  if (!seed || Array.isArray(seed) || typeof seed !== "object") throw new Error("World source must be an object.");
+  for (const { name, singular } of WORLD_SECTIONS) {
+    if (!Array.isArray(seed[name])) throw new Error(`${name} must be a list.`);
+    const ids = new Set();
+    seed[name].forEach((item, index) => {
+      if (!item || typeof item !== "object") throw new Error(`${singular} #${index + 1} must be an object.`);
+      const id = String(item.id || "").trim();
+      if (!id) throw new Error(`Every ${singular} needs an ID.`);
+      if (ids.has(id)) throw new Error(`Duplicate ${singular} ID: ${id}`);
+      ids.add(id);
+    });
+  }
+  const locationIds = new Set(seed.locations.map((item) => item.id));
+  const actorIds = new Set(seed.actors.map((item) => item.id));
+  if (!actorIds.has(seed.observer_id)) throw new Error(`Observer actor “${seed.observer_id || ""}” does not exist.`);
+  for (const location of seed.locations) {
+    if (!String(location.name || "").trim()) throw new Error(`Location “${location.id}” needs a name.`);
+    if (location.parent_id && !locationIds.has(location.parent_id)) throw new Error(`Location “${location.id}” has an unknown parent.`);
+    if (location.parent_id === location.id) throw new Error(`Location “${location.id}” cannot be its own parent.`);
+  }
+  for (const actor of seed.actors) {
+    if (!String(actor.name || "").trim()) throw new Error(`Actor “${actor.id}” needs a name.`);
+    if (actor.home_location && !locationIds.has(actor.home_location)) throw new Error(`Actor “${actor.id}” has an unknown home location.`);
+  }
+  for (const routine of seed.routines) {
+    if (!actorIds.has(routine.actor_id)) throw new Error(`Routine “${routine.id}” needs a valid actor.`);
+    if (routine.location_id && !locationIds.has(routine.location_id)) throw new Error(`Routine “${routine.id}” has an unknown location.`);
+    if (!WORLD_ACTIVITY_KINDS.includes(routine.activity_kind)) throw new Error(`Routine “${routine.id}” has an unknown activity kind.`);
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(routine.start_local || ""))) throw new Error(`Routine “${routine.id}” needs a valid start time.`);
+    if (!Number.isFinite(Number(routine.duration_minutes)) || Number(routine.duration_minutes) < 1) throw new Error(`Routine “${routine.id}” needs a positive duration.`);
+  }
+  for (const fact of seed.facts) {
+    if (!String(fact.content || "").trim()) throw new Error(`Fact “${fact.id}” needs content.`);
+    if (fact.subject_id && !actorIds.has(fact.subject_id)) throw new Error(`Fact “${fact.id}” has an unknown subject actor.`);
+    if (fact.location_id && !locationIds.has(fact.location_id)) throw new Error(`Fact “${fact.id}” has an unknown location.`);
+  }
+}
+
+function importWorldSource(content) {
+  $("cfg-world-seed").value = content;
+  cfgState.worldSourceDirty = true;
+  markWorldDirty();
+  try {
+    const parsed = JSON.parse(content);
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("World source must be an object.");
+    cfgState.worldDraft = cloneWorldSeed(parsed);
+    cfgState.worldSourceDirty = false;
+    renderWorldElements();
+    syncWorldSource();
+  } catch (e) {
+    $("cfg-world-source-panel").open = true;
+  }
+}
+
+function exportWorld() {
+  const content = cfgState.worldSourceDirty
+    ? $("cfg-world-seed").value
+    : JSON.stringify(cfgState.worldDraft || {}, null, 2);
+  const blob = new Blob([content], { type: "application/json" });
+  const link = document.createElement("a"); link.href = URL.createObjectURL(blob);
+  link.download = `${cfgState.active || "character"}-world.json`; link.click(); URL.revokeObjectURL(link.href);
+}
+
+async function advanceWorld() {
+  await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/world/advance`);
+  await loadWorld();
+}
+
+async function applyWorldCommand() {
+  const kind = $("cfg-world-command").value;
+  const value = $("cfg-world-command-value").value.trim();
+  const body = { kind, actor_id: selectedWorldActor() || cfgState.world.snapshot.observer_id };
+  if (kind === "move") body.location_id = value;
+  if (kind === "start_activity") { body.activity_kind = "other"; body.activity = value; }
+  await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/world/commands`, { body });
+  await loadWorld();
+}
+
 // --------------------------------------------------------------- new / delete
 function newCharacter() {
   // The 5-step wizard owns creation; opens a modal.
@@ -165,6 +743,7 @@ function renderConfig() {
       ? cfg.memory.knowledge_graph_token_budget
       : 1000
   );
+  renderSectionOrder(cfg.section_order || DEFAULT_SECTION_ORDER);
 }
 
 function renderMemoryList(mem) {
@@ -185,6 +764,8 @@ function renderMemoryList(mem) {
     });
     toggle.addEventListener("change", () => {
       kInput.disabled = !toggle.checked;
+      if (toggle.checked) ensureSectionIncluded(m.name);
+      refreshSectionOrderRows();
       dirtyMemory();
     });
     box.appendChild(el("label", { class: "mem-row" }, [
@@ -196,6 +777,81 @@ function renderMemoryList(mem) {
       ]) : null,
     ]));
   }
+}
+
+function sectionEnabled(name) {
+  if (name === "knowledge_graph") return !!$("cfg-kg").checked;
+  const toggle = document.querySelector(`.switch-input[data-mem="${name}"]`);
+  return !!(toggle && toggle.checked);
+}
+
+function renderSectionOrder(order) {
+  const box = $("cfg-section-order"); clear(box);
+  const requested = Array.isArray(order)
+    ? order.filter((name, index) => SECTION_TITLES[name] && order.indexOf(name) === index)
+    : [...DEFAULT_SECTION_ORDER];
+  const included = new Set(requested);
+  const names = [...requested, ...DEFAULT_SECTION_ORDER.filter((name) => !included.has(name))];
+  for (const name of names) {
+    const include = el("input", {
+      type: "checkbox", checked: included.has(name), "data-section-include": name,
+      title: `Include ${SECTION_TITLES[name]} in /context`,
+      "aria-label": `Include ${SECTION_TITLES[name]} in /context`,
+    });
+    include.addEventListener("change", () => { refreshSectionOrderRows(); dirtyMemory(); });
+    const row = el("div", { class: "cfg-section-row", "data-section-name": name }, [
+      el("span", { class: "cfg-section-position", "aria-hidden": "true" }),
+      include,
+      el("span", { class: "cfg-section-title" }, SECTION_TITLES[name]),
+      el("span", { class: "cfg-section-status" }),
+      el("span", { class: "cfg-section-actions" }, [
+        el("button", {
+          type: "button", class: "cfg-section-move", "data-direction": "up",
+          title: `Move ${SECTION_TITLES[name]} up`, "aria-label": `Move ${SECTION_TITLES[name]} up`,
+          onclick: () => moveSectionRow(row, -1),
+        }, "↑"),
+        el("button", {
+          type: "button", class: "cfg-section-move", "data-direction": "down",
+          title: `Move ${SECTION_TITLES[name]} down`, "aria-label": `Move ${SECTION_TITLES[name]} down`,
+          onclick: () => moveSectionRow(row, 1),
+        }, "↓"),
+      ]),
+    ]);
+    box.appendChild(row);
+  }
+  refreshSectionOrderRows();
+}
+
+function moveSectionRow(row, direction) {
+  const sibling = direction < 0 ? row.previousElementSibling : row.nextElementSibling;
+  if (!sibling) return;
+  if (direction < 0) row.parentNode.insertBefore(row, sibling);
+  else row.parentNode.insertBefore(sibling, row);
+  refreshSectionOrderRows();
+  dirtyMemory();
+}
+
+function refreshSectionOrderRows() {
+  const rows = [...document.querySelectorAll("#cfg-section-order .cfg-section-row")];
+  let includedPosition = 0;
+  rows.forEach((row, index) => {
+    const name = row.dataset.sectionName;
+    const enabled = sectionEnabled(name);
+    const included = row.querySelector("[data-section-include]").checked;
+    row.classList.toggle("is-disabled", !enabled);
+    row.classList.toggle("is-excluded", !included);
+    row.querySelector(".cfg-section-position").textContent = included
+      ? String(++includedPosition).padStart(2, "0") : "—";
+    const status = row.querySelector(".cfg-section-status");
+    status.textContent = !enabled ? "memory off" : included ? "included" : "omitted";
+    row.querySelector('[data-direction="up"]').disabled = index === 0;
+    row.querySelector('[data-direction="down"]').disabled = index === rows.length - 1;
+  });
+}
+
+function ensureSectionIncluded(name) {
+  const include = document.querySelector(`[data-section-include="${name}"]`);
+  if (include && !include.checked) include.checked = true;
 }
 
 function dirtyMemory() {
@@ -218,7 +874,15 @@ function gatherConfig() {
   if (!Number.isNaN(kgTokenBudget)) {
     mem.knowledge_graph_token_budget = Math.max(0, kgTokenBudget);
   }
-  return { persona: $("cfg-persona").value, kg_enabled: $("cfg-kg").checked, memory: mem };
+  const sectionOrder = [...document.querySelectorAll("#cfg-section-order .cfg-section-row")]
+    .filter((row) => row.querySelector("[data-section-include]").checked)
+    .map((row) => row.dataset.sectionName);
+  return {
+    persona: $("cfg-persona").value,
+    kg_enabled: $("cfg-kg").checked,
+    memory: mem,
+    section_order: sectionOrder,
+  };
 }
 
 async function savePersona() {
@@ -465,6 +1129,7 @@ function setEditTab(name) {
   document.querySelectorAll(".edit-pane").forEach((p) => {
     p.classList.toggle("hidden", p.dataset.edit !== name);
   });
+  if (name === "world") loadWorld();
 }
 
 function setBucket(name) {
@@ -685,6 +1350,8 @@ function wire() {
   $("cfg-save-memory").addEventListener("click", saveMemory);
   $("cfg-kg").addEventListener("change", () => {
     $("cfg-kg-token-budget").disabled = !$("cfg-kg").checked;
+    if ($("cfg-kg").checked) ensureSectionIncluded("knowledge_graph");
+    refreshSectionOrderRows();
     dirtyMemory();
   });
   $("cfg-kg-token-budget").addEventListener("input", dirtyMemory);
@@ -704,6 +1371,27 @@ function wire() {
     e.target.value = "";  // allow re-uploading the same file
   });
   $("cfg-rebuild").addEventListener("click", rebuild);
+  $("cfg-world-actor").addEventListener("change", renderWorldFeatures);
+  $("cfg-world-save-features").addEventListener("click", () => saveWorldFeatures().catch((e) => showError(e.message)));
+  $("cfg-world-save-seed").addEventListener("click", () => saveWorldSeed().catch((e) => showError(e.message)));
+  document.querySelectorAll("[data-world-add]").forEach((button) => {
+    button.addEventListener("click", () => addWorldElement(button.dataset.worldAdd));
+  });
+  $("cfg-world-apply-source").addEventListener("click", () => {
+    try { applyWorldSource(); } catch (e) { showError(e.message); flash($("cfg-world-apply-source"), "Invalid", false); }
+  });
+  $("cfg-world-seed").addEventListener("input", () => {
+    cfgState.worldSourceDirty = true;
+    markWorldDirty();
+  });
+  $("cfg-world-advance").addEventListener("click", () => advanceWorld().catch((e) => showError(e.message)));
+  $("cfg-world-command-run").addEventListener("click", () => applyWorldCommand().catch((e) => showError(e.message)));
+  $("cfg-world-export").addEventListener("click", exportWorld);
+  $("cfg-world-import").addEventListener("click", () => $("cfg-world-import-file").click());
+  $("cfg-world-import-file").addEventListener("change", async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    importWorldSource(await file.text()); e.target.value = "";
+  });
 
   // Chat
   $("chat-form").addEventListener("submit", (e) => {
