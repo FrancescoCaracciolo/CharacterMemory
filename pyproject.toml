@@ -65,5 +65,7 @@ exclude = ["examples*", "tests*", "assets*"]
 
 # Ship the memory-browser GUI static assets inside the wheel so
 # `GET /gui` works after `pip install charactermemory[server]`.
+# `vendor/*.js` carries the vendored Lucide icon bundle — subdirectory files
+# are NOT matched by the top-level `*.js` glob, so it needs its own entry.
 [tool.setuptools.package-data]
-"character_memory.server.static" = ["*.html", "*.js", "*.css", "*.json"]
+"character_memory.server.static" = ["*.html", "*.js", "*.css", "*.json", "vendor/*.js"]

@@ -220,6 +220,11 @@ class MemoryConfig:
     extract_interval: int = 5
     # Decay half-life (seconds). Used by facts/episodic/heartbeat.
     decay_half_life: float = 60 * 60 * 24 * 3 # Three days
+    # How recalled items are timestamped in the prompt: "none", "absolute"
+    # (short local date+time, e.g. [2026-08-14 09:30]), "relative" (humanized
+    # age, e.g. [2 days ago]) or "both" (e.g. [2026-08-12 16:33 (2 days ago)]).
+    # Memories whose items carry no timestamp are rendered unchanged.
+    timestamp_style: str = "both"
 
     # EMOTIONS
     # Baseline (user-independent) emotion vector.

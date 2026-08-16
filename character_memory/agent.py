@@ -363,6 +363,11 @@ class CharacterAgent:
                 token_budget=m.knowledge_graph_token_budget,
             )
 
+        # Prompt timestamp rendering (see Memory.format / format_item_timestamp)
+        # is set once here rather than threaded through every constructor.
+        for mem in self.memories.values():
+            mem.timestamp_style = m.timestamp_style
+
     def _wire_character(self) -> None:
         self._limits = {
             name: (

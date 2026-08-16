@@ -30,7 +30,7 @@ from ..emotion_vectors import (
     emotion_similarity,
     emotional_impact,
 )
-from ..memory.base import MemoryItem
+from ..memory.base import MemoryItem, item_bullet
 from ..memory.dedup import DedupReport
 from ..memory.emotion import EmotionStatus
 from ..memory.episodic import EpisodicMemory
@@ -663,14 +663,17 @@ class KnowledgeGraphRetriever:
         user_id: Optional[str] = None,
         token_budget: int = 1_000,
         state_changing: bool = True,
+        timestamp_style: str = "both",
     ) -> list[MemoryItem]:
         """Return activation-ranked nodes that fit within ``token_budget``.
 
         The budget covers the exact bullet-list body injected into the prompt
-        (``- node text`` lines), not an arbitrary number of nodes. Nodes are
-        considered in activation order and retrieval stops before the first
-        node that would make the rendered body exceed the budget. A
-        non-positive budget returns no items.
+        (``- node text`` lines, including any timestamp stamps), not an
+        arbitrary number of nodes. Nodes are considered in activation order
+        and retrieval stops before the first node that would make the rendered
+        body exceed the budget. A non-positive budget returns no items.
+        `timestamp_style` must match the one the caller will render with so
+        the measurement and the final body agree.
 
         When `state_changing` is True (the default) the surfaced nodes get a
         practice event appended and the Hebbian step strengthens the
@@ -694,7 +697,9 @@ class KnowledgeGraphRetriever:
             if node is None:
                 continue
             item = self._node_to_item(node, a)
-            if _count_tokens(self.format_items([*items, item])) > budget:
+            if _count_tokens(
+                self.format_items([*items, item], timestamp_style=timestamp_style)
+            ) > budget:
                 break
             items.append(item)
             surfaced_ids.append(nid)
@@ -737,7 +742,7 @@ class KnowledgeGraphRetriever:
 
     # --------------------------------------------------------------- rendering
     @staticmethod
-    def format_items(items: list[MemoryItem]) -> str:
+    def format_items(items: list[MemoryItem], timestamp_style: str = "both") -> str:
         """Render recalled nodes exactly as they appear in the KG section."""
         order = {"person": 0, "fact": 1, "episode": 2, "entity": 3, "self": 4}
         ranked = sorted(
@@ -747,7 +752,7 @@ class KnowledgeGraphRetriever:
                 -item.score,
             ),
         )
-        return "\n".join(f"- {item.text}" for item in ranked)
+        return "\n".join(item_bullet(item, timestamp_style) for item in ranked)
 
     def _node_to_item(self, node: Node, activation: float) -> MemoryItem:
         """Render a node into a prompt-friendly MemoryItem."""
@@ -770,6 +775,11 @@ class KnowledgeGraphRetriever:
             "node_kind": kind,
             "activation": float(activation),
         }
+        # Surfaced so prompt rendering can stamp the node's age (see
+        # item_bullet); None on nodes never assigned a creation time.
+        created_at = getattr(node, "created_at", None)
+        if created_at is not None:
+            metadata["created_at"] = float(created_at)
         shift = getattr(node, "emotional_shift", None)
         if isinstance(shift, dict):
             self_node = self.graph.nodes.get(self.graph.SELF_ID)

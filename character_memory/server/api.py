@@ -32,6 +32,12 @@ Characters are discovered from the ``assets/`` directory at startup: every
 subdirectory of ``assets/`` (e.g. ``assets/Kurisu``) becomes an available
 character keyed by its folder name. Override the assets root with the
 ``CM_ASSETS_DIR`` environment variable.
+
+Optionally require an API key on every endpoint with the ``CM_API_KEY``
+environment variable (or the ``--api-key`` flag of the console script):
+unset/empty means no auth. See :mod:`.auth` for the accepted credential
+forms (Bearer / X-API-Key header, ``?api_key=`` query parameter) and the
+public ``/gui`` paths.
 """
 
 from __future__ import annotations
@@ -69,6 +75,10 @@ from .mcp import build_router as build_mcp_router
 # chat) that back the Configure tab of the GUI. Reads live in `adapters.py`.
 from .admin import build_admin_router as build_admin_router_impl
 from .admin import build_jobs_router as build_jobs_router_impl
+# Optional API-key gate: when CM_API_KEY (or --api-key) configures at least
+# one key, every endpoint below requires it — see auth.py for the accepted
+# credential forms and the /gui public paths.
+from .auth import APIKeyMiddleware, parse_api_keys, read_api_keys
 # Background cache synchronizer: reloads in-RAM hybrid indexes + the KG graph
 # when another process (the Discord bot, the CLI, a second worker) writes to
 # the shared per-character save_directory.
@@ -92,6 +102,12 @@ SAVE_ROOT = os.environ.get("CM_SAVE_DIR", os.path.join(os.getcwd(), ".cm_servers
 SYNC_INTERVAL = float(os.environ.get("CM_SYNC_INTERVAL", "3.0"))
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# Accepted API keys (CM_API_KEY, comma-separated). Empty list = auth off.
+# Kept as a mutable module-level list so main()'s --api-key flag can turn
+# auth on in-process (the module — and its middleware — is already built by
+# the time main() runs); the middleware holds this same list by reference.
+API_KEYS: list[str] = read_api_keys()
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +269,12 @@ class MemoryMutationRequest(BaseModel):
 # App + handlers.
 # --------------------------------------------------------------------------- #
 app = FastAPI(title="CharacterMemory server")
+
+# Optional API-key gate, ahead of every route and mount below (the HTTP API,
+# /api/... admin + memory browser endpoints, /mcp and the GUI's data calls).
+# With no key configured this is a pass-through; /gui and /gui/static stay
+# public so the (data-less) page shell can load and prompt for the key.
+app.add_middleware(APIKeyMiddleware, api_keys=API_KEYS)
 
 # Mount the MCP (Model Context Protocol) JSON-RPC 2.0 endpoint. Reads reuse
 # ``adapters.read_memory`` (semantic search + lexical fallback + pagination)
@@ -416,13 +438,16 @@ def gui() -> HTMLResponse:
     """Serve the single-page memory browser.
 
     The page talks to the `/api/memories/...` endpoints below. Characters are
-    listed via `GET /`.
+    listed via `GET /`. The HTML is served with `no-cache` (assets are
+    cache-busted via ``?v=`` query strings, the shell must always revalidate)
+    so a browser never keeps an index.html that references assets which no
+    longer exist.
     """
     index = os.path.join(STATIC_DIR, "index.html")
     if not os.path.isfile(index):
         raise HTTPException(status_code=404, detail="GUI assets not built.")
     with open(index, encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+        return HTMLResponse(f.read(), headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/memories/{character}")
@@ -597,7 +622,37 @@ def main() -> None:  # pragma: no cover - manual run helper / console script
             "Default: load existing graphs (no rebuild)."
         ),
     )
+    parser.add_argument(
+        "--api-key", default=None, metavar="KEY",
+        help=(
+            "Require this API key on every endpoint (equivalent to setting "
+            "the CM_API_KEY environment variable; comma-separated for "
+            "several keys). Default: no auth."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.api_key is not None:
+        # Bridge to a uvicorn worker subprocess (the --reload re-import path)
+        # which reads CM_API_KEY at import time...
+        os.environ["CM_API_KEY"] = args.api_key
+        # ...and to the in-process path (reload off, the default): the app
+        # and its middleware were built at module import time, before main()
+        # ran, so flip them on directly. Same shape as --rebuild-kg below.
+        # Mutate through the canonical module object: under ``python -m
+        # character_memory.server.api`` this file runs as ``__main__`` while
+        # uvicorn serves the ``character_memory.server.api`` copy imported by
+        # the package ``__init__`` — updating the local name would only touch
+        # the ``__main__`` copy and the served app would stay keyless.
+        import character_memory.server.api as api_module
+        api_module.API_KEYS[:] = parse_api_keys(args.api_key)
+        if not api_module.API_KEYS:
+            print("[charactermemory] --api-key given but empty: auth stays off.")
+        else:
+            print(
+                f"[charactermemory] API key auth enabled "
+                f"({len(api_module.API_KEYS)} key(s) accepted)."
+            )
 
     # A KG rebuild runs an expensive LLM extraction pass; default to no reload
     # when --rebuild-kg is given so it isn't re-triggered on every file change.

@@ -16,14 +16,16 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=section-order-1">
-  <!-- The knowledge-graph view is a self-contained canvas force-renderer (no CDN). -->
+  <link rel="stylesheet" href="/gui/static/styles.css?v=icons-1">
+  <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
+       placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
+       The knowledge-graph view stays a self-contained canvas force-renderer. -->
 </head>
 <body>
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <span class="logo" aria-hidden="true">M</span>
+        <span class="logo" aria-hidden="true">M<i data-lucide="sparkle" class="icon logo-sparkle"></i></span>
         <span class="brand-copy"><b>Mnemosyne</b><small>character memory clubhouse</small></span>
       </div>
       <nav class="tabbar" role="tablist" aria-label="View">
@@ -40,19 +42,20 @@
           <span class="theme-switch-label" aria-hidden="true">Theme</span>
           <input id="theme-toggle" type="checkbox" role="switch" aria-label="Use dark theme">
           <span class="theme-track" aria-hidden="true">
-            <span class="theme-sun">☀</span>
-            <span class="theme-moon">☾</span>
+            <span class="theme-sun"><i data-lucide="sun" class="icon"></i></span>
+            <span class="theme-moon"><i data-lucide="moon" class="icon"></i></span>
             <span class="theme-knob"></span>
           </span>
         </label>
-        <button id="refresh" class="btn icon-btn" title="Reload overview" aria-label="Reload overview">↻</button>
+        <button id="refresh" class="btn icon-btn" title="Reload overview" aria-label="Reload overview"><i data-lucide="refresh-cw" class="icon"></i></button>
+        <button id="api-key-btn" class="btn icon-btn" type="button" title="API key" aria-label="Set the server API key"><i data-lucide="key-round" class="icon"></i></button>
         <a class="btn ghost api-link" href="/" title="JSON index">API</a>
       </div>
     </header>
 
     <div class="main">
       <aside class="sidebar">
-        <div class="side-label"><span>Memory drawers</span><span id="memory-total">—</span></div>
+        <div class="side-label"><span><i data-lucide="sparkle" class="icon side-label-ico"></i>Memory drawers</span><span id="memory-total">—</span></div>
         <div class="side-head">
           <input id="memory-filter" class="filter-input" placeholder="Filter memories…" autocomplete="off">
         </div>
@@ -68,11 +71,11 @@
             <span id="mem-disabled" class="chip warn-chip hidden">disabled</span>
           </div>
           <div class="tools">
-            <button id="add-memory" class="btn primary add-memory hidden" type="button">＋ Add memory</button>
+            <button id="add-memory" class="btn primary add-memory hidden" type="button"><i data-lucide="plus" class="icon"></i><span class="btn-label">Add memory</span></button>
             <div class="search">
-              <span class="search-ico">⌕</span>
+              <span class="search-ico"><i data-lucide="search" class="icon"></i></span>
               <input id="q" placeholder="Search this memory…" autocomplete="off" spellcheck="false">
-              <button id="q-clear" class="q-clear hidden" title="Clear search" aria-label="Clear search">×</button>
+              <button id="q-clear" class="q-clear hidden" title="Clear search" aria-label="Clear search"><i data-lucide="x" class="icon"></i></button>
             </div>
             <select id="user-filter" class="user-filter" title="Filter by user"></select>
           </div>
@@ -82,29 +85,29 @@
         <div id="graph-view" class="graph-view hidden">
           <div class="graph-controls">
             <div class="search">
-              <span class="search-ico">⌕</span>
+              <span class="search-ico"><i data-lucide="search" class="icon"></i></span>
               <input id="graph-q" placeholder="Activate the graph by query…" autocomplete="off" spellcheck="false">
-              <button id="graph-q-clear" class="q-clear hidden" title="Clear" aria-label="Clear activation query">×</button>
+              <button id="graph-q-clear" class="q-clear hidden" title="Clear" aria-label="Clear activation query"><i data-lucide="x" class="icon"></i></button>
             </div>
             <select id="graph-user" class="user-filter" title="Bias a user's PersonNode"></select>
-            <button id="graph-full" class="btn ghost" title="Show the whole graph and highlight retrieved nodes">◯ full graph</button>
+            <button id="graph-full" class="btn ghost" title="Show the whole graph and highlight retrieved nodes"><i data-lucide="circle-dashed" class="icon"></i><span class="btn-label">full graph</span></button>
             <span id="graph-meta" class="graph-meta"></span>
             <div class="graph-ctl-spacer"></div>
-            <button id="graph-freeze" class="btn ghost" title="Pause / resume physics (space)">❚❚ freeze</button>
-            <button id="graph-fit" class="btn ghost" title="Fit graph to view">⤢ fit</button>
-            <button id="graph-repel" class="btn ghost" title="Re-run layout">↻ relayout</button>
-            <button id="graph-settings-btn" class="btn ghost" type="button" title="Graph settings" aria-controls="graph-settings" aria-expanded="false">⚙ settings</button>
+            <button id="graph-freeze" class="btn ghost" title="Pause / resume physics (space)"><i data-lucide="pause" class="icon"></i><span class="btn-label">freeze</span></button>
+            <button id="graph-fit" class="btn ghost" title="Fit graph to view"><i data-lucide="maximize" class="icon"></i><span class="btn-label">fit</span></button>
+            <button id="graph-repel" class="btn ghost" title="Re-run layout"><i data-lucide="refresh-ccw" class="icon"></i><span class="btn-label">relayout</span></button>
+            <button id="graph-settings-btn" class="btn ghost" type="button" title="Graph settings" aria-controls="graph-settings" aria-expanded="false"><i data-lucide="settings" class="icon"></i><span class="btn-label">settings</span></button>
           </div>
           <div class="graph-split">
             <div class="graph-canvas-wrap">
               <canvas id="cy" class="graph-cy" tabindex="0" aria-label="Interactive knowledge graph. Drag to pan, pinch or use the zoom buttons to zoom, and tap a node for details."></canvas>
               <div id="graph-overlay" class="graph-overlay"></div>
               <div class="graph-nav" role="group" aria-label="Graph zoom controls">
-                <button id="graph-zoom-in" class="graph-nav-btn" type="button" title="Zoom in" aria-label="Zoom in">＋</button>
-                <button id="graph-zoom-out" class="graph-nav-btn" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+                <button id="graph-zoom-in" class="graph-nav-btn" type="button" title="Zoom in" aria-label="Zoom in"><i data-lucide="plus" class="icon"></i></button>
+                <button id="graph-zoom-out" class="graph-nav-btn" type="button" title="Zoom out" aria-label="Zoom out"><i data-lucide="minus" class="icon"></i></button>
               </div>
               <div id="graph-settings" class="graph-settings hidden" role="region" aria-label="Graph settings" aria-hidden="true">
-                <div class="gs-title">Graph settings <button id="gs-close" class="gs-close" type="button" title="Hide panel" aria-label="Close graph settings">×</button></div>
+                <div class="gs-title">Graph settings <button id="gs-close" class="gs-close" type="button" title="Hide panel" aria-label="Close graph settings"><i data-lucide="x" class="icon"></i></button></div>
                 <label class="gs-row">
                   <span class="gs-label">Repulsion</span>
                   <span class="gs-val" id="gs-repulsion-val">3200</span>
@@ -184,7 +187,7 @@
         </div>
         <div class="live-head-actions">
           <span id="live-follow-label" class="live-follow-label">Following latest</span>
-          <button id="live-follow" class="btn ghost" type="button">↟ Follow latest</button>
+          <button id="live-follow" class="btn ghost" type="button"><i data-lucide="arrow-up-to-line" class="icon"></i><span class="btn-label">Follow latest</span></button>
           <button id="live-expand" class="btn ghost" type="button">Expand all</button>
           <button id="live-collapse" class="btn ghost" type="button">Collapse all</button>
         </div>
@@ -197,7 +200,7 @@
           <div class="live-panel-label"><span>Recent requests</span><span id="live-history-count">0 / 25</span></div>
           <div id="live-timeline" class="live-timeline" aria-label="Recent context requests"></div>
           <div id="live-timeline-empty" class="live-empty live-timeline-empty">
-            <span class="live-empty-mark">◌</span>
+            <span class="live-empty-mark"><i data-lucide="radar" class="icon"></i></span>
             <span>Waiting for a <code>POST /context</code> request…</span>
           </div>
         </aside>
@@ -205,7 +208,7 @@
           <div id="live-request" class="live-request hidden"></div>
           <div id="live-recalls" class="live-recalls"></div>
           <div id="live-empty" class="live-empty hidden">
-            <span class="live-empty-mark">◌</span>
+            <span class="live-empty-mark"><i data-lucide="radar" class="icon"></i></span>
             <strong>No context request yet</strong>
             <span>Keep this tab open while your client chats with the character.</span>
           </div>
@@ -219,7 +222,7 @@
             <select id="live-graph-user" class="user-filter hidden" title="Choose participant graph"></select>
           </div>
           <div id="live-graph-empty" class="live-empty">
-            <span class="live-empty-mark">◇</span>
+            <span class="live-empty-mark"><i data-lucide="share-2" class="icon"></i></span>
             <strong>Knowledge graph idle</strong>
             <span>When graph memory is recalled, its activation cloud will appear here.</span>
           </div>
@@ -228,8 +231,8 @@
               <canvas id="live-cy" class="graph-cy" tabindex="0" aria-label="Knowledge graph activation for the selected context request"></canvas>
               <div id="live-graph-overlay" class="graph-overlay"></div>
               <div class="graph-nav live-graph-nav" role="group" aria-label="Live graph zoom controls">
-                <button id="live-zoom-in" class="graph-nav-btn" type="button" title="Zoom in" aria-label="Zoom in">＋</button>
-                <button id="live-zoom-out" class="graph-nav-btn" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+                <button id="live-zoom-in" class="graph-nav-btn" type="button" title="Zoom in" aria-label="Zoom in"><i data-lucide="plus" class="icon"></i></button>
+                <button id="live-zoom-out" class="graph-nav-btn" type="button" title="Zoom out" aria-label="Zoom out"><i data-lucide="minus" class="icon"></i></button>
               </div>
             </div>
             <aside class="live-graph-side">
@@ -257,7 +260,7 @@
             <div id="memory-editor-eyebrow" class="modal-eyebrow">New record</div>
             <h2 id="memory-editor-title">Add memory</h2>
           </div>
-          <button id="memory-editor-close" class="modal-close" type="button" aria-label="Close">×</button>
+          <button id="memory-editor-close" class="modal-close" type="button" aria-label="Close"><i data-lucide="x" class="icon"></i></button>
         </header>
         <p id="memory-editor-note" class="memory-editor-note"></p>
         <div id="memory-fields" class="memory-fields"></div>
@@ -266,6 +269,28 @@
           <button id="memory-editor-cancel" class="btn ghost" type="button">Cancel</button>
           <span class="modal-spacer"></span>
           <button id="memory-editor-save" class="btn primary" type="submit">Save memory</button>
+        </footer>
+      </form>
+    </div>
+
+    <!-- API key dialog: shown when the server requires a key (401) or via
+         the key topbar button. The key is stored locally and sent with every
+         request; reload re-bootstraps all tabs with it applied. -->
+    <div id="api-key-overlay" class="api-key-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="api-key-title">
+      <form id="api-key-form" class="api-key-card">
+        <header class="api-key-head">
+          <h2 id="api-key-title"><i data-lucide="key-round" class="icon"></i> API key</h2>
+          <button id="api-key-close" class="modal-close" type="button" aria-label="Close"><i data-lucide="x" class="icon"></i></button>
+        </header>
+        <p id="api-key-hint" class="api-key-hint">
+          This server requires an API key. Paste the key configured as <code>CM_API_KEY</code> (or <code>--api-key</code>) on the server.
+        </p>
+        <input id="api-key-input" class="api-key-input" type="password" placeholder="Paste the API key…" autocomplete="off" spellcheck="false">
+        <p id="api-key-error" class="form-error hidden"></p>
+        <footer class="api-key-foot">
+          <button id="api-key-clear" class="btn ghost" type="button">Clear</button>
+          <span class="modal-spacer"></span>
+          <button id="api-key-save" class="btn primary" type="submit">Save key</button>
         </footer>
       </form>
     </div>
@@ -278,13 +303,13 @@
       <aside class="cfg-rail">
         <div class="cfg-rail-head">
           <span class="cfg-rail-title">Characters</span>
-          <button id="cfg-new" class="btn primary tight" title="Create a new character">+ New</button>
+          <button id="cfg-new" class="btn primary tight" title="Create a new character"><i data-lucide="plus" class="icon"></i><span class="btn-label">New</span></button>
         </div>
         <nav id="cfg-char-list" class="cfg-char-list" aria-label="Characters"></nav>
       </aside>
 
       <section id="cfg-empty" class="cfg-empty">
-        <div class="cfg-empty-big">◆</div>
+        <div class="cfg-empty-big"><i data-lucide="sparkles" class="icon"></i></div>
         <div class="cfg-empty-text">Select a character on the left — or click <b>+ New</b> to build one.</div>
       </section>
 
@@ -346,7 +371,7 @@
           <div class="cfg-block">
             <div class="cfg-block-head">
               <label class="cfg-label">Indexes</label>
-              <button id="cfg-rebuild" class="btn ghost">⟳ Rebuild indexes</button>
+              <button id="cfg-rebuild" class="btn ghost"><i data-lucide="refresh-cw" class="icon"></i><span class="btn-label">Rebuild indexes</span></button>
             </div>
             <div id="cfg-build-status" class="cfg-build-status"></div>
           </div>
@@ -385,10 +410,10 @@
               </div>
               <div class="world-add-bar" aria-label="Add a world element">
                 <span class="world-add-label">Quick add</span>
-                <button class="btn ghost tight" type="button" data-world-add="locations">＋ Location</button>
-                <button class="btn ghost tight" type="button" data-world-add="actors">＋ Actor</button>
-                <button class="btn ghost tight" type="button" data-world-add="routines">＋ Routine</button>
-                <button class="btn ghost tight" type="button" data-world-add="facts">＋ Fact</button>
+                <button class="btn ghost tight" type="button" data-world-add="locations"><i data-lucide="plus" class="icon"></i><span class="btn-label">Location</span></button>
+                <button class="btn ghost tight" type="button" data-world-add="actors"><i data-lucide="plus" class="icon"></i><span class="btn-label">Actor</span></button>
+                <button class="btn ghost tight" type="button" data-world-add="routines"><i data-lucide="plus" class="icon"></i><span class="btn-label">Routine</span></button>
+                <button class="btn ghost tight" type="button" data-world-add="facts"><i data-lucide="plus" class="icon"></i><span class="btn-label">Fact</span></button>
               </div>
               <div id="cfg-world-elements" class="world-elements"></div>
               <details id="cfg-world-source-panel" class="world-source-panel">
@@ -425,10 +450,10 @@
               <button class="bucket-btn" data-bucket="dialogues">Dialogues</button>
             </div>
             <label class="btn ghost upload-btn" title="Upload .md / .txt files">
-              ↑ Upload
+              <i data-lucide="upload" class="icon"></i> Upload
               <input id="cfg-upload" type="file" multiple accept=".md,.txt,text/markdown,text/plain" hidden>
             </label>
-            <button id="cfg-new-file" class="btn ghost">+ New file</button>
+            <button id="cfg-new-file" class="btn ghost"><i data-lucide="plus" class="icon"></i><span class="btn-label">New file</span></button>
           </div>
           <div class="files-split">
             <ul id="cfg-file-list" class="cfg-file-list" aria-label="Files"></ul>
@@ -469,7 +494,7 @@
             <div class="wiz-eyebrow">New character</div>
             <h2 id="wiz-title">Create a character</h2>
           </div>
-          <button id="wiz-close" class="wiz-close" title="Cancel" aria-label="Cancel">×</button>
+          <button id="wiz-close" class="wiz-close" title="Cancel" aria-label="Cancel"><i data-lucide="x" class="icon"></i></button>
         </header>
 
         <ol id="wiz-stepper" class="wiz-stepper">
@@ -495,7 +520,7 @@
         <section class="wiz-pane hidden" data-step="2">
           <p class="wiz-intro">Drop the character's lore, story or reference docs. Markdown is chunked by header. Optional — you can add files later.</p>
           <label class="btn ghost upload-btn" title="Upload wiki files">
-            ↑ Upload wiki files
+            <i data-lucide="upload" class="icon"></i> Upload wiki files
             <input id="wiz-wiki-upload" type="file" multiple accept=".md,.txt,text/markdown,text/plain" hidden>
           </label>
           <ul id="wiz-wiki-list" class="wiz-file-list" aria-label="Wiki files"></ul>
@@ -505,7 +530,7 @@
         <section class="wiz-pane hidden" data-step="3">
           <p class="wiz-intro">Drop dialogue transcripts. Each turn should be <code>Speaker: text</code>, separated by blank lines. Optional.</p>
           <label class="btn ghost upload-btn" title="Upload dialogue files">
-            ↑ Upload dialogue files
+            <i data-lucide="upload" class="icon"></i> Upload dialogue files
             <input id="wiz-dialogue-upload" type="file" multiple accept=".md,.txt,text/markdown,text/plain" hidden>
           </label>
           <ul id="wiz-dialogue-list" class="wiz-file-list" aria-label="Dialogue files"></ul>
@@ -530,13 +555,15 @@
         <footer class="wiz-foot">
           <button id="wiz-back" class="btn ghost">Back</button>
           <span class="wiz-spacer"></span>
-          <button id="wiz-next" class="btn primary">Next →</button>
+          <button id="wiz-next" class="btn primary"><span class="btn-label">Next</span><i data-lucide="arrow-right" class="icon"></i></button>
           <button id="wiz-build" class="btn primary hidden">Build</button>
         </footer>
       </div>
     </div>
   </div>
-  <script src="/gui/static/app.js?v=clubhouse-8"></script>
-  <script src="/gui/static/config.js?v=section-order-1"></script>
+  <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
+    onerror="console.error('[Mnemosyne] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
+  <script src="/gui/static/app.js?v=icons-1"></script>
+  <script src="/gui/static/config.js?v=icons-1"></script>
 </body>
 </html>

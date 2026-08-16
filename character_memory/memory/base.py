@@ -5,6 +5,7 @@ Every memory system subclasses `Memory`. The agent iterates the
 them. 
 """
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -14,6 +15,66 @@ from ..rag.base import Query
 
 if TYPE_CHECKING:  # avoid a circular import at runtime (extract.py imports base)
     from .extract import ExtractionContext
+
+
+def _relative_age(seconds: float) -> str:
+    """Humanized age for `seconds` elapsed ("just now", "3 days ago", …)."""
+    if seconds < 60:
+        return "just now"
+    steps = (
+        (60, 60, "minute"),
+        (3600, 24, "hour"),
+        (86400, 7, "day"),
+        (604800, 5, "week"),
+        (2592000, 12, "month"),
+    )
+    for threshold, per_step, unit in steps:
+        if seconds < threshold * per_step:
+            n = max(1, int(seconds // threshold))
+            return f"{n} {unit}{'s' if n != 1 else ''} ago"
+    years = max(1, int(seconds // 31536000))
+    return f"{years} year{'s' if years != 1 else ''} ago"
+
+
+def format_item_timestamp(
+    metadata: dict, style: str = "both", now: Optional[float] = None
+) -> str:
+    """Render the timestamp label for a recalled item's metadata, or "".
+
+    Prefers ``occurred_at`` (when the thing happened — conversation events,
+    world records) over ``created_at`` (when the memory was learned). The
+    label is returned bare (no brackets); callers wrap it as they see fit.
+    Returns "" when no timestamp is available or `style` is "none"/unknown,
+    so memories without timestamps render exactly as before.
+
+    `style`: "absolute" (short local date+time, like dedup's judge prompts),
+    "relative" (humanized age), "both" (absolute with the age in parentheses).
+    """
+    ts = metadata.get("occurred_at") or metadata.get("created_at")
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    parts: list[str] = []
+    if style in ("absolute", "both"):
+        parts.append(time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)))
+    if style in ("relative", "both"):
+        parts.append(_relative_age(max(0.0, (now if now is not None else time.time()) - ts)))
+    if not parts:
+        return ""
+    if len(parts) == 2:
+        return f"{parts[0]} ({parts[1]})"
+    return parts[0]
+
+
+def item_bullet(it: "MemoryItem", style: str) -> str:
+    """One `- {text}` bullet, stamped with `[ {timestamp} ]` when available.
+
+    Shared by :meth:`Memory.format` / :meth:`Memory.format_grouped` and the
+    knowledge-graph renderer so every prompt section stamps alike.
+    """
+    label = format_item_timestamp(it.metadata, style)
+    return f"- {it.text} [{label}]" if label else f"- {it.text}"
 
 
 class MemoryScope(str, Enum):
@@ -105,6 +166,14 @@ class Memory(ABC):
     #: recall out across a multi-participant chat.
     scope: MemoryScope = MemoryScope.PER_USER
 
+    #: How recalled items are timestamped in the prompt. One of "none",
+    #: "absolute" (short local date+time), "relative" (humanized age) or
+    #: "both"; see :func:`format_item_timestamp`. Items whose metadata carries
+    #: no timestamp are rendered unchanged. The agent sets this from
+    #: :attr:`MemoryConfig.timestamp_style`; direct ``Character(memories=...)``
+    #: callers keep this default or set it themselves.
+    timestamp_style: str = "both"
+
     def __init__(self, *, enabled: bool = True, name: Optional[str] = None) -> None:
         self.enabled = enabled
         if name is not None:
@@ -150,7 +219,7 @@ class Memory(ABC):
 
     def format(self, items: list[MemoryItem]) -> str:
         """Render recalled `items` into a prompt fragment (override me)."""
-        return "\n".join(f"- {it.text}" for it in items)
+        return "\n".join(item_bullet(it, self.timestamp_style) for it in items)
 
     def build_section(
         self, query: Query, user_id: str, limit: int, state_changing: bool = True
@@ -239,10 +308,10 @@ class Memory(ABC):
         order = [u for u in participants if u in by_user]
         order += [u for u in by_user if u not in order]
         for uid in order:
-            body = "\n".join(f"- {it.text}" for it in by_user[uid])
+            body = "\n".join(item_bullet(it, self.timestamp_style) for it in by_user[uid])
             blocks.append(f"About {uid}:\n{body}")
         if unattributed:
-            body = "\n".join(f"- {it.text}" for it in unattributed)
+            body = "\n".join(item_bullet(it, self.timestamp_style) for it in unattributed)
             blocks.append(body)
         return "\n\n".join(blocks)
 

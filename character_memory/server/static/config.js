@@ -21,7 +21,7 @@
 "use strict";
 (function () {
 const U = window.cmUtil;
-const { $, el, clear, getJSON, markdown, esc } = U;
+const { $, el, clear, icon, getJSON, markdown, esc } = U;
 
 const API = "";
 
@@ -53,11 +53,12 @@ const SECTION_TITLES = Object.fromEntries([
 const WORLD_FEATURES = ["locations", "activities", "routines", "hunger", "energy", "sleep", "autonomous_needs"];
 const WORLD_ACTIVITY_KINDS = ["idle", "work", "school", "travel", "eat", "sleep", "leisure", "social", "other"];
 const WORLD_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+// `icon` is a Lucide icon name rendered via cmUtil.icon().
 const WORLD_SECTIONS = [
-  { name: "locations", title: "Locations", singular: "location", icon: "⌂" },
-  { name: "actors", title: "Actors", singular: "actor", icon: "◉" },
-  { name: "routines", title: "Routines", singular: "routine", icon: "↻" },
-  { name: "facts", title: "Facts", singular: "fact", icon: "✦" },
+  { name: "locations", title: "Locations", singular: "location", icon: "map-pin" },
+  { name: "actors", title: "Actors", singular: "actor", icon: "user-round" },
+  { name: "routines", title: "Routines", singular: "routine", icon: "repeat" },
+  { name: "facts", title: "Facts", singular: "fact", icon: "lightbulb" },
 ];
 
 const cfgState = {
@@ -80,7 +81,7 @@ const cfgState = {
 async function sendJSON(url, { method = "POST", body } = {}) {
   const r = await fetch(url, {
     method,
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json", ...U.authHeaders() },
     body: body ? JSON.stringify(body) : undefined,
   });
   const txt = await r.text();
@@ -90,21 +91,42 @@ async function sendJSON(url, { method = "POST", body } = {}) {
   return data;
 }
 
+// The label span flash() (and callers like rebuild()) swap. Created on first
+// use by wrapping the button's loose text nodes, so icon SVGs and nested
+// inputs (the upload labels) are never clobbered by a text swap.
+function flashLabel(btn) {
+  let label = btn.querySelector(":scope > .btn-label");
+  if (!label) {
+    label = el("span", { class: "btn-label" });
+    for (const node of [...btn.childNodes]) if (node.nodeType === Node.TEXT_NODE) label.appendChild(node);
+    btn.prepend(label);
+  }
+  return label;
+}
+
 function flash(btn, msg, ok = true) {
   if (!btn) return;
-  const orig = btn.dataset.label || btn.textContent;
-  btn.dataset.label = orig;
-  btn.textContent = msg;
+  const label = flashLabel(btn);
+  // Snapshot only when idle: during a pending flash the label holds the
+  // transient message, not the button's real text.
+  if (!btn.dataset.flashing) btn.dataset.label = label.textContent.trim();
+  btn.dataset.flashing = "1";
+  label.textContent = msg;
   btn.classList.toggle("flash-ok", ok);
   btn.classList.toggle("flash-bad", !ok);
-  setTimeout(() => { btn.textContent = orig; btn.classList.remove("flash-ok", "flash-bad"); }, 1400);
+  clearTimeout(btn._flashTimer);
+  btn._flashTimer = setTimeout(() => {
+    label.textContent = btn.dataset.label;
+    delete btn.dataset.flashing;
+    btn.classList.remove("flash-ok", "flash-bad");
+  }, 1400);
 }
 
 function showError(msg) {
   const activeEditor = document.querySelector(".editor-tabs .etab.active")?.dataset.edit;
   const log = $("chat-log");
   if (log && activeEditor === "chat") {
-    log.appendChild(el("div", { class: "chat-error" }, "⚠ " + msg));
+    log.appendChild(el("div", { class: "chat-error" }, [icon("triangle-alert"), ` ${msg}`]));
     log.scrollTop = log.scrollHeight;
     return;
   }
@@ -321,10 +343,10 @@ function worldElementSummary(section, item, index) {
   title = String(title || `New ${section.singular}`).trim();
   if (title.length > 72) title = title.slice(0, 69) + "…";
   return el("summary", { class: "world-element-summary" }, [
-    el("span", { class: "world-element-icon", "aria-hidden": "true" }, section.icon),
+    el("span", { class: "world-element-icon", "aria-hidden": "true" }, icon(section.icon)),
     el("span", { class: "world-element-title" }, title),
     item.id ? el("code", {}, item.id) : el("span", { class: "world-missing-id" }, `#${index + 1}`),
-    el("span", { class: "world-chevron", "aria-hidden": "true" }, "⌄"),
+    el("span", { class: "world-chevron", "aria-hidden": "true" }, icon("chevron-down")),
   ]);
 }
 
@@ -452,13 +474,13 @@ function renderWorldElements() {
     const group = el("section", { class: "world-element-group" });
     group.appendChild(el("div", { class: "world-element-group-head" }, [
       el("div", {}, [
-        el("span", { class: "world-element-group-icon", "aria-hidden": "true" }, section.icon),
+        el("span", { class: "world-element-group-icon", "aria-hidden": "true" }, icon(section.icon)),
         el("strong", {}, section.title),
         el("span", { class: "world-count" }, String(items.length)),
       ]),
       el("button", {
         class: "btn ghost tight", type: "button", onclick: () => addWorldElement(section.name),
-      }, `＋ Add ${section.singular}`),
+      }, [icon("plus"), `Add ${section.singular}`]),
     ]));
     const list = el("div", { class: "world-element-list" });
     if (!items.length) {
@@ -809,12 +831,12 @@ function renderSectionOrder(order) {
           type: "button", class: "cfg-section-move", "data-direction": "up",
           title: `Move ${SECTION_TITLES[name]} up`, "aria-label": `Move ${SECTION_TITLES[name]} up`,
           onclick: () => moveSectionRow(row, -1),
-        }, "↑"),
+        }, icon("chevron-up")),
         el("button", {
           type: "button", class: "cfg-section-move", "data-direction": "down",
           title: `Move ${SECTION_TITLES[name]} down`, "aria-label": `Move ${SECTION_TITLES[name]} down`,
           onclick: () => moveSectionRow(row, 1),
-        }, "↓"),
+        }, icon("chevron-down")),
       ]),
     ]);
     box.appendChild(row);
@@ -952,7 +974,7 @@ async function selectFile(name) {
 
 async function loadFileContent(name) {
   try {
-    const r = await fetch(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/files/${cfgState.bucket}/${encodeURIComponent(name)}`);
+    const r = await fetch(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/files/${cfgState.bucket}/${encodeURIComponent(name)}`, { headers: U.authHeaders() });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     $("cfg-filename").value = name;
     $("cfg-file-content").value = await r.text();
@@ -1006,7 +1028,7 @@ async function uploadFiles(fileList) {
   for (const f of fileList) fd.append("files", f, f.name);
   try {
     const r = await fetch(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/files/${cfgState.bucket}`, {
-      method: "POST", body: fd,
+      method: "POST", body: fd, headers: U.authHeaders(),
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
@@ -1018,13 +1040,15 @@ async function uploadFiles(fileList) {
 async function rebuild() {
   if (!cfgState.active) return;
   if (!confirm(`Rebuild all indexes for "${cfgState.active}"? Re-chunks files and (if enabled) re-runs KG extraction. May take a while.`)) return;
-  const btn = $("cfg-rebuild"); btn.disabled = true; btn.textContent = "Rebuilding…";
+  const btn = $("cfg-rebuild");
+  const label = flashLabel(btn);
+  btn.disabled = true; label.textContent = "Rebuilding…";
   const status = $("cfg-build-status");
   try {
     const data = await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/rebuild`);
     await pollJob(data.job_id, (snap) => {
       const pct = Math.round((snap.progress || 0) * 100);
-      btn.textContent = `Rebuilding… ${pct}%`;
+      label.textContent = `Rebuilding… ${pct}%`;
       if (status) {
         clear(status);
         const line = el("div", { class: "build-line" }, `${snap.cfgState} · ${snap.stage}${snap.detail ? " — " + snap.detail : ""}`);
@@ -1033,10 +1057,16 @@ async function rebuild() {
       }
     });
     flash(btn, "Done", true);
-    if (status) status.appendChild(el("div", { class: "build-done" }, "✓ Indexes rebuilt."));
+    if (status) status.appendChild(el("div", { class: "build-done" }, [icon("check"), " Indexes rebuilt."]));
     await loadCharacters();
   } catch (e) { showError(e.message); flash(btn, "Failed", false); }
-  finally { btn.disabled = false; btn.textContent = "⟳ Rebuild indexes"; }
+  finally {
+    btn.disabled = false;
+    label.textContent = "Rebuild indexes";
+    // A pending flash timer restores dataset.label — keep it in sync so the
+    // button settles on its real label, not the last progress text.
+    if (btn.dataset.label) btn.dataset.label = "Rebuild indexes";
+  }
 }
 
 // Poll a rebuild job until it reaches a terminal cfgState. `onUpdate` is called
@@ -1047,12 +1077,13 @@ async function pollJob(jobId, onUpdate) {
     await new Promise((r) => setTimeout(r, 700));
     let r;
     try {
-      r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}`);
+      r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}`, { headers: U.authHeaders() });
     } catch (e) {
       // transient fetch error: keep polling
       continue;
     }
     if (r.status === 404) throw new Error("Job vanished.");
+    if (r.status === 401) throw new Error("Unauthorized: set the API key with the key button in the top bar.");
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     snap = await r.json();
     onUpdate(snap || {});
@@ -1246,7 +1277,7 @@ function renderWizFileLists() {
         el("span", { class: "wiz-file-size" }, humanSize(f.file.size)),
         el("button", { class: "wiz-file-rm", onclick: () => {
           files.splice(i, 1); renderWizFileLists();
-        } }, "×"),
+        } }, icon("x")),
       ]));
     }
   }
@@ -1277,7 +1308,10 @@ function addWizFiles(which, fileList) {
 
 function setStatus(msg, kind) {
   const box = $("wiz-build-status"); clear(box);
-  box.appendChild(el("div", { class: "wiz-status-line " + (kind || "") }, msg));
+  box.appendChild(el("div", { class: "wiz-status-line " + (kind || "") },
+    kind === "ok" ? [icon("check"), ` ${msg}`]
+      : kind === "bad" ? [icon("x"), ` ${msg}`]
+      : msg));
 }
 
 async function runWizardBuild() {
@@ -1314,14 +1348,14 @@ async function runWizardBuild() {
       const pct = Math.round((snap.progress || 0) * 100);
       setStatus(`${snap.stage}${snap.detail ? " — " + snap.detail : ""} (${pct}%)`);
     });
-    setStatus(`✓ "${name}" is ready.`, "ok");
+    setStatus(`"${name}" is ready.`, "ok");
     await loadCharacters();
     await selectCharacter(name);
     // Brief beat so the user sees the success line before close.
     await new Promise((r) => setTimeout(r, 600));
     closeWizard();
   } catch (e) {
-    setStatus("✗ " + e.message, "bad");
+    setStatus(e.message, "bad");
     showError(e.message);
   } finally {
     wiz.building = false;
@@ -1335,7 +1369,7 @@ async function uploadWizBucket(name, bucket, files) {
   const fd = new FormData();
   for (const f of files) fd.append("files", f.file, f.name);
   const r = await fetch(`${API}/api/admin/characters/${encodeURIComponent(name)}/files/${bucket}`, {
-    method: "POST", body: fd,
+    method: "POST", body: fd, headers: U.authHeaders(),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);

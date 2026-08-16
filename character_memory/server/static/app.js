@@ -14,6 +14,26 @@
 const API = "";
 const SIZE = 25;
 
+// ---------------------------------------------------------------- API key
+// Optional server auth (CM_API_KEY / --api-key on the server). The key is
+// stored locally and attached to every request as an X-API-Key header; the
+// SSE EventSource cannot send headers, so its URL carries the key as an
+// `api_key` query parameter instead. Best-effort, like cm_theme: ignored
+// when localStorage is unavailable.
+const API_KEY_STORAGE = "cm_api_key";
+function storedApiKey() {
+  try { return localStorage.getItem(API_KEY_STORAGE) || ""; } catch (error) { return ""; }
+}
+function authHeaders() {
+  const key = storedApiKey();
+  return key ? { "X-API-Key": key } : {};
+}
+function authQuery(url) {
+  const key = storedApiKey();
+  if (!key) return url;
+  return url + (url.includes("?") ? "&" : "?") + "api_key=" + encodeURIComponent(key);
+}
+
 const state = {
   characters: [],
   character: null,
@@ -54,6 +74,35 @@ const el = (tag, attrs = {}, children = []) => {
 };
 const clear = (n) => { while (n && n.firstChild) n.removeChild(n.firstChild); };
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ---------------------------------------------------------------- icons
+// Inline Lucide icon (kebab-case name → SVG element). Degrades to an empty
+// placeholder when the vendored bundle (static/vendor/lucide.min.js) is
+// missing, so the GUI keeps working — just unadorned.
+const icon = (name, cls = "") => {
+  const classes = ("icon" + (cls ? " " + cls : "")).trim();
+  const lib = window.lucide;
+  if (lib) {
+    const pascal = name.replace(/(^|-)([a-z0-9])/g, (_m, _dash, c) => c.toUpperCase());
+    const def = lib[pascal];
+    if (def) return lib.createElement(def, { class: classes, "aria-hidden": "true" });
+  }
+  if (!icon._warned) {
+    icon._warned = true;
+    console.warn("[Mnemosyne] Lucide is not loaded — icons render as empty placeholders. " +
+      "Check that /gui/static/vendor/lucide.min.js is served, then hard-reload (Ctrl+Shift+R).");
+  }
+  return el("i", { class: classes, "aria-hidden": "true" });
+};
+
+// (Re)build an icon+label toggle button. Used instead of textContent swaps so
+// the Lucide SVG children survive label changes (freeze/full-graph buttons).
+const setButtonContent = (btn, iconName, label) => {
+  if (!btn) return;
+  clear(btn);
+  btn.appendChild(icon(iconName));
+  btn.appendChild(el("span", { class: "btn-label" }, label));
+};
 
 // ---------------------------------------------------------------- theme
 const THEME_KEY = "cm_theme";
@@ -435,7 +484,8 @@ function pickRenderer(memName, kind) {
 
 // ---------------------------------------------------------------- data fetching
 async function getJSON(url, signal) {
-  const r = await fetch(url, { headers: { Accept: "application/json" }, signal });
+  const r = await fetch(url, { headers: { Accept: "application/json", ...authHeaders() }, signal });
+  if (r.status === 401) promptApiKey();
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
     throw new Error(detail.detail || `HTTP ${r.status}`);
@@ -446,9 +496,10 @@ async function getJSON(url, signal) {
 async function sendJSON(url, { method = "POST", body } = {}) {
   const response = await fetch(url, {
     method,
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    headers: { Accept: "application/json", "Content-Type": "application/json", ...authHeaders() },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  if (response.status === 401) promptApiKey();
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
   return data;
@@ -648,7 +699,7 @@ function renderSkeletons() {
 function renderEmpty(title, sub) {
   clear($("records"));
   $("records").appendChild(el("div", { class: "empty" }, [
-    el("div", { class: "big" }, "∅"),
+    el("div", { class: "big" }, icon("inbox")),
     el("div", {}, title),
     sub ? el("div", { class: "text" }, sub) : null,
   ]));
@@ -662,25 +713,28 @@ function renderPaginator(data) {
   box.appendChild(el("span", { class: "pg-info" },
     `${(page - 1) * size + 1}–${Math.min(page * size, total)} of ${total}${search ? " matches" : ""}`));
 
-  const btn = (label, target, opts = {}) => el("button", {
+  const btn = (content, target, opts = {}) => el("button", {
     class: "pg-btn" + (opts.active ? " active" : ""),
     disabled: opts.disabled || false,
+    "aria-label": opts.label,
     onclick: () => gotoPage(target),
-  }, label);
+  }, content);
 
-  box.appendChild(btn("‹", page - 1, { disabled: page <= 1 }));
+  box.appendChild(btn(icon("chevron-left"), page - 1, { disabled: page <= 1, label: "Previous page" }));
   // windowed page numbers
   const win = 2;
   const from = Math.max(1, page - win), to = Math.min(pages, page + win);
   if (from > 1) { box.appendChild(btn("1", 1)); if (from > 2) box.appendChild(el("span", { class: "pg-info" }, "…")); }
   for (let p = from; p <= to; p++) box.appendChild(btn(String(p), p, { active: p === page }));
   if (to < pages) { if (to < pages - 1) box.appendChild(el("span", { class: "pg-info" }, "…")); box.appendChild(btn(String(pages), pages)); }
-  box.appendChild(btn("›", page + 1, { disabled: page >= pages }));
+  box.appendChild(btn(icon("chevron-right"), page + 1, { disabled: page >= pages, label: "Next page" }));
 }
 
 function showError(msg) {
   const s = $("status");
-  s.textContent = "⚠ " + msg;
+  clear(s);
+  s.appendChild(icon("triangle-alert"));
+  s.appendChild(document.createTextNode(" " + msg));
   s.classList.remove("hidden");
 }
 
@@ -1631,7 +1685,7 @@ async function renderGraphView() {
   $("graph-q").value = state.graph.q || "";
   $("graph-q-clear").classList.toggle("hidden", !state.graph.q);
   $("graph-full").classList.toggle("graph-freeze-on", !!state.graph.full);
-  $("graph-full").textContent = state.graph.full ? "● full graph" : "◯ full graph";
+  setButtonContent($("graph-full"), state.graph.full ? "circle-dot" : "circle-dashed", "full graph");
 
   let data;
   try {
@@ -1746,12 +1800,12 @@ function wireGraphControls() {
     if (!state.graph._gv) return;
     const frozen = state.graph._gv.relayout();
     $("graph-freeze").classList.toggle("graph-freeze-on", frozen);
-    $("graph-freeze").textContent = frozen ? "▶ resume" : "❚❚ freeze";
+    setButtonContent($("graph-freeze"), frozen ? "play" : "pause", frozen ? "resume" : "freeze");
   });
   $("graph-full").addEventListener("click", () => {
     state.graph.full = !state.graph.full;
     $("graph-full").classList.toggle("graph-freeze-on", state.graph.full);
-    $("graph-full").textContent = state.graph.full ? "● full graph" : "◯ full graph";
+    setButtonContent($("graph-full"), state.graph.full ? "circle-dot" : "circle-dashed", "full graph");
     // Full mode shows the whole graph by default; bump the caps so the slider
     // still lets the user dial it back down.
     if (state.graph.full) { syncSlider("gs-nodes", "nodeLimit", 6000); syncSlider("gs-edges", "edgeLimit", 9000); }
@@ -1799,7 +1853,7 @@ function wireGraphControls() {
     if (!state.graph._gv) return;
     const f = state.graph._gv.freeze();
     $("graph-freeze").classList.toggle("graph-freeze-on", f);
-    $("graph-freeze").textContent = f ? "▶ resume" : "❚❚ freeze";
+    setButtonContent($("graph-freeze"), f ? "play" : "pause", f ? "resume" : "freeze");
   });
   // Space toggles the physics freeze while the graph is on screen.
   document.addEventListener("keydown", (e) => {
@@ -1809,7 +1863,7 @@ function wireGraphControls() {
     if (!state.graph._gv) return;
     const f = state.graph._gv.freeze();
     $("graph-freeze").classList.toggle("graph-freeze-on", f);
-    $("graph-freeze").textContent = f ? "▶ resume" : "❚❚ freeze";
+    setButtonContent($("graph-freeze"), f ? "play" : "pause", f ? "resume" : "freeze");
   });
 }
 
@@ -1932,7 +1986,8 @@ function connectLiveStream() {
     return;
   }
   liveSetConnection("connecting", "Connecting to /context…");
-  const source = new EventSource(`${API}/api/context-events/${encodeURIComponent(state.character)}`);
+  // EventSource cannot send headers, so the API key rides the query string.
+  const source = new EventSource(authQuery(`${API}/api/context-events/${encodeURIComponent(state.character)}`));
   state.live.source = source;
   source.onopen = () => liveSetConnection("connected", "Listening for /context");
   source.onerror = () => {
@@ -2005,7 +2060,7 @@ function renderLiveTimeline() {
       el("div", { class: "live-timeline-message" }, event.message || "(empty message)"),
       el("div", { class: "live-timeline-tags" }, [
         el("span", {}, `${event.memory_count || 0} recalled`),
-        Object.keys(event.graphs || {}).length ? el("span", { class: "kg-on" }, "◆ graph") : null,
+        Object.keys(event.graphs || {}).length ? el("span", { class: "kg-on" }, [icon("share-2"), " graph"]) : null,
       ]),
     ]);
     box.appendChild(button);
@@ -2068,6 +2123,7 @@ function renderLiveRecalls(event) {
     const items = liveMemoryItems(memory);
     const details = el("details", { class: "live-memory", open: firstRender || known }, []);
     const summary = el("summary", { class: "live-memory-summary" }, [
+      icon("chevron-down", "live-memory-chev"),
       el("span", { class: "live-memory-name", title: memory.name }, memory.title || memory.name),
       el("span", { class: "live-memory-scope" }, memory.scope || "memory"),
       el("span", { class: "live-memory-count" }, `${items.length} recalled`),
@@ -2273,6 +2329,77 @@ function resetCharacterView() {
   $("graph-q").value = "";
 }
 
+// ---------------------------------------------------------------- API key dialog
+function setApiKeyIndicator() {
+  const btn = $("api-key-btn");
+  if (btn) btn.classList.toggle("has-key", Boolean(storedApiKey()));
+}
+
+function openApiKeyDialog(message) {
+  const overlay = $("api-key-overlay");
+  if (!overlay) return;
+  const hint = $("api-key-hint");
+  if (hint) {
+    hint.textContent = message ||
+      "Set the API key this server requires (CM_API_KEY or --api-key on the server side).";
+  }
+  const input = $("api-key-input");
+  if (input) {
+    input.value = storedApiKey();
+    input.focus();
+  }
+  overlay.classList.remove("hidden");
+}
+
+function closeApiKeyDialog() {
+  const overlay = $("api-key-overlay");
+  if (overlay) overlay.classList.add("hidden");
+}
+
+// Prompt for the key after a 401. Throttled: parallel failed fetches
+// (overview + page + graph) must not stack prompts or reset the input.
+let apiKeyPromptedAt = 0;
+function promptApiKey() {
+  const now = Date.now();
+  if (now - apiKeyPromptedAt < 1500) return;
+  apiKeyPromptedAt = now;
+  openApiKeyDialog(
+    "The server rejected the request: the API key is missing or invalid. " +
+    "Set it below and the page will retry."
+  );
+}
+
+function persistApiKey(key) {
+  try {
+    if (key) localStorage.setItem(API_KEY_STORAGE, key);
+    else localStorage.removeItem(API_KEY_STORAGE);
+  } catch (error) { /* storage may be disabled */ }
+  closeApiKeyDialog();
+  // Re-bootstrap every tab with the new key applied; the selected tab and
+  // character survive via the ?tab= / ?character= URL params.
+  location.reload();
+}
+
+function wireApiKeyDialog() {
+  const btn = $("api-key-btn");
+  if (btn) btn.addEventListener("click", () => openApiKeyDialog());
+  const form = $("api-key-form");
+  if (form) form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = $("api-key-input");
+    persistApiKey(((input && input.value) || "").trim());
+  });
+  const clear = $("api-key-clear");
+  if (clear) clear.addEventListener("click", () => persistApiKey(""));
+  const close = $("api-key-close");
+  if (close) close.addEventListener("click", closeApiKeyDialog);
+  const overlay = $("api-key-overlay");
+  if (overlay) overlay.addEventListener("mousedown", (event) => {
+    if (event.target === overlay) closeApiKeyDialog();
+  });
+  setApiKeyIndicator();
+}
+
 // ---------------------------------------------------------------- wire up
 async function init() {
   wireThemeToggle();
@@ -2280,6 +2407,7 @@ async function init() {
   // state and settings before the controls are first wired/rendered.
   loadGraphUI();
   wireLiveControls();
+  wireApiKeyDialog();
   $("refresh").addEventListener("click", () => loadOverview());
   $("add-memory").addEventListener("click", () => openMemoryEditor());
   $("memory-form").addEventListener("submit", saveMemory);
@@ -2306,7 +2434,8 @@ async function init() {
     if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
       e.preventDefault(); $("q").focus();
     } else if (e.key === "Escape") {
-      if (!$("memory-editor").classList.contains("hidden")) closeMemoryEditor();
+      if (!$("api-key-overlay").classList.contains("hidden")) closeApiKeyDialog();
+      else if (!$("memory-editor").classList.contains("hidden")) closeMemoryEditor();
       else if ($("q").value) { $("q").value = ""; onSearchInput(); }
     }
   });
@@ -2332,7 +2461,8 @@ async function init() {
 // ----------------------------------------------------------------- tab switching
 // Share DOM helpers with config.js (the Configure tab) through `window.cmUtil`
 // so the configurator never duplicates el()/clear()/$()/markdown()/getJSON().
-window.cmUtil = { $, el, clear, getJSON, markdown, esc };
+// authHeaders/authQuery carry the optional API key on config.js's own fetches.
+window.cmUtil = { $, el, clear, icon, setButtonContent, getJSON, markdown, esc, authHeaders, authQuery };
 
 function setTab(name, { history = true } = {}) {
   const browse = name === "browse";
@@ -2374,5 +2504,11 @@ function wireTabs() {
   });
 }
 wireTabs();
+
+// Convert the static <i data-lucide="…"> placeholders in index.html into
+// inline SVG. Dynamic DOM uses cmUtil.icon() directly, so no re-scan needed.
+if (window.lucide && typeof window.lucide.createIcons === "function") {
+  window.lucide.createIcons();
+}
 
 init();

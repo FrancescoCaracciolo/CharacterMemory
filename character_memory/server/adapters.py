@@ -593,6 +593,7 @@ class KnowledgeGraphAdapter(MemoryAdapter):
                 user_id=user_id,
                 token_budget=self.m.token_budget,
                 state_changing=False,
+                timestamp_style=self.m.timestamp_style,
             )
         except Exception:
             items = []

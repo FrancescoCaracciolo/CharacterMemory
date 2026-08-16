@@ -1747,6 +1747,13 @@ def build_router(
     with the admin router) so the ``refresh_memory`` tool can force an
     immediate cache reload. Optional for callers that don't run the poller; in
     that case ``refresh_memory`` reports ``reloaded: false``.
+
+    When the host app enables API-key auth (``CM_API_KEY`` / ``--api-key``,
+    see :mod:`.auth`), this endpoint is gated like every other route: clients
+    pass ``Authorization: Bearer <key>`` (most streamable-HTTP MCP client
+    configs have a ``headers`` field) or ``X-API-Key``, or fall back to the
+    ``?api_key=`` query parameter. A failed check is a plain HTTP ``401``,
+    not a JSON-RPC envelope.
     """
     # Keep a live reference to the monitors dict the tool handler reads. We
     # store the dict itself (not a copy) so monitors added/removed by the

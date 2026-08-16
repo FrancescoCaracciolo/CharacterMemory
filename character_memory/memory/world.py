@@ -26,7 +26,7 @@ from ..chunking import Chunk
 from ..config import WorldConfig
 from ..rag.base import Query
 from ..rag.hybrid import HybridSearch
-from .base import ExtractionSpec, Memory, MemoryItem, MemoryScope
+from .base import ExtractionSpec, Memory, MemoryItem, MemoryScope, item_bullet
 from .store import SQLiteStore
 from .structured import StructuredMemory
 
@@ -1162,8 +1162,8 @@ class WorldMemory(Memory):
         if not items:
             return ""
         current = items[0].text
-        history = [item.text for item in items[1:]]
-        return current + ("\nRelevant world facts/events:\n" + "\n".join(f"- {x}" for x in history) if history else "")
+        history = [item_bullet(item, self.timestamp_style) for item in items[1:]]
+        return current + ("\nRelevant world facts/events:\n" + "\n".join(history) if history else "")
 
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
         return self.records.get_memories(limit)

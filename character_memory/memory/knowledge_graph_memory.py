@@ -98,6 +98,7 @@ class KnowledgeGraphMemory(Memory):
             user_id=user_id,
             token_budget=limit,
             state_changing=state_changing,
+            timestamp_style=self.timestamp_style,
         )
 
     def _activation_snapshot(self, items: list[MemoryItem]) -> dict[str, Any]:
@@ -185,7 +186,7 @@ class KnowledgeGraphMemory(Memory):
     def format(self, items: list[MemoryItem]) -> str:
         if not items:
             return ""
-        return self.retriever.format_items(items)
+        return self.retriever.format_items(items, timestamp_style=self.timestamp_style)
 
     # ----------------------------------------------- build / persist / load stubs
     def build(self, info_chunks: list[Chunk]) -> None:

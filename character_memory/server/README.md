@@ -46,6 +46,7 @@ listed below and also work when launching through uvicorn directly):
 | `--port PORT`            | `8000`      | Bind port.                                         |
 | `--reload` / `--no-reload` | on        | Toggle uvicorn auto-reload.                        |
 | `--rebuild-kg [NAME…]`   | _unset_     | Rebuild a character's KG at startup (see below).   |
+| `--api-key KEY`          | _unset_     | Require this API key on every endpoint (see below).|
 
 The server reads its configuration from environment variables (the same ones
 the rest of the library uses):
@@ -60,9 +61,58 @@ the rest of the library uses):
 | `CM_ASSETS_DIR`    | `./assets`         | Root folder scanned for character subdirectories.        |
 | `CM_SAVE_DIR`      | `./.cm_servers`    | Where each character's SQLite store + indexes live.      |
 | `CM_REBUILD_KG`    | _empty_            | Comma-separated character names to rebuild at startup, or `all`. |
+| `CM_API_KEY`       | _empty_            | Require this API key on every endpoint (comma-separated list allowed). |
 
 Both `CM_ASSETS_DIR` and `CM_SAVE_DIR` are relative to the **current working
 directory** (the server has no notion of a repo root once installed).
+
+### API key authentication
+
+Optional, off by default. Set `CM_API_KEY` (env var, `.env`, or the
+`--api-key` flag) to require a key on **every** endpoint — the thin-client
+API (`/`, `/context`, `/save`), the memory browser and admin endpoints
+(`/api/...`), and the MCP endpoint (`POST /mcp`):
+
+```bash
+CM_API_KEY=change-me charactermemory-server
+# or several keys (any one of them passes — handy for rotating or issuing
+# one per client):
+CM_API_KEY=gui-key,mcp-key charactermemory-server
+# or equivalently:
+charactermemory-server --api-key change-me
+```
+
+A request presents its key in any of three forms (first one found wins):
+
+| Form                                | Typical client                                    |
+|-------------------------------------|---------------------------------------------------|
+| `Authorization: Bearer <key>` header | HTTP API clients, MCP clients (`headers` config) |
+| `X-API-Key: <key>` header            | the browser GUI's fetches                        |
+| `?api_key=<key>` query parameter     | SSE `EventSource` and header-less clients        |
+
+```bash
+curl -H 'Authorization: Bearer change-me' http://localhost:8000/
+curl 'http://localhost:8000/?api_key=change-me'
+```
+
+Details:
+
+- Unauthenticated requests get a plain `401` with a `WWW-Authenticate:
+  Bearer` header (what streamable-HTTP MCP clients expect — not a JSON-RPC
+  envelope).
+- `/gui` and its `/gui/static/*` assets stay **public**: the page shell
+  ships in the package and holds no user data. It loads, detects the `401`
+  on its first data call, prompts for the key (🔑 button in the top bar)
+  and attaches it to every request from then on. The key is stored in the
+  browser's `localStorage`.
+- The `?api_key=` fallback exists because `EventSource` cannot send
+  headers; query strings can end up in access logs, so prefer the headers
+  whenever the client supports them.
+- MCP clients that support custom headers pass the key like this:
+  `{"url": "http://host:8000/mcp?character=Kurisu", "headers": {"Authorization": "Bearer change-me"}}`.
+- Keys are compared with `hmac.compare_digest`; this is a shared-secret
+  gate for exposing the server beyond localhost, not a hardened
+  multi-tenant auth system.
 
 ### Characters
 
@@ -304,9 +354,11 @@ def turn(message: str) -> str:
   assistant answer by `/save`, so the chat history is durable across
   server restarts. Structured-memory indexes are persisted to
   `CM_SAVE_DIR/<character>/` and flushed on shutdown.
-- **This is an example server**, not a hardened production server: there is
-  no auth, rate limiting, or concurrency control around the underlying SQLite
-  store. For multi-worker deployments, give each character a single writer.
+- **This is an example server**, not a hardened production server: auth is
+  opt-in via `CM_API_KEY` / `--api-key` (see "API key authentication" above)
+  and off by default, and there is no rate limiting or concurrency control
+  around the underlying SQLite store. For multi-worker deployments, give each
+  character a single writer.
 
 ---
 
@@ -349,6 +401,11 @@ Features:
   does not add a second durable chat log.
 
 Keyboard: `/` focuses search, `Esc` clears it.
+
+If the server runs with `CM_API_KEY` set, the GUI prompts for the key on
+the first rejected request (or via the 🔑 button in the top bar), stores it
+in `localStorage` and attaches it to every request — headers for fetches,
+`?api_key=` for the SSE live stream.
 
 ### `GET /gui`
 
@@ -456,7 +513,7 @@ character's resting-state vector.
 ## MCP endpoint
 
 The same FastAPI app exposes an [MCP (Model Context Protocol)](https://modelcontextprotocol.io)
-endpoint at `POST /mcp?character=<name>` that lets MCP clients
+endpoint at `POST /mcp?character=<name>[&tools=<categories>]` that lets MCP clients
 (Claude Desktop, MCP Inspector, the Python `mcp` client, …) **read and
 edit** a character's memories. It speaks JSON-RPC 2.0 — the JSON-mode
 subset of MCP's Streamable HTTP transport. No new dependency: the
@@ -464,11 +521,41 @@ protocol surface we need (`initialize`, `tools/list`, `tools/call`,
 `ping`, `notifications/initialized`) is implemented directly on top of
 FastAPI in [`mcp.py`](./mcp.py).
 
-### `POST /mcp?character=<name>`
+When the server runs with `CM_API_KEY` set (see "API key authentication"
+above), this endpoint requires the key too: pass an
+`Authorization: Bearer <key>` header — most streamable-HTTP MCP clients have
+a `headers` config field for it — or `X-API-Key`, or the `?api_key=`
+query parameter for header-less clients. A failed check is a plain HTTP
+`401`.
+
+### `POST /mcp?character=<name>[&tools=<categories>]`
 
 The query parameter `character` (required) names the `CharacterAgent`
 every tool call operates against — it must match a folder scanned by
 `CM_ASSETS_DIR` at startup (`GET /` lists them).
+
+The optional `tools` parameter selects a comma-separated union of tool
+categories. It filters both `tools/list` and `tools/call`, so a client cannot
+invoke a tool hidden by its configured URL. Omit it, or use `tools=all`, for
+the complete registry.
+
+| Category | Tools |
+|---|---|
+| `core` | Memory overview and cache refresh. |
+| `memory` | Generic memory search plus structured/RAG read-write operations. |
+| `heartbeat` | Heartbeat journal list, search, and CRUD tools. |
+| `events` | Immutable event search/fetch/neighbors plus temporal calculations. |
+| `kg` | Graph overview/search/deduplication, node fetch/neighbors, plus temporal calculations. |
+
+Tools may belong to more than one category: `resolve_time_range` and
+`calculate_time_difference` are included by either `events` or `kg`, and the
+heartbeat list/search/CRUD tools are included by both `memory` and `heartbeat` for
+backwards compatibility. For example,
+`/mcp?character=Kurisu&tools=heartbeat` exposes only the heartbeat journal
+tools. Category names are case-insensitive and duplicates are ignored. An
+empty or unknown selection returns HTTP 400 with JSON-RPC code `-32602`;
+calling a registered tool outside the selected categories returns a normal
+JSON-RPC `-32602` error envelope.
 
 The body is a JSON-RPC 2.0 envelope (single object, or an array for
 batches). Every successful / failed tool call returns a regular JSON
@@ -507,8 +594,19 @@ register themselves at module import.
 | Tool                    | Writes to         | Notes                                                                       |
 |-------------------------|-------------------|------------------------------------------------------------------------------|
 | `list_memories`         | _character_       | Sidebar overview: every memory with title, kind, count, known users.        |
+| `refresh_memory`        | _character_       | Force an immediate cache reload after another process writes.               |
 | `search_memory`         | _read-only_       | Optional `query`, `user_id`, ISO-8601 `date_from` / `date_to`, `limit`.     |
 | `search_memory_by_date` | _read-only_       | Required calendar `date`; optional IANA `timezone`, `query`, `user_id`, `limit`. |
+| `search_conversation_events` | _read-only_ | Search raw immutable events and extracted aliases with optional occurrence bounds. |
+| `get_conversation_events` | _read-only_ | Fetch complete events by stable event IDs.                                  |
+| `get_event_neighbors`   | _read-only_       | Expand immediately preceding/following events in the same chat.             |
+| `resolve_time_range`    | _read-only_       | Resolve relative expressions into half-open occurrence bounds.              |
+| `calculate_time_difference` | _read-only_ | Calculate whole elapsed days, weeks, months, or years.                       |
+| `graph_overview`        | _read-only_       | KG node/edge counts and known users.                                         |
+| `search_knowledge_graph` | _read-only_      | Activation search returning records and a visualization subgraph.           |
+| `get_knowledge_graph_nodes` | _read-only_   | Fetch graph nodes by stable node IDs.                                        |
+| `get_knowledge_graph_neighbors` | _read-only_ | Expand a node across directly connected typed edges.                       |
+| `deduplicate_knowledge_graph` | `knowledge_graph` | Merge duplicate person/self nodes and persist the graph.                |
 | `add_fact`              | `user_facts`      | `user_id`, `content`, `type`, `importance`, `confidence`.                  |
 | `update_fact`           | `user_facts`      | `id`, plus any subset of fields to overwrite.                                |
 | `delete_fact`           | `user_facts`      | `id`.                                                                       |
@@ -519,9 +617,13 @@ register themselves at module import.
 | `update_episode`        | `episodic`        | `id`, plus any subset.                                                       |
 | `delete_episode`        | `episodic`        | `id`.                                                                       |
 | `add_heartbeat`         | `heartbeat`       | `summary`, `kind` (`discovery` \| `action`), `importance`.                  |
+| `list_heartbeats`       | _read-only_       | Latest heartbeat reports, newest first; optional `limit`.                    |
+| `search_heartbeats`     | _read-only_       | Hybrid search over heartbeat reports; required `query`, optional `limit`.    |
 | `update_heartbeat`      | `heartbeat`       | `id`, plus any subset.                                                       |
 | `delete_heartbeat`      | `heartbeat`       | `id`.                                                                       |
 | `set_user_summary`      | `user_summary`    | `user_id`, `summary`, optional `name`, `aliases`, `importance`.              |
+| `set_character_emotion` | `emotion`         | Absolute character-wide `current_mood`; no `memory` or `user_id` required.   |
+| `get_character_emotion` | _read-only_       | Character resting baseline and persisted current mood.                       |
 | `set_user_emotion`      | `emotion`         | `user_id`, optional signed `deltas`, absolute `current_mood`, and optional `comment`. |
 | `get_user_emotion`      | `emotion`         | `user_id`. Returns baseline + current mood + per-user dims + relationship comment. |
 | `add_character_info`    | `character_info`  | `text`, optional `source`. Session-scoped — see caveat below.               |
@@ -539,7 +641,7 @@ returns `isError: true`; an inverted range
 (`date_from > date_to`) returns `isError: true` rather than an empty
 result.
 
-### Write pluming
+### Write plumbing
 
 Every write tool commits through the memory's own primitive
 (`Add.Fact`, `episode`, `Directive`, heartbeat `entry`,
@@ -561,6 +663,7 @@ disk.
 | Status | When                                                                   |
 |--------|-------------------------------------------------------------------------|
 | `400`  | Missing `?character=` query parameter.                                  |
+| `400`  | Empty/unknown `?tools=` category selection.                              |
 | `404`  | Unknown character (one not in the loaded `AGENTS` dict).               |
 | `405`  | `GET /mcp` — JSON-mode only; the SSE channel is not implemented.       |
 | `400`  | Body is not valid JSON.                                                |
@@ -592,6 +695,31 @@ curl -X POST 'http://localhost:8000/mcp?character=Kurisu' \
         }
       }'
 ```
+
+### Example: event-only tool surface
+
+The category selection belongs in the MCP client URL and therefore applies to
+every request on that connection:
+
+```bash
+curl -X POST 'http://localhost:8000/mcp?character=Kurisu&tools=events' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "search_conversation_events",
+          "arguments": {
+            "query": "photography workshop",
+            "occurred_from": "2024-01-01T00:00:00Z",
+            "limit": 8
+          }
+        }
+      }'
+```
+
+Use `tools=events,kg` to expose both retrieval families while excluding the
+generic memory CRUD tools.
 
 ### Example: `search_memory_by_date`
 
