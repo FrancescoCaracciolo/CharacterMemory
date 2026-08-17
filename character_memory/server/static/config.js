@@ -38,10 +38,11 @@ const MEMORIES = [
   { name: "user_summary", title: "User summary", k: true },
   { name: "emotion", title: "Emotion tracking", k: false },
   { name: "world", title: "Private world", k: true },
+  { name: "calendar", title: "Calendar", k: true },
 ];
 
 const DEFAULT_SECTION_ORDER = [
-  "character_info", "emotion", "world", "user_directives", "user_facts",
+  "character_info", "emotion", "world", "calendar", "user_directives", "user_facts",
   "episodic", "conversation_events", "heartbeat", "user_summary",
   "knowledge_graph", "dialogue_style",
 ];

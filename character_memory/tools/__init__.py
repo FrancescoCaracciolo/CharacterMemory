@@ -57,6 +57,14 @@ from .knowledge_graph_tools import (
     knowledge_graph_tools,
 )
 from .world_tools import GetWorldState, SearchWorld, WorldAction, world_tools
+from .calendar_tools import (
+    SearchCalendarEvents,
+    CreateCalendarEvent,
+    UpdateCalendarEvent,
+    EditCalendarEvent,
+    CancelCalendarEvent,
+    calendar_tools,
+)
 from .registry import (
     ToolRegistry,
     get_tool,
@@ -83,6 +91,12 @@ __all__ = [
     "conversation_event_tools",
     "knowledge_graph_tools",
     "world_tools",
+    "calendar_tools",
+    "SearchCalendarEvents",
+    "CreateCalendarEvent",
+    "UpdateCalendarEvent",
+    "EditCalendarEvent",
+    "CancelCalendarEvent",
     "GetWorldState",
     "SearchWorld",
     "WorldAction",

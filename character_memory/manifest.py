@@ -49,6 +49,7 @@ MEMORY_NAMES: tuple[str, ...] = (
     "conversation_events",
     "emotion",
     "world",
+    "calendar",
     "heartbeat",
     "user_summary",
     "knowledge_graph",

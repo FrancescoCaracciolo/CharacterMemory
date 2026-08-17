@@ -48,6 +48,7 @@ from ..memory.emotion import EmotionStatus
 from ..memory.knowledge_graph_memory import KnowledgeGraphMemory
 from ..memory.structured import StructuredMemory
 from ..memory.world import WorldCommand, WorldMemory
+from ..memory.calendar import CalendarMemory, SELF_OWNER
 from ..tools import (
     CalculateTimeDifference,
     GetConversationEvents,
@@ -67,12 +68,12 @@ from .sync import MemorySync
 SERVER_NAME = "character-memory-mcp"
 SERVER_VERSION = "0.2.0"
 PROTOCOL_VERSION = "2024-11-05"  # MCP protocol version this server speaks.
-TOOL_CATEGORIES = frozenset({"core", "memory", "events", "kg", "heartbeat", "world"})
+TOOL_CATEGORIES = frozenset({"core", "memory", "events", "kg", "heartbeat", "world", "calendar"})
 
 # --------------------------------------------------------------------------- #
 # Small utilities
 # --------------------------------------------------------------------------- #
-def _parse_iso(ts: Optional[str]) -> Optional[float]:
+def _parse_iso(ts: Optional[str], timezone: str = "UTC") -> Optional[float]:
     """Parse an ISO 8601 string to a Unix epoch float; reject bad input.
 
     ``"Z"`` shorthand (UTC) is normalised to ``+00:00`` so
@@ -81,8 +82,11 @@ def _parse_iso(ts: Optional[str]) -> Optional[float]:
     if ts is None or ts == "":
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except (TypeError, ValueError) as e:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo(str(timezone or "UTC")))
+        return parsed.timestamp()
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as e:
         raise ValueError(f"Invalid ISO 8601 timestamp {ts!r}: {e}") from e
 
 
@@ -554,6 +558,97 @@ def _tool_set_world_features(agent: CharacterAgent, mem: Any, args: dict) -> dic
     resolved = world.set_features(values, actor_id=_args(args, "actor_id", None))
     agent.persist_structured()
     return {"resolved_features": resolved, "actor_id": _args(args, "actor_id", None)}
+
+
+# calendar --------------------------------------------------------------- #
+def _calendar(agent: CharacterAgent) -> CalendarMemory:
+    calendar = getattr(agent, "calendar_memory", None)
+    if calendar is None:
+        calendar = (getattr(agent, "memories", {}) or {}).get("calendar")
+    if calendar is None or not calendar.enabled:
+        raise ValueError(
+            f"Character {agent.character_name!r} does not have CalendarMemory enabled."
+        )
+    return calendar
+
+
+def _calendar_values(args: dict) -> dict[str, Any]:
+    return {
+        key: args[key]
+        for key in (
+            "title", "description", "location", "timezone", "kind", "start_at", "end_at",
+            "weekdays", "start_local", "duration_minutes", "attendees",
+        )
+        if key in args
+    }
+
+
+def _tool_search_calendar(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    calendar = _calendar(agent)
+    timezone = calendar.default_timezone
+    start = _parse_iso(_args(args, "start", None), timezone)
+    before = _parse_iso(_args(args, "before", None), timezone)
+    if start is None and before is None:
+        start = None
+    if start is not None and before is not None and before <= start:
+        raise ValueError("start must be before before")
+    owner_ids = _args(args, "owner_ids", None)
+    if owner_ids is not None and not isinstance(owner_ids, list):
+        raise ValueError("owner_ids must be an array")
+    events = calendar.search_events(
+        str(_args(args, "query", "") or ""),
+        start=start,
+        before=before,
+        owners=owner_ids,
+        include_cancelled=bool(_args(args, "include_cancelled", False)),
+        limit=max(1, min(200, int(_args(args, "limit", 25) or 25))),
+        state_changing=False,
+    )
+    return {"count": len(events), "events": [event.to_dict() for event in events], "timezone": timezone}
+
+
+def _tool_create_calendar(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    calendar = _calendar(agent)
+    owner = str(_args(args, "owner_id", "") or "").strip()
+    if not owner:
+        raise ValueError("owner_id is required")
+    title = str(_args(args, "title", "") or "").strip()
+    if not title:
+        raise ValueError("title is required")
+    event_id = calendar.create_event(
+        owner,
+        source="mcp",
+        source_message_ids=[],
+        **_calendar_values({**args, "title": title}),
+    )
+    persist = getattr(agent, "persist_structured", None)
+    if callable(persist):
+        persist()
+    return {"id": event_id, "event": calendar.get_row(event_id)}
+
+
+def _tool_update_calendar(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    calendar = _calendar(agent)
+    event_id = int(_args(args, "event_id", 0) or 0)
+    if not event_id:
+        raise ValueError("event_id is required")
+    updated = calendar.update_event(event_id, **_calendar_values(args))
+    persist = getattr(agent, "persist_structured", None)
+    if callable(persist):
+        persist()
+    return {"id": updated, "event": calendar.get_row(updated)}
+
+
+def _tool_cancel_calendar(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    calendar = _calendar(agent)
+    event_id = int(_args(args, "event_id", 0) or 0)
+    if not event_id:
+        raise ValueError("event_id is required")
+    cancelled = calendar.cancel_event(event_id)
+    persist = getattr(agent, "persist_structured", None)
+    if callable(persist):
+        persist()
+    return {"id": cancelled, "event": calendar.get_row(cancelled)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1098,10 +1193,10 @@ _register_provider_tool(GetKnowledgeGraphNeighbors, bound=True, categories=("kg"
 
 # Time arithmetic is useful in both source-event and graph retrieval flows.
 _register_provider_tool(
-    ResolveTimeRange, bound=False, categories=("events", "kg")
+    ResolveTimeRange, bound=False, categories=("events", "kg", "calendar")
 )
 _register_provider_tool(
-    CalculateTimeDifference, bound=False, categories=("events", "kg")
+    CalculateTimeDifference, bound=False, categories=("events", "kg", "calendar")
 )
 
 _register(
@@ -1582,6 +1677,67 @@ _register(
     _tool_set_world_features, needs_memory=False, categories=("world",),
 )
 
+_register(
+    "search_calendar_events",
+    "Search one-off calendar events and weekly routines, including live world routines.",
+    {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "default": ""},
+            "start": {"type": "string", "description": "ISO lower bound (inclusive)."},
+            "before": {"type": "string", "description": "ISO upper bound (exclusive)."},
+            "owner_ids": {"type": "array", "items": {"type": "string"}},
+            "include_cancelled": {"type": "boolean", "default": False},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 25},
+        },
+        "required": [],
+    },
+    _tool_search_calendar, needs_memory=False, categories=("calendar",),
+)
+_register(
+    "create_calendar_event",
+    "Create a one-off event or weekly routine in a character or user's calendar.",
+    {
+        "type": "object",
+        "properties": {
+            "owner_id": {"type": "string"}, "title": {"type": "string"},
+            "description": {"type": "string"}, "location": {"type": "string"},
+            "timezone": {"type": "string"},
+            "kind": {"type": "string", "enum": ["event", "routine"], "default": "event"},
+            "start_at": {"type": "string"}, "end_at": {"type": "string"},
+            "weekdays": {"type": "array", "items": {"type": "integer"}},
+            "start_local": {"type": "string"}, "duration_minutes": {"type": "integer"},
+            "attendees": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["owner_id", "title"],
+    },
+    _tool_create_calendar, needs_memory=False, categories=("calendar",),
+)
+_register(
+    "update_calendar_event",
+    "Partially update a persisted calendar event or weekly routine.",
+    {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "integer"}, "title": {"type": "string"},
+            "description": {"type": "string"}, "location": {"type": "string"},
+            "timezone": {"type": "string"}, "kind": {"type": "string", "enum": ["event", "routine"]},
+            "start_at": {"type": "string"}, "end_at": {"type": "string"},
+            "weekdays": {"type": "array", "items": {"type": "integer"}},
+            "start_local": {"type": "string"}, "duration_minutes": {"type": "integer"},
+            "attendees": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["event_id"],
+    },
+    _tool_update_calendar, needs_memory=False, categories=("calendar",),
+)
+_register(
+    "cancel_calendar_event",
+    "Cancel a persisted calendar event or weekly routine without deleting its provenance.",
+    {"type": "object", "properties": {"event_id": {"type": "integer"}}, "required": ["event_id"]},
+    _tool_cancel_calendar, needs_memory=False, categories=("calendar",),
+)
+
 
 def _build_schemas(
     agent: CharacterAgent,
@@ -1714,7 +1870,7 @@ def _invoke(
     if not needs_memory:
         try:
             return _as_tool_result(handler(agent, None, args))
-        except (RuntimeError, TypeError, ValueError) as e:
+        except (KeyError, RuntimeError, TypeError, ValueError) as e:
             return _json_error(str(e))
 
     mem_name = args.get("memory")
@@ -1725,7 +1881,7 @@ def _invoke(
         )
     try:
         return _as_tool_result(handler(agent, mem, args))
-    except (RuntimeError, TypeError, ValueError) as e:
+    except (KeyError, RuntimeError, TypeError, ValueError) as e:
         return _json_error(str(e))
 
 
@@ -1740,7 +1896,7 @@ def build_router(
 
     Mount it on the existing app in :file:`api.py`; the route is ``POST /mcp``
     and reads the bound character from the ``?character=`` query parameter.
-    ``?tools=core,memory,heartbeat,events,kg`` optionally restricts the advertised and
+    ``?tools=core,memory,heartbeat,events,kg,calendar`` optionally restricts the advertised and
     callable tool categories; omit it or use ``tools=all`` for the full set.
 
     ``sync_monitors`` is the live per-character :class:`MemorySync` map (shared

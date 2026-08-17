@@ -66,6 +66,7 @@ import yaml
 from .config import (
     CharacterMemoryConfig,
     ChunkingConfig,
+    CalendarConfig,
     DedupConfig,
     EmbeddingConfig,
     KnowledgeGraphConfig,
@@ -165,6 +166,7 @@ _SUBCONFIG_TYPES = {
     DedupConfig: "dedup",
     KnowledgeGraphConfig: "knowledge_graph",
     WorldConfig: "world",
+    CalendarConfig: "calendar",
 }
 
 
@@ -237,6 +239,10 @@ def _build_memory_config(data: Optional[dict[str, Any]]) -> MemoryConfig:
         elif f.name == "world":
             kwargs["world"] = _build_subconfig(
                 WorldConfig, raw if isinstance(raw, dict) else None
+            )
+        elif f.name == "calendar":
+            kwargs["calendar"] = _build_subconfig(
+                CalendarConfig, raw if isinstance(raw, dict) else None
             )
         elif isinstance(raw, dict) and f.type in (dict, "dict"):
             kwargs[f.name] = dict(raw)

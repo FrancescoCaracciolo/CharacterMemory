@@ -39,6 +39,8 @@ class PromptConfig:
     user_summary_header_multi: str = "Summaries of these users"
     emotion_header: str = "Emotional state"
     world_header: str = "Current World"
+    calendar_header: str = "Calendar"
+    calendar_header_multi: str = "Calendar (character + participants)"
     knowledge_graph_header: str = "Activated knowledge (graph)"
     knowledge_graph_header_multi: str = "Activated knowledge (graph)"
 
@@ -121,6 +123,7 @@ class PromptConfig:
             "character_info",
             "emotion",
             "world",
+            "calendar",
             "user_directives",
             "user_facts",
             "episodic",

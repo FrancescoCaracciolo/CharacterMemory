@@ -21,8 +21,12 @@ const SIZE = 25;
 // `api_key` query parameter instead. Best-effort, like cm_theme: ignored
 // when localStorage is unavailable.
 const API_KEY_STORAGE = "cm_api_key";
+const CALENDAR_WORLD_ROUTINES_KEY = "cm_calendar_show_world_routines";
 function storedApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ""; } catch (error) { return ""; }
+}
+function storedCalendarWorldRoutines() {
+  try { return localStorage.getItem(CALENDAR_WORLD_ROUTINES_KEY) !== "false"; } catch (error) { return true; }
 }
 function authHeaders() {
   const key = storedApiKey();
@@ -43,7 +47,9 @@ const state = {
   size: SIZE,
   user: "",
   q: "",
-  cache: new Map(),        // `${memory}|${user}|${q}` -> Map(page -> data)
+  calendarOffset: 0,
+  showWorldRoutines: storedCalendarWorldRoutines(),
+  cache: new Map(),        // `${memory}|${user}|${q}|${calendarOffset}` -> Map(page -> data)
   inflight: null,          // AbortController for the active page fetch
   editor: { editable: false, fields: [], description: "" },
   editing: null,
@@ -327,7 +333,7 @@ function markdown(text) {
 function wrapCard(children, rec) {
   const head = el("div", { class: "card-tags" }, []);
   const pill = scorePill(rec);
-  const actions = state.editor && state.editor.editable
+  const actions = state.editor && state.editor.editable && !(rec.fields && rec.fields.virtual)
     ? el("div", { class: "card-actions" }, [
         el("button", { class: "card-action", type: "button", title: "Edit memory", onclick: (event) => {
           event.stopPropagation(); openMemoryEditor(rec);
@@ -411,6 +417,27 @@ function renderUserSummary(rec) {
   return card;
 }
 
+function renderCalendar(rec) {
+  const f = rec.fields || {};
+  const start = f.start ? new Date(f.start) : null;
+  const end = f.end ? new Date(f.end) : null;
+  const time = start
+    ? `${start.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}${end ? ` – ${end.toLocaleTimeString([], { timeStyle: "short" })}` : ""}`
+    : "unscheduled";
+  const body = el("div", { class: "calendar-card-body" }, [
+    el("div", { class: "calendar-time" }, time),
+    el("div", { class: "text" }, f.title || rec.text || "(untitled)"),
+    f.description ? el("div", { class: "calendar-description" }, f.description) : null,
+    f.location ? el("div", { class: "calendar-location" }, [icon("map-pin"), f.location]) : null,
+  ]);
+  const card = wrapCard([body], rec);
+  addTag(card, chip(f.virtual ? "world routine" : (f.kind || "event"), "kind-chip"));
+  addTag(card, chip(f.owner_id === "_self" ? "character" : (f.owner_id || "user")));
+  if (f.status === "cancelled") addTag(card, chip("cancelled", "kind-chip"));
+  if (Array.isArray(f.attendees) && f.attendees.length) addTag(card, chip(`${f.attendees.length} attendee${f.attendees.length === 1 ? "" : "s"}`));
+  return card;
+}
+
 function renderRag(rec) {
   const src = (rec.meta && rec.meta.source) || (rec.fields && rec.fields.source) || "";
   const card = wrapCard([el("div", { class: "md", html: markdown(rec.text || "") })], rec);
@@ -468,6 +495,7 @@ const RENDERERS = {
   episodic: renderEpisode,
   heartbeat: renderHeartbeat,
   user_summary: renderUserSummary,
+  calendar: renderCalendar,
   character_info: renderRag,
   dialogue_style: renderDialogue,
   emotion: renderEmotion,
@@ -548,7 +576,57 @@ async function loadOverview() {
   }
 }
 
-function cacheKey() { return `${state.memory}|${state.user || ""}|${state.q}`; }
+function cacheKey() { return `${state.memory}|${state.user || ""}|${state.q}|${state.calendarOffset}`; }
+
+function calendarRange() {
+  // Keep the navigation anchored to calendar months instead of a rolling
+  // agenda window.  The API still receives the complete visible grid range,
+  // including the leading/trailing days needed to draw a rectangular month.
+  const monthStart = new Date();
+  monthStart.setHours(0, 0, 0, 0);
+  monthStart.setDate(1);
+  monthStart.setMonth(monthStart.getMonth() + state.calendarOffset);
+
+  const start = new Date(monthStart);
+  start.setDate(start.getDate() - start.getDay()); // Sunday-first grid.
+
+  const monthEnd = new Date(monthStart);
+  monthEnd.setMonth(monthEnd.getMonth() + 1);
+  const before = new Date(monthEnd);
+  before.setDate(before.getDate() + (7 - before.getDay()) % 7);
+
+  return {
+    start,
+    before,
+    monthStart,
+    monthEnd,
+    label: monthStart.toLocaleDateString([], { month: "long", year: "numeric" }),
+  };
+}
+
+const CALENDAR_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+function calendarEditorFields(timezone = "UTC") {
+  return [
+    { name: "user_id", label: "Owner ID", type: "text", required: false, default: state.user || "_self", readonly_on_edit: true },
+    { name: "title", label: "Title", type: "textarea", required: true },
+    { name: "description", label: "Description", type: "textarea" },
+    { name: "location", label: "Location", type: "text" },
+    { name: "timezone", label: "Time zone", type: "timezone", default: timezone },
+    { name: "kind", label: "Schedule", type: "select", options: ["event", "routine"], default: "event" },
+    { name: "start_at", label: "Starts", type: "datetime-local", required: true, show_when: { field: "kind", equals: "event" } },
+    { name: "end_at", label: "Ends", type: "datetime-local", required: true, show_when: { field: "kind", equals: "event" } },
+    { name: "weekdays", label: "Repeats on", type: "weekdays", show_when: { field: "kind", equals: "routine" } },
+    { name: "start_local", label: "Starts at", type: "time", required: true, show_when: { field: "kind", equals: "routine" } },
+    { name: "duration_minutes", label: "Duration (minutes)", type: "number", required: true, min: 1, step: 5, show_when: { field: "kind", equals: "routine" } },
+    { name: "attendees", label: "Attendees", type: "tags" },
+  ];
+}
+
+function setWorldRoutinesVisible(visible) {
+  state.showWorldRoutines = visible;
+  try { localStorage.setItem(CALENDAR_WORLD_ROUTINES_KEY, String(visible)); } catch (error) { /* storage may be disabled */ }
+}
 
 async function loadPage() {
   if (!state.memory) { renderEmpty("Select a memory", ""); return; }
@@ -571,13 +649,42 @@ async function loadPage() {
   const params = new URLSearchParams({ page: state.page, size: state.size });
   if (state.user) params.set("user", state.user);
   if (state.q) params.set("q", state.q);
-  const url = `${API}/api/memories/${encodeURIComponent(state.character)}/${encodeURIComponent(state.memory)}?${params}`;
+  let url;
+  if (state.memory === "calendar") {
+    const range = calendarRange();
+    const calendarParams = new URLSearchParams({
+      start: range.start.toISOString(), before: range.before.toISOString(), limit: "200",
+    });
+    if (state.user) calendarParams.append("owner", state.user);
+    if (state.q) calendarParams.set("q", state.q);
+    url = `${API}/api/calendar/${encodeURIComponent(state.character)}/events?${calendarParams}`;
+  } else {
+    url = `${API}/api/memories/${encodeURIComponent(state.character)}/${encodeURIComponent(state.memory)}?${params}`;
+  }
 
   try {
     const data = await getJSON(url, ac.signal);
-    pages.set(state.page, data);
+    const normalized = state.memory === "calendar"
+      ? {
+          memory: "calendar", kind: "calendar", search: !!state.q, q: state.q,
+          page: 1, pages: 1, total: (data.events || []).length, size: SIZE,
+          users: (state.memories.find((m) => m.name === "calendar") || {}).users || [],
+          editor: { editable: true, fields: calendarEditorFields(data.timezone || "UTC"), description: "Create one-off events with the date picker, or weekly routines with the day selector. World routines are read-only live projections." },
+          records: (data.events || []).map((event) => ({
+            id: event.virtual ? event.id : (event.metadata && event.metadata.event_id) || event.series_id || event.id,
+            user_id: event.owner_id,
+            text: event.title,
+            // The agenda API exposes both epoch fields and display-ready ISO
+            // fields. Keep the editor's text inputs in ISO form so a round
+            // trip through the generic memory editor remains valid.
+            fields: { ...event, start_at: event.start || "", end_at: event.end || "" },
+            meta: { virtual: event.virtual },
+          })),
+        }
+      : data;
+    pages.set(state.page, normalized);
     if (state.inflight === ac) state.inflight = null;
-    renderPage(data);
+    renderPage(normalized);
   } catch (e) {
     if (e.name === "AbortError") return;
     showError(e.message);
@@ -664,11 +771,17 @@ function renderPage(data) {
   // The knowledge graph renders its own force-directed visualization
   // instead of the card list. Toggle the two views.
   const isGraph = data.memory === "knowledge_graph" || data.kind === "graph";
+  const isCalendar = data.memory === "calendar" || data.kind === "calendar";
   $("graph-view").classList.toggle("hidden", !isGraph);
   $("records").classList.toggle("hidden", isGraph);
-  $("paginator").classList.toggle("hidden", isGraph);
+  $("paginator").classList.toggle("hidden", isGraph || isCalendar);
   if (isGraph) {
     renderGraphView();
+    return;
+  }
+
+  if (isCalendar) {
+    renderCalendarAgenda(data);
     return;
   }
 
@@ -681,6 +794,140 @@ function renderPage(data) {
     for (const rec of records) list.appendChild(render(rec));
   }
   renderPaginator(data);
+}
+
+function renderCalendarAgenda(data) {
+  const list = $("records"); clear(list);
+  const range = calendarRange();
+  const worldRoutinesVisible = state.showWorldRoutines;
+  const toolbar = el("div", { class: "calendar-toolbar" }, [
+    el("div", { class: "calendar-nav" }, [
+      el("button", { class: "btn ghost tight", type: "button", "aria-label": "Previous month", onclick: () => { state.calendarOffset -= 1; state.cache.clear(); loadPage(); } }, [icon("chevron-left"), "Previous"]),
+      el("button", { class: "btn ghost tight", type: "button", onclick: () => { state.calendarOffset = 0; state.cache.clear(); loadPage(); } }, "Today"),
+      el("button", { class: "btn ghost tight", type: "button", "aria-label": "Next month", onclick: () => { state.calendarOffset += 1; state.cache.clear(); loadPage(); } }, ["Next", icon("chevron-right")]),
+    ]),
+    el("div", { class: "calendar-range" }, [
+      el("strong", { class: "calendar-month-title" }, range.label),
+      el("span", { class: "calendar-range-detail" }, `${range.start.toLocaleDateString([], { dateStyle: "medium" })} – ${new Date(range.before.getTime() - 1).toLocaleDateString([], { dateStyle: "medium" })}`),
+    ]),
+    el("button", {
+      class: "btn ghost tight calendar-filter-toggle", type: "button", role: "switch",
+      "aria-checked": worldRoutinesVisible, title: "Show or hide read-only routines projected from the world",
+      onclick: () => { setWorldRoutinesVisible(!state.showWorldRoutines); renderCalendarAgenda(data); },
+    }, [icon(worldRoutinesVisible ? "eye" : "eye-off"), `World routines: ${worldRoutinesVisible ? "on" : "off"}`]),
+  ]);
+  list.appendChild(toolbar);
+
+  const allRecords = data.records || [];
+  const records = worldRoutinesVisible ? allRecords : allRecords.filter((rec) => !(rec.fields || {}).virtual);
+
+  // Index each occurrence by its local day.  Multi-day events are shown in
+  // every covered cell, which makes the month view useful for travel, leave,
+  // and other events that cross midnight.  World routines arrive as concrete
+  // occurrences from the API and therefore need no special rendering path.
+  const eventsByDay = new Map();
+  for (const rec of records) {
+    const fields = rec.fields || {};
+    const start = fields.start || fields.start_at;
+    if (!start) continue;
+    const startDate = new Date(start);
+    if (Number.isNaN(startDate.getTime())) continue;
+    const endDate = fields.end || fields.end_at ? new Date(fields.end || fields.end_at) : startDate;
+    const lastDate = new Date(Number.isNaN(endDate.getTime()) ? startDate.getTime() : endDate.getTime());
+    // An event ending exactly at midnight belongs to the preceding day.
+    if (lastDate.getTime() > startDate.getTime()) lastDate.setTime(lastDate.getTime() - 1);
+    const day = new Date(startDate);
+    day.setHours(0, 0, 0, 0);
+    lastDate.setHours(0, 0, 0, 0);
+    if (day < range.start) day.setTime(range.start.getTime());
+    while (day <= lastDate && day < range.before) {
+      if (day >= range.start) {
+        const key = calendarDateKey(day);
+        if (!eventsByDay.has(key)) eventsByDay.set(key, []);
+        eventsByDay.get(key).push(rec);
+      }
+      day.setDate(day.getDate() + 1);
+    }
+  }
+
+  const weekdays = el("div", { class: "calendar-weekdays", role: "row" },
+    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((label) =>
+      el("div", { class: "calendar-weekday", role: "columnheader" }, label)));
+  const grid = el("div", { class: "calendar-grid", role: "grid", "aria-label": range.label });
+  const todayKey = calendarDateKey(new Date());
+  const monthKey = `${range.monthStart.getFullYear()}-${range.monthStart.getMonth()}`;
+  const cursor = new Date(range.start);
+  while (cursor < range.before) {
+    const key = calendarDateKey(cursor);
+    const dayMonthKey = `${cursor.getFullYear()}-${cursor.getMonth()}`;
+    const outside = dayMonthKey !== monthKey;
+    const today = key === todayKey;
+    const events = (eventsByDay.get(key) || []).slice().sort(calendarEventSort);
+    const cell = el("div", {
+      class: "calendar-day" + (outside ? " is-outside" : "") + (today ? " is-today" : ""),
+      role: "gridcell",
+      "aria-label": cursor.toLocaleDateString([], { dateStyle: "full" }),
+    }, [
+      el("div", { class: "calendar-day-head" }, [
+        el("span", { class: "calendar-day-number" }, String(cursor.getDate())),
+        today ? el("span", { class: "calendar-day-today" }, "Today") : null,
+      ]),
+      el("div", { class: "calendar-events" }, events.map(renderCalendarEvent)),
+    ]);
+    grid.appendChild(cell);
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  const shell = el("div", { class: "calendar-shell" }, [weekdays, grid]);
+  list.appendChild(shell);
+  if (!records.length) {
+    list.appendChild(el("div", { class: "calendar-empty-hint" }, [
+      icon("calendar-days"), data.search
+        ? `No events match “${data.q}” in this month.`
+        : allRecords.length && !worldRoutinesVisible
+          ? "Only world routines are scheduled this month. Turn their visibility back on to see them."
+          : "No events in this month. Add one with the button above.",
+    ]));
+  }
+}
+
+function calendarDateKey(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function calendarEventSort(a, b) {
+  const aTime = new Date((a.fields || {}).start || (a.fields || {}).start_at || 0).getTime();
+  const bTime = new Date((b.fields || {}).start || (b.fields || {}).start_at || 0).getTime();
+  return (Number.isNaN(aTime) ? Infinity : aTime) - (Number.isNaN(bTime) ? Infinity : bTime);
+}
+
+function renderCalendarEvent(rec) {
+  const fields = rec.fields || {};
+  const start = fields.start || fields.start_at ? new Date(fields.start || fields.start_at) : null;
+  const validStart = start && !Number.isNaN(start.getTime());
+  const time = validStart ? start.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+  const title = fields.title || rec.text || "(untitled)";
+  const owner = fields.owner_id === "_self" ? "character" : (fields.owner_id || "user");
+  const virtual = !!fields.virtual;
+  const type = fields.kind === "routine" ? "routine" : "event";
+  const classes = ["calendar-event", virtual ? "virtual" : "", type, fields.status === "cancelled" ? "cancelled" : ""]
+    .filter(Boolean).join(" ");
+  const description = [fields.description, fields.location].filter(Boolean).join(" · ");
+  const node = el(virtual ? "div" : "button", {
+    class: classes,
+    ...(virtual ? {} : {
+      type: "button",
+      onclick: () => openMemoryEditor(rec),
+    }),
+    title: `${time ? `${time} ` : ""}${title}${description ? ` — ${description}` : ""}`,
+    "aria-label": `${time ? `${time} ` : ""}${title} (${owner})`,
+  }, [
+    time ? el("span", { class: "calendar-event-time" }, time) : null,
+    el("span", { class: "calendar-event-title" }, title),
+  ]);
+  if (!virtual) node.dataset.owner = owner;
+  return node;
 }
 
 function renderSkeletons() {
@@ -760,6 +1007,31 @@ function recordValue(rec, field) {
   return field.default != null ? field.default : "";
 }
 
+function datetimeLocalValue(value) {
+  if (!value) return "";
+  const text = String(value);
+  // Calendar API values are ISO strings in the event's selected timezone.
+  // Truncating preserves that local wall time for the native control.
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(text)) return text.slice(0, 16);
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function timezoneChoices() {
+  const fallback = ["UTC", "Europe/Rome", "Europe/London", "America/New_York", "America/Los_Angeles", "Asia/Tokyo", "Asia/Shanghai", "Australia/Sydney"];
+  try {
+    return typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : fallback;
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function browserTimezone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch (_error) { return "UTC"; }
+}
+
 function makeMemoryField(field, rec) {
   let value = recordValue(rec, field);
   if (field.type === "tags" && typeof value === "string") {
@@ -773,6 +1045,21 @@ function makeMemoryField(field, rec) {
     placeholder: field.placeholder || "",
     disabled: !!(rec && field.readonly_on_edit),
   };
+  if (field.type === "weekdays") {
+    const selected = new Set((Array.isArray(value) ? value : String(value || "").split(","))
+      .map((day) => Number(day)).filter((day) => Number.isInteger(day) && day >= 0 && day < 7));
+    const picker = el("div", { class: "weekday-picker", role: "group", "aria-label": field.label });
+    CALENDAR_WEEKDAYS.forEach((day, index) => {
+      const checkbox = el("input", { type: "checkbox", value: String(index), checked: selected.has(index) });
+      picker.appendChild(el("label", { class: "weekday-option" }, [checkbox, el("span", {}, day)]));
+    });
+    const node = el("div", { class: "memory-field", "data-field": field.name }, [
+      el("span", { class: "memory-field-label" }, field.label), picker,
+    ]);
+    if (field.show_when) node.dataset.showWhen = JSON.stringify(field.show_when);
+    return node;
+  }
+
   let input;
   if (field.type === "textarea" || field.type === "json") {
     input = el("textarea", { ...attrs, rows: "4", class: "memory-input memory-textarea" });
@@ -789,19 +1076,48 @@ function makeMemoryField(field, rec) {
       min: field.min, max: field.max, step: field.step || 0.05,
       oninput: () => { output.value = Number(input.value).toFixed(2); },
     });
-    return el("label", { class: "memory-field range-field", for: attrs.id }, [
+    const node = el("label", { class: "memory-field range-field", for: attrs.id, "data-field": field.name }, [
       el("span", { class: "memory-field-label" }, [field.label, field.required ? el("i", {}, "required") : null]),
       el("div", { class: "range-wrap" }, [input, output]),
     ]);
+    if (field.show_when) node.dataset.showWhen = JSON.stringify(field.show_when);
+    return node;
+  } else if (field.type === "timezone") {
+    input = el("input", { ...attrs, type: "text", class: "memory-input", value, list: "calendar-timezone-options", autocomplete: "off" });
+    const options = el("datalist", { id: "calendar-timezone-options" }, timezoneChoices().map((zone) => el("option", { value: zone })));
+    const localButton = el("button", { type: "button", class: "timezone-local-btn", onclick: () => { input.value = browserTimezone(); input.dispatchEvent(new Event("change", { bubbles: true })); } }, [icon("locate-fixed"), " Use browser zone"]);
+    const node = el("label", { class: "memory-field", for: attrs.id, "data-field": field.name }, [
+      el("span", { class: "memory-field-label" }, [field.label, field.required ? el("i", {}, "required") : null]),
+      el("div", { class: "timezone-control" }, [input, localButton]), options,
+      el("small", {}, "Search for an IANA zone, such as Europe/Rome."),
+    ]);
+    if (field.show_when) node.dataset.showWhen = JSON.stringify(field.show_when);
+    return node;
   } else {
-    input = el("input", { ...attrs, type: field.type === "number" ? "number" : "text", class: "memory-input", value });
+    const inputType = ["number", "datetime-local", "time"].includes(field.type) ? field.type : "text";
+    input = el("input", { ...attrs, type: inputType, class: "memory-input", value: field.type === "datetime-local" ? datetimeLocalValue(value) : value, min: field.min, step: field.step });
   }
-  return el("label", { class: "memory-field", for: attrs.id }, [
+  const node = el("label", { class: "memory-field", for: attrs.id, "data-field": field.name }, [
     el("span", { class: "memory-field-label" }, [field.label, field.required ? el("i", {}, "required") : null]),
     input,
     field.type === "tags" ? el("small", {}, "Separate values with commas") : null,
     field.type === "json" ? el("small", {}, "JSON object of emotion axis → intensity") : null,
   ]);
+  if (field.show_when) node.dataset.showWhen = JSON.stringify(field.show_when);
+  return node;
+}
+
+function syncConditionalEditorFields() {
+  for (const node of document.querySelectorAll("#memory-fields [data-show-when]")) {
+    try {
+      const rule = JSON.parse(node.dataset.showWhen);
+      const input = $(`mf-${rule.field}`);
+      node.hidden = !input || input.value !== rule.equals;
+      for (const control of node.querySelectorAll("input, select, textarea")) control.disabled = node.hidden;
+    } catch (_error) {
+      node.hidden = false;
+    }
+  }
 }
 
 function openMemoryEditor(rec = null) {
@@ -813,6 +1129,8 @@ function openMemoryEditor(rec = null) {
   $("memory-editor-error").classList.add("hidden");
   const fields = $("memory-fields"); clear(fields);
   for (const field of state.editor.fields || []) fields.appendChild(makeMemoryField(field, rec));
+  syncConditionalEditorFields();
+  for (const input of fields.querySelectorAll("select, input")) input.addEventListener("change", syncConditionalEditorFields);
   $("memory-editor-save").textContent = rec ? "Save changes" : "Add to memory";
   $("memory-editor").classList.remove("hidden");
   document.body.classList.add("modal-open");
@@ -830,8 +1148,10 @@ function gatherMemoryValues() {
   const values = {};
   for (const field of state.editor.fields || []) {
     const input = $(`mf-${field.name}`);
-    if (!input || input.disabled) continue;
+    const container = input ? input.closest(".memory-field") : document.querySelector(`#memory-fields [data-field="${field.name}"]`);
+    if ((!input && field.type !== "weekdays") || (input && input.disabled) || (container && container.hidden)) continue;
     if (field.type === "tags") values[field.name] = input.value.split(",").map((v) => v.trim()).filter(Boolean);
+    else if (field.type === "weekdays") values[field.name] = [...container.querySelectorAll("input:checked")].map((day) => Number(day.value));
     else if (field.type === "json") values[field.name] = JSON.parse(input.value || "{}");
     else if (field.type === "range" || field.type === "number") values[field.name] = Number(input.value);
     else values[field.name] = input.value;
@@ -879,6 +1199,7 @@ function selectMemory(name) {
   state.page = 1;
   state.user = "";
   state.q = "";
+  if (name === "calendar") state.calendarOffset = 0;
   $("q").value = "";
   $("user-filter").value = "";
   renderSidebar();

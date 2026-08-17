@@ -177,6 +177,17 @@ class WorldConfig:
 
 
 @dataclass
+class CalendarConfig:
+    """Configuration for the optional character/user calendar."""
+
+    timezone: str = "UTC"
+    near_past_hours: int = 24
+    near_future_days: int = 14
+    import_world_routines: bool = True
+    extract_updates: bool = True
+
+
+@dataclass
 class MemoryConfig:
     """Per-memory toggles and retrieval knobs.
 
@@ -194,6 +205,9 @@ class MemoryConfig:
     enabled_heartbeat: bool = True
     enabled_user_summary: bool = True
     enabled_world: bool = False
+    # Calendar is opt-in so existing characters do not suddenly learn from
+    # conversations or add a new prompt section.
+    enabled_calendar: bool = False
     #: Knowledge-graph retriever is OFF by default; opt in per character
     #: (e.g. the Kurisu asset flips this True) or via config.
     enabled_knowledge_graph: bool = False
@@ -210,6 +224,7 @@ class MemoryConfig:
     heartbeat_k: int = 4
     user_summary_k: int = 2
     world_k: int = 4
+    calendar_k: int = 8
     knowledge_graph_token_budget: int = 1_000
 
     # Structured Memory behavior
@@ -247,6 +262,7 @@ class MemoryConfig:
 
     # PRIVATE WORLD SIMULATION
     world: WorldConfig = field(default_factory=WorldConfig)
+    calendar: CalendarConfig = field(default_factory=CalendarConfig)
 
     # HISTORY-AWARE RETRIEVAL
     # Retrieval normally uses only the last user message as the query. These

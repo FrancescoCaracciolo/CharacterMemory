@@ -30,6 +30,7 @@ from character_memory import EmotionStatus, Memory, StructuredMemory
 from character_memory.emotion_vectors import emotion_similarity, emotional_impact
 from character_memory.memory.character_base import RAGMemory
 from character_memory.memory.knowledge_graph_memory import KnowledgeGraphMemory
+from character_memory.memory.calendar import CalendarMemory, SELF_OWNER
 
 # Hard cap on how many hits search ever ranks, so a query against a huge memory
 # stays snappy. Pagination slices within this ranked window.
@@ -339,6 +340,81 @@ class StructuredAdapter(MemoryAdapter):
                 scored.append((float(hay.count(ql)), r))
         scored.sort(key=lambda t: t[0], reverse=True)
         return [(r, s) for s, r in scored]
+
+
+class CalendarAdapter(MemoryAdapter):
+    """Agenda projection for persisted events plus live calendar sources."""
+
+    kind = "calendar"
+
+    @property
+    def m(self) -> CalendarMemory:
+        return self.memory  # type: ignore[return-type]
+
+    def count(self, user_id: Optional[str] = None) -> int:
+        if not user_id:
+            return len(self.m.all_rows())
+        target = str(user_id)
+        count = 0
+        for row in self.m.all_rows():
+            if str(row.get("user_id") or SELF_OWNER) == target:
+                count += 1
+                continue
+            try:
+                attendees = json.loads(row.get("attendees") or "[]")
+            except (TypeError, ValueError):
+                attendees = []
+            if target in {str(value) for value in attendees}:
+                count += 1
+        return count
+
+    def users(self) -> list[str]:
+        users: set[str] = set()
+        for row in self.m.all_rows():
+            users.add(str(row.get("user_id") or SELF_OWNER))
+            try:
+                users.update(json.loads(row.get("attendees") or "[]"))
+            except (TypeError, ValueError):
+                pass
+        return sorted(users)
+
+    def _records(self, *, user_id: Optional[str] = None, q: str = "", limit: int = SEARCH_CAP) -> list[MemoryRecord]:
+        now = self.m._now()
+        events = self.m.search_events(
+            q,
+            start=now - self.m.near_past_hours * 3600,
+            before=now + self.m.near_future_days * 86_400,
+            owners={user_id} if user_id else None,
+            limit=limit,
+            state_changing=False,
+        )
+        out: list[MemoryRecord] = []
+        for event in events:
+            payload = event.to_dict()
+            record_id = event.id if event.virtual else event.metadata.get("event_id", event.series_id)
+            out.append(MemoryRecord(
+                # Recurring persisted rows are edited/cancelled by their
+                # authoritative series row, not by a concrete occurrence ID.
+                id=record_id,
+                user_id=event.owner_id,
+                text=event.title,
+                score=None,
+                fields=payload,
+                meta={"source": event.source, "virtual": event.virtual, "start_at": event.start_at, "end_at": event.end_at},
+            ))
+        return out
+
+    def page(self, page: int, size: int, user_id: Optional[str] = None) -> tuple[list[MemoryRecord], int]:
+        records = self._records(user_id=user_id, limit=SEARCH_CAP)
+        total = len(records)
+        start = (page - 1) * size
+        return records[start:start + size], total
+
+    def search(self, q: str, page: int, size: int, user_id: Optional[str] = None) -> tuple[list[MemoryRecord], int]:
+        records = self._records(user_id=user_id, q=q, limit=SEARCH_CAP)
+        total = len(records)
+        start = (page - 1) * size
+        return records[start:start + size], total
 
 
 class RAGAdapter(MemoryAdapter):
@@ -669,6 +745,8 @@ def get_adapter(memory: Memory) -> MemoryAdapter:
         return cls(memory)
     if isinstance(memory, KnowledgeGraphMemory):
         return KnowledgeGraphAdapter(memory)
+    if isinstance(memory, CalendarMemory):
+        return CalendarAdapter(memory)
     if isinstance(memory, EmotionStatus):
         return EmotionAdapter(memory)
     if isinstance(memory, RAGMemory):

@@ -41,6 +41,7 @@ def memory_tools(agent: "CharacterAgent") -> list[Tool]:
         agent.generate_answer(chat, tools=tools)
     """
     from .event_tools import conversation_event_tools
+    from .calendar_tools import SearchCalendarEvents
 
     tools: list[Tool] = [
         _SearchMemory(agent),
@@ -52,6 +53,8 @@ def memory_tools(agent: "CharacterAgent") -> list[Tool]:
     memories = _agent_memories(agent)
     if getattr(memories.get("conversation_events"), "enabled", False):
         tools.extend(conversation_event_tools(agent))
+    if getattr(memories.get("calendar"), "enabled", False):
+        tools.append(SearchCalendarEvents(agent))
     return tools
 
 

@@ -55,6 +55,7 @@ from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
 from .memory.user_summary import UserSummaryMemory
 from .memory.world import WorldMemory, WorldSnapshot
+from .memory.calendar import CalendarMemory
 from .knowledge_graph.nodes import Node
 from .character_config import load_from_character_dir
 from .prompts import PromptConfig
@@ -71,6 +72,7 @@ from .tools.base import (
 )
 from .tools.memory_tools import memory_tools as _build_memory_tools
 from .tools.world_tools import world_tools as _build_world_tools
+from .tools.calendar_tools import calendar_tools as _build_calendar_tools
 from .tools.registry import ToolRegistry
 
 _INFO_GLOB = "Information"
@@ -86,6 +88,7 @@ _STRUCTURED_MEMORIES = (
     "heartbeat",
     "user_summary",
     "world",
+    "calendar",
 )
 _DEDUP_MEMORIES = (
     "user_facts", "user_directives", "episodic", "heartbeat", "user_summary"
@@ -347,6 +350,22 @@ class CharacterAgent:
                 half_life=half,
                 sticky_threshold=sticky,
             )
+        if m.is_enabled("calendar"):
+            calendar = CalendarMemory(
+                self.store,
+                hybrid(),
+                timezone=m.calendar.timezone,
+                near_past_hours=m.calendar.near_past_hours,
+                near_future_days=m.calendar.near_future_days,
+                extract_updates=m.calendar.extract_updates,
+                enabled=True,
+                half_life=half,
+                sticky_threshold=sticky,
+            )
+            world = self.memories.get("world")
+            if m.calendar.import_world_routines and isinstance(world, WorldMemory):
+                calendar.import_world(world)
+            self.memories["calendar"] = calendar
         self.memories["user_summary"] = UserSummaryMemory(
             self.store, hybrid(), enabled=m.is_enabled("user_summary"),
             half_life=half, sticky_threshold=sticky,
@@ -981,7 +1000,6 @@ class CharacterAgent:
                 messages, schemas, tool_choice=tool_choice,
             ):
                 if isinstance(ev, TextChunk):
-                    collected.append(ev.text)
                     round_content.append(ev.text)
                     yield ev
                 elif isinstance(ev, ToolCallEvent):
@@ -990,6 +1008,11 @@ class CharacterAgent:
                     yield ev
             if not has_calls:
                 # Plain-text reply (streamed above); done.
+                # Text emitted in a prior tool-call round is intermediate
+                # assistant content. It may be useful to the live stream, but
+                # only this no-call round is the visible final reply that can
+                # be persisted alongside deferred effects.
+                collected.extend(round_content)
                 if save and chat is not None:
                     self._after_generate(
                         chat, True, "".join(collected), auto_extract, effects=effects
@@ -1055,11 +1078,30 @@ class CharacterAgent:
         """Perception-filtered world tools, optionally including deferred actions."""
         return _build_world_tools(self, include_actions=include_actions)
 
+    def calendar_tools(
+        self, target: Optional[Union[Chat, str]] = None, *, include_writes: bool = True
+    ) -> list[Tool]:
+        """Return calendar tools scoped to a persisted chat's participants."""
+        participants: list[str] = []
+        if isinstance(target, Chat):
+            participants = target.participants()
+        elif isinstance(target, str):
+            chat = self._as_chat(target)
+            if chat is not None:
+                participants = chat.participants()
+        return _build_calendar_tools(self, owner_ids=participants, include_writes=include_writes)
+
     @property
     def world_memory(self) -> Optional[WorldMemory]:
         """The configured private world, or ``None`` for custom agent builds."""
         memory = self.memories.get("world")
         return memory if isinstance(memory, WorldMemory) else None
+
+    @property
+    def calendar_memory(self) -> Optional[CalendarMemory]:
+        """The configured calendar, or ``None`` for custom agent builds."""
+        memory = self.memories.get("calendar")
+        return memory if isinstance(memory, CalendarMemory) else None
 
     def world_snapshot(
         self, *, commit: bool = False, now: Optional[float] = None
@@ -1114,9 +1156,17 @@ class CharacterAgent:
         staged = list(effects or [])
         if staged:
             world = self.world_memory
-            if world is None or not world.enabled:
-                raise RuntimeError("A turn staged world effects but WorldMemory is unavailable")
-            world.commit_turn(chat.id, reply, staged)
+            calendar = self.calendar_memory
+            if any(effect.kind == "world_command" for effect in staged):
+                if world is None or not world.enabled:
+                    raise RuntimeError("A turn staged world effects but WorldMemory is unavailable")
+                world.commit_turn(chat.id, reply, staged, calendar=calendar)
+            elif any(effect.kind.startswith("calendar_") for effect in staged):
+                if calendar is None or not calendar.enabled:
+                    raise RuntimeError("A turn staged calendar effects but CalendarMemory is unavailable")
+                self._commit_calendar_turn(chat, reply, staged, calendar)
+            else:
+                raise RuntimeError("Unsupported deferred turn effect")
         else:
             chat.add_message("assistant", reply)
         # Auto-extraction (a second LLM call on the configured interval) can be
@@ -1125,6 +1175,61 @@ class CharacterAgent:
         # extraction on a background thread so the user isn't blocked on it.
         if auto_extract:
             self._maybe_auto_extract(chat)
+
+    def _commit_calendar_turn(
+        self, chat: Chat, reply: str, effects: list[TurnEffect], calendar: CalendarMemory
+    ) -> None:
+        """Atomically persist a final reply and calendar-only effects.
+
+        The normal config-driven agent shares one SQLite store across chats and
+        structured memories, so the reply and effects are committed in one
+        transaction. ``CharacterAgent.load(...)`` also permits caller-owned
+        memories with their own store; in that extension path we commit the
+        reply first, apply the calendar transaction, and remove the reply if
+        validation fails (SQLite cannot span two independent connections).
+        """
+        assert self.store is not None
+        now = time.time()
+        ids: list[int] = []
+
+        if getattr(calendar, "store", None) is not self.store:
+            with self.store.transaction(immediate=True) as conn:
+                cur = conn.execute(
+                    "INSERT INTO messages(chat_id,role,content,user_id,occurred_at,created_at,extracted) "
+                    "VALUES(?,?,?,?,?,?,0)",
+                    [chat.id, "assistant", reply, None, None, now],
+                )
+                message_id = int(cur.lastrowid)
+            try:
+                with calendar.store.transaction(immediate=True) as conn:
+                    for effect in effects:
+                        ids.append(calendar.apply_deferred_effect(
+                            conn, effect.kind, effect.payload,
+                            source_message_id=message_id, now=now,
+                        ))
+            except BaseException:
+                # Best-effort compensation keeps a failed deferred effect from
+                # leaving a visible assistant turn in the custom-store path.
+                self.store.execute("DELETE FROM messages WHERE id=?", [message_id])
+                raise
+            if ids:
+                calendar.apply_index_changes(updated_ids=ids)
+            return
+
+        with self.store.transaction(immediate=True) as conn:
+            cur = conn.execute(
+                "INSERT INTO messages(chat_id,role,content,user_id,occurred_at,created_at,extracted) "
+                "VALUES(?,?,?,?,?,?,0)",
+                [chat.id, "assistant", reply, None, None, now],
+            )
+            message_id = int(cur.lastrowid)
+            for effect in effects:
+                ids.append(calendar.apply_deferred_effect(
+                    conn, effect.kind, effect.payload,
+                    source_message_id=message_id, now=now,
+                ))
+        if ids:
+            calendar.apply_index_changes(updated_ids=ids)
 
     # Extraction
     def _extract_messages(

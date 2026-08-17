@@ -23,6 +23,14 @@ from .world import (
     WorldSnapshot,
     WorldStateStore,
 )
+from .calendar import (
+    CalendarEvent,
+    CalendarMemory,
+    CalendarOccurrence,
+    CalendarSource,
+    WorldRoutineCalendarSource,
+    SELF_OWNER,
+)
 
 __all__ = [
     "Memory",
@@ -56,4 +64,10 @@ __all__ = [
     "WorldSimulator",
     "RuleBasedWorldSimulator",
     "WorldMemory",
+    "CalendarEvent",
+    "CalendarOccurrence",
+    "CalendarSource",
+    "WorldRoutineCalendarSource",
+    "CalendarMemory",
+    "SELF_OWNER",
 ]

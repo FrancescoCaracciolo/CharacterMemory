@@ -17,6 +17,7 @@ from typing import Any
 
 from ..emotion_vectors import emotion_vector, encode_emotion_vector
 from ..memory.conversation_events import ConversationEventMemory
+from ..memory.calendar import CalendarMemory
 from ..memory.emotion import EmotionStatus
 from ..memory.episodic import EpisodicMemory
 from ..memory.structured import StructuredMemory
@@ -169,6 +170,25 @@ def edit_schema(memory: Any) -> dict[str, Any]:
                 "chat messages."
             ),
         }
+    if isinstance(memory, CalendarMemory):
+        return {
+            "editable": True,
+            "fields": [
+                {"name": "user_id", "label": "Owner ID", "type": "text", "required": False, "default": "_self", "placeholder": "_self or user", "readonly_on_edit": True},
+                {"name": "title", "label": "Title", "type": "textarea", "required": True},
+                {"name": "description", "label": "Description", "type": "textarea"},
+                {"name": "location", "label": "Location", "type": "text"},
+                {"name": "timezone", "label": "Time zone", "type": "timezone", "default": memory.default_timezone},
+                {"name": "kind", "label": "Schedule", "type": "select", "options": ["event", "routine"], "default": "event"},
+                {"name": "start_at", "label": "Starts", "type": "datetime-local", "required": True, "show_when": {"field": "kind", "equals": "event"}},
+                {"name": "end_at", "label": "Ends", "type": "datetime-local", "required": True, "show_when": {"field": "kind", "equals": "event"}},
+                {"name": "weekdays", "label": "Repeats on", "type": "weekdays", "show_when": {"field": "kind", "equals": "routine"}},
+                {"name": "start_local", "label": "Starts at", "type": "time", "required": True, "show_when": {"field": "kind", "equals": "routine"}},
+                {"name": "duration_minutes", "label": "Duration (minutes)", "type": "number", "required": True, "min": 1, "step": 5, "show_when": {"field": "kind", "equals": "routine"}},
+                {"name": "attendees", "label": "Attendees", "type": "tags"},
+            ],
+            "description": "Create or edit one-off events and weekly routines. World routines are read-only live projections.",
+        }
     if isinstance(memory, EmotionStatus):
         fields: list[dict[str, Any]] = [
             {
@@ -231,6 +251,12 @@ def _normalise(memory: Any, values: dict[str, Any], *, partial: bool) -> dict[st
     allowed = {f["name"]: f for f in schema["fields"]}
     clean: dict[str, Any] = {}
     for name, field in allowed.items():
+        rule = field.get("show_when")
+        if rule:
+            controller = allowed.get(rule.get("field"), {})
+            controller_value = values.get(rule.get("field"), controller.get("default"))
+            if controller_value != rule.get("equals"):
+                continue
         if name not in values:
             if not partial and field.get("required") and field.get("default") is None:
                 raise ValueError(f"{field['label']} is required.")
@@ -242,7 +268,7 @@ def _normalise(memory: Any, values: dict[str, Any], *, partial: bool) -> dict[st
             clean[name] = _clip(value, float(field["min"]), float(field["max"]))
         elif field["type"] == "number":
             clean[name] = float(value)
-        elif field["type"] == "tags":
+        elif field["type"] in {"tags", "weekdays"}:
             if isinstance(value, str):
                 value = [part.strip() for part in value.split(",") if part.strip()]
             if not isinstance(value, list):
@@ -300,6 +326,15 @@ def create_record(agent: Any, memory: Any, values: dict[str, Any]) -> Any:
         memory.set_user_comment(user_id, comment)
         return user_id
 
+    if isinstance(memory, CalendarMemory):
+        owner = clean.pop("user_id", "_self")
+        clean.pop("importance", None)
+        row_id = memory.create_event(owner, source="webui", **clean)
+        # CalendarMemory synchronizes its in-memory index during the write;
+        # persist only here so the editor does not embed the row twice.
+        _refresh_index(agent, memory)
+        return row_id
+
     assert isinstance(memory, StructuredMemory)
     user_id = clean.pop("user_id", "_self")
     importance = clean.pop("importance", getattr(memory, "default_importance", 0.5))
@@ -344,6 +379,11 @@ def update_record(
     if row is None:
         raise KeyError(record_id)
     clean.pop("user_id", None)  # record ownership is immutable from the editor
+    if isinstance(memory, CalendarMemory):
+        clean.pop("importance", None)
+        memory.update_event(row_id, **clean)
+        _refresh_index(agent, memory)
+        return row_id
     for key, value in clean.items():
         if key == "emotional_shift" and isinstance(memory, EpisodicMemory):
             row[key] = encode_emotion_vector(value, allowed_axes=memory.emotion_baseline)
@@ -372,6 +412,10 @@ def delete_record(agent: Any, memory: Any, record_id: str) -> Any:
         raise ValueError("Structured memory record IDs must be integers.") from exc
     if memory.get_row(row_id) is None:
         raise KeyError(record_id)
+    if isinstance(memory, CalendarMemory):
+        memory.cancel_event(row_id)
+        _refresh_index(agent, memory)
+        return row_id
     memory.delete_row(row_id)
     _refresh_index(agent, memory, removed_ids=(row_id,))
     return row_id

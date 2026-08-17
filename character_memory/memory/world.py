@@ -1387,14 +1387,21 @@ class WorldMemory(Memory):
         )
 
     def commit_turn(
-        self, chat_id: str, reply: str, effects: list["TurnEffect"]
+        self, chat_id: str, reply: str, effects: list["TurnEffect"],
+        *, calendar: Optional[Any] = None,
     ) -> int:
-        """Atomically persist final assistant text and all staged world effects."""
+        """Atomically persist final assistant text and staged world/calendar effects."""
         commands: list[WorldCommand] = []
+        calendar_effects: list["TurnEffect"] = []
         for effect in effects:
+            if effect.kind in {"calendar_create", "calendar_update", "calendar_cancel"}:
+                calendar_effects.append(effect)
+                continue
             if effect.kind != "world_command":
                 raise ValueError(f"Unsupported deferred effect {effect.kind!r}")
             commands.append(self.validate_command_dict(effect.payload))
+        if calendar_effects and calendar is None:
+            raise ValueError("Calendar effects require an enabled CalendarMemory")
         now = self._now()
         observer_id = self.observer_id
         for command in commands:
@@ -1458,6 +1465,13 @@ class WorldMemory(Memory):
                 )
                 if rec.rowcount:
                     indexed_ids.append(int(rec.lastrowid))
+            calendar_ids: list[int] = []
+            if calendar_effects:
+                for effect in calendar_effects:
+                    calendar_ids.append(calendar.apply_deferred_effect(
+                        conn, effect.kind, effect.payload,
+                        source_message_id=message_id, now=now,
+                    ))
             revision_row = conn.execute(
                 "SELECT value FROM world_meta WHERE key='revision'"
             ).fetchone()
@@ -1476,6 +1490,8 @@ class WorldMemory(Memory):
             )
         if indexed_ids:
             self.records.apply_index_changes(updated_ids=indexed_ids)
+        if calendar_effects:
+            calendar.apply_index_changes(updated_ids=calendar_ids)
         return message_id
 
     def _command_transition(

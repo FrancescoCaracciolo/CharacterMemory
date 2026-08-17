@@ -57,6 +57,7 @@ from character_memory import (
     LLMConfig,
     MemoryConfig,
 )
+from character_memory.memory.calendar import CalendarMemory, SELF_OWNER, _parse_iso
 
 # Read-side memory browser: normalises each memory backend into paged,
 # searchable records and powers the GUI served at /gui.
@@ -261,6 +262,12 @@ class SaveResponse(BaseModel):
 
 class MemoryMutationRequest(BaseModel):
     """Fields submitted by the browser's schema-driven memory editor."""
+
+    values: dict = Field(default_factory=dict)
+
+
+class CalendarMutationRequest(BaseModel):
+    """Calendar event/routine fields used by the agenda editor."""
 
     values: dict = Field(default_factory=dict)
 
@@ -541,6 +548,81 @@ def remove_memory_record(character: str, memory: str, record_id: str) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"ok": True, "id": deleted_id, "memory": memory}
+
+
+def _calendar_for_api(character: str) -> tuple[CharacterAgent, CalendarMemory]:
+    agent = _get_agent(character)
+    memory = agent.calendar_memory
+    if memory is None or not memory.enabled:
+        raise HTTPException(status_code=409, detail="CalendarMemory is not enabled.")
+    return agent, memory
+
+
+@app.get("/api/calendar/{character}/events")
+def calendar_events(
+    character: str,
+    start: Optional[str] = Query(None, description="ISO lower bound (inclusive)."),
+    before: Optional[str] = Query(None, description="ISO upper bound (exclusive)."),
+    q: Optional[str] = Query(None),
+    owner: Optional[list[str]] = Query(None),
+    include_cancelled: bool = Query(False),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict:
+    _agent, calendar = _calendar_for_api(character)
+    try:
+        lo = _parse_iso(start, timezone=calendar.default_timezone) if start else None
+        hi = _parse_iso(before, timezone=calendar.default_timezone) if before else None
+        events = calendar.search_events(
+            q or "", start=lo, before=hi, owners=owner,
+            include_cancelled=include_cancelled, limit=limit, state_changing=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "character": character,
+        "timezone": calendar.default_timezone,
+        "events": [event.to_dict() for event in events],
+    }
+
+
+@app.post("/api/calendar/{character}/events", status_code=201)
+def create_calendar_event(character: str, req: CalendarMutationRequest) -> dict:
+    _agent, calendar = _calendar_for_api(character)
+    values = dict(req.values)
+    owner = str(values.pop("owner_id", values.pop("user_id", SELF_OWNER)) or SELF_OWNER)
+    try:
+        event_id = calendar.create_event(owner, source="webui", **values)
+        _agent.persist_structured()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "id": event_id, "event": calendar.get_row(event_id)}
+
+
+@app.patch("/api/calendar/{character}/events/{event_id}")
+def update_calendar_event(character: str, event_id: int, req: CalendarMutationRequest) -> dict:
+    _agent, calendar = _calendar_for_api(character)
+    values = dict(req.values)
+    values.pop("owner_id", None)
+    values.pop("user_id", None)
+    try:
+        calendar.update_event(event_id, **values)
+        _agent.persist_structured()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown calendar event {event_id}.") from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "id": event_id, "event": calendar.get_row(event_id)}
+
+
+@app.post("/api/calendar/{character}/events/{event_id}/cancel")
+def cancel_calendar_event(character: str, event_id: int) -> dict:
+    _agent, calendar = _calendar_for_api(character)
+    try:
+        calendar.cancel_event(event_id)
+        _agent.persist_structured()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown calendar event {event_id}.") from exc
+    return {"ok": True, "id": event_id, "event": calendar.get_row(event_id)}
 
 
 @app.get("/api/graph/{character}")
