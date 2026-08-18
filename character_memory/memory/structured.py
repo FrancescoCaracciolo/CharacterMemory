@@ -13,9 +13,15 @@ from typing import Any, Callable, Optional
 
 from ..chunking.base import Chunk
 from ..config import ContradictionPolicy
+from ..rag.base import Query
 from ..rag.hybrid import HybridSearch
 from .base import Memory, MemoryItem
-from .decay import age_seconds, decay_score
+from .decay import (
+    age_seconds,
+    decay_score,
+    intrinsic_score,
+    relevance_repaired_score,
+)
 from .store import SQLiteStore
 
 # Columns every structured memory gets for free (decay + multi-user bookkeeping).
@@ -35,9 +41,8 @@ class StructuredMemory(Memory):
     table: str = "structured"
     extra_columns: dict[str, str] = {}  # memory-specific columns
     text_column: str = "content"        # column holding the primary text for this memory
-    # Most structured memories use hybrid search only to form a candidate set,
-    # then rank by salience/decay. Source-event memory opts into retrieval order
-    # because all of its immutable rows intentionally have equal importance.
+    # Retained for source compatibility with older subclasses. Relevance is
+    # now part of every candidate's bounded score instead of an alternate sort.
     rank_by_relevance: bool = False
 
     def __init__(
@@ -196,66 +201,187 @@ class StructuredMemory(Memory):
 
     # RECALL functions
     def _effective(self, row: dict[str, Any]) -> float:
-        # For emotional impact it must be overridden
+        """Query-independent familiar salience (override for custom models)."""
         return decay_score(
             base_importance=float(row["importance"]),
             recall_count=int(row.get("recall_count", 0)),
             age_seconds=age_seconds(
-                float(row["created_at"]), row.get("last_recalled"), self._now()
+                self._age_anchor(row), row.get("last_recalled"), self._now()
             ),
             half_life=self.half_life,
         )
 
+    def _age_anchor(self, row: dict[str, Any]) -> float:
+        """Creation/event timestamp from which this memory actually ages."""
+        semantic_time = row.get("occurred_at")
+        return float(
+            semantic_time
+            if semantic_time is not None
+            else row["created_at"]
+        )
+
+    def _intrinsic(self, row: dict[str, Any]) -> float:
+        """Salience before decay/familiarity (override with `_effective`)."""
+        return intrinsic_score(float(row["importance"]))
+
+    def _rank_score(self, row: dict[str, Any], relevance: float) -> float:
+        """Final candidate score after bounded relevance repair."""
+        return relevance_repaired_score(
+            self._intrinsic(row), self._effective(row), relevance
+        )
+
+    def _recall_where(self, user_id: str) -> dict[str, Any] | None:
+        """Hybrid/SQLite filter for one recall; character memories override."""
+        return {"user_id": user_id}
+
+    def _sticky_rows(self, rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Rows eligible for the one-slot sticky reservation."""
+        return [
+            row
+            for row in rows
+            if float(row["importance"]) >= self.sticky_threshold
+        ]
+
+    def _additional_relevance(
+        self,
+        query: Query,
+        rows_by_id: dict[int, dict[str, Any]],
+    ) -> dict[int, float]:
+        """Subclass hook for non-RAG triggers such as directive keywords."""
+        return {}
+
+    @staticmethod
+    def _hit_relevance(hits: list[Any]) -> dict[int, float]:
+        """Map row ids to normalized relevance, with a generic-RAG fallback."""
+        positive = [max(0.0, float(hit.score)) for hit in hits]
+        fallback_max = max(positive, default=0.0)
+        relevance: dict[int, float] = {}
+        for hit in hits:
+            rid = hit.metadata.get("id")
+            if rid is None:
+                continue
+            normalized = hit.metadata.get("normalized_relevance")
+            if normalized is None:
+                normalized = (
+                    max(0.0, float(hit.score)) / fallback_max
+                    if fallback_max > 0.0
+                    else 0.0
+                )
+            try:
+                row_id = int(rid)
+            except (TypeError, ValueError):
+                # Structured rows are integer SQLite ids. A malformed or
+                # foreign backend hit is not a candidate for this memory.
+                continue
+            relevance[row_id] = max(
+                relevance.get(row_id, 0.0),
+                max(0.0, min(1.0, float(normalized))),
+            )
+        return relevance
+
+    def _scored_item(
+        self,
+        row: dict[str, Any],
+        *,
+        score: float,
+        relevance: float,
+    ) -> MemoryItem:
+        item = self.row_item(row, score)
+        item.metadata.update({
+            "intrinsic_score": self._intrinsic(row),
+            "familiar_score": self._effective(row),
+            "retrieval_relevance": relevance,
+            "ranking_score": score,
+        })
+        return item
+
     def recall(
         self,
-        query: str,
+        query: Query,
         user_id: str,
         limit: int,
         sticky_limit: int = 10,
         state_changing: bool = True,
     ) -> list[MemoryItem]:
-        rows_by_id = {r["id"]: r for r in self.store.select(self.table, {"user_id": user_id})}
+        if limit <= 0:
+            return []
+
+        where = self._recall_where(user_id)
+        rows = self.store.select(self.table, where)
+        rows_by_id = {int(r["id"]): r for r in rows}
         if not rows_by_id:
             return []
 
-        # BM25 + similarity retrieval for this user.
-        hits = self.hybrid.search(query, k=max(limit, self.hybrid.candidate_pool), where={"user_id": user_id})
-        retrieval_ranks: dict[int, int] = {}
-        for rank, hit in enumerate(hits):
-            rid = hit.metadata.get("id")
+        # Search forms the query candidates. HybridSearch supplies an absolute
+        # normalized score; third-party RAG backends fall back to normalization
+        # against their best hit for this call.
+        candidate_pool = int(getattr(self.hybrid, "candidate_pool", max(limit, 30)))
+        hits = self.hybrid.search(
+            query,
+            k=max(limit, candidate_pool),
+            where=where,
+        )
+        relevance_by_id = {
+            rid: relevance
+            for rid, relevance in self._hit_relevance(hits).items()
+            if rid in rows_by_id
+        }
+        for rid, relevance in self._additional_relevance(query, rows_by_id).items():
             if rid in rows_by_id:
-                retrieval_ranks.setdefault(int(rid), rank)
-        candidate_ids: set[int] = set(retrieval_ranks)
+                relevance_by_id[rid] = max(
+                    relevance_by_id.get(rid, 0.0),
+                    max(0.0, min(1.0, float(relevance))),
+                )
 
-        # High base-importance, injected regardless of query.
-        i = 0
-        for rid, row in rows_by_id.items():
-            if float(row["importance"]) >= self.sticky_threshold:
-                candidate_ids.add(rid)
-            i+=1
-            if i >= sticky_limit:
-                break
+        sticky = self._sticky_rows(rows)
+        sticky_ids = {int(row["id"]) for row in sticky}
+        reserve_sticky = limit > 1 and sticky_limit > 0 and bool(sticky_ids)
+        candidate_ids = set(relevance_by_id)
+        if reserve_sticky:
+            candidate_ids.update(sticky_ids)
 
-        scored = []
+        scored: list[tuple[float, int, dict[str, Any], float]] = []
         for rid in candidate_ids:
             row = rows_by_id[rid]
-            scored.append((self._effective(row), row))
-        if self.rank_by_relevance:
-            scored.sort(
-                key=lambda kv: (
-                    retrieval_ranks.get(int(kv[1]["id"]), len(hits) + 1),
-                    -kv[0],
-                )
+            relevance = relevance_by_id.get(rid, 0.0)
+            scored.append((self._rank_score(row, relevance), rid, row, relevance))
+        scored.sort(key=lambda entry: (entry[0], entry[3], -entry[1]), reverse=True)
+        if reserve_sticky:
+            # A single partitioned slot prevents a collection of fresh,
+            # high-importance but irrelevant sticky rows from consuming the
+            # entire prompt. Query relevance still decides which sticky row
+            # wins that slot.
+            sticky_entries = [entry for entry in scored if entry[1] in sticky_ids]
+            ordinary_entries = [
+                entry for entry in scored if entry[1] not in sticky_ids
+            ]
+            chosen = [
+                *ordinary_entries[: limit - 1],
+                max(
+                    sticky_entries,
+                    key=lambda entry: (
+                        entry[0],
+                        entry[3],
+                        self._effective(entry[2]),
+                        -entry[1],
+                    ),
+                ),
+            ]
+            chosen.sort(
+                key=lambda entry: (entry[0], entry[3], -entry[1]),
+                reverse=True,
             )
         else:
-            scored.sort(key=lambda kv: kv[0], reverse=True)
-        chosen = scored[:limit]
+            chosen = scored[:limit]
 
         # Bump recall counters for what we surfaced (skipped when read-only).
         if state_changing:
-            self._bump_recall([row["id"] for _, row in chosen])
+            self._bump_recall([row["id"] for _, _, row, _ in chosen])
 
-        return [self.row_item(row, score) for score, row in chosen]
+        return [
+            self._scored_item(row, score=score, relevance=relevance)
+            for score, _, row, relevance in chosen
+        ]
 
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
         """All rows in this memory's table, rendered as items.

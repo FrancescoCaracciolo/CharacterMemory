@@ -1,11 +1,10 @@
-"""Activation functions: ACT-R base-level learning + spreading activation.
+"""Activation functions: bounded ACT-R-style retention + spreading activation.
 
 Two pieces, kept pure (no I/O, no globals) so they are easy to test and so
 the retriever can compose them:
 
-- :func:`base_level_activation` — the exact ACT-R base-level learning (BLL)
-  formula from a node's `practice_times`. Practice events are the node's
-  creation timestamp and every recall.
+- :func:`base_level_activation` — ACT-R power-law retention anchored to node
+  creation, with bounded familiarity from prompt exposure.
 - :func:`spread_activation` — Anderson-style spreading over the graph, up to
   a configurable number of hops, weighted by edge strength and the fan-out
   of the source node.
@@ -22,7 +21,8 @@ import math
 from typing import Optional
 
 from ..emotion_vectors import emotion_similarity, emotional_impact
-from .edges import Edge, EpisodeEdge, FactEdge, RelationEdge
+from ..memory.decay import MAX_EXPOSURE_BOOST, exposure_saturation
+from .edges import CoOccurrenceEdge, Edge, EpisodeEdge, FactEdge, RelationEdge
 from .graph import KnowledgeGraph
 from .nodes import Node
 
@@ -34,30 +34,34 @@ def base_level_activation(
     decay: float = 0.5,
     decay_half_life: float = 0.0,
 ) -> float:
-    """ACT-R base-level learning: ``B = ln(Σ_j t_j^-d)``.
+    """Return bounded ACT-R-style base-level activation.
 
-    `t_j` is the elapsed time since practice event `j`. The formula is
-    evaluated exactly from `node.practice_times`. When there are no practice
-    events the node gets a small floor so it can still be activated by
-    spreading. A secondary `decay_half_life` (seconds, optional) adds an
-    exponential recency factor on top, mirroring the library's existing
-    decay model so a stale-but-practiced node still fades between practices.
+    Creation contributes the usual power-law mass. Prompt exposure can
+    multiply that mass by at most 1.10, reaching half of the allowance at ten
+    recalls. Neither the last-recalled time nor later practice timestamps
+    reset age. The optional exponential factor is applied to positive
+    activation mass before taking its logarithm, so stale negative activation
+    cannot become spuriously stronger.
     """
-    if not node.practice_times:
+    created_at = float(node.created_at or 0.0)
+    if created_at <= 0.0 and node.practice_times:
+        created_at = min(float(t) for t in node.practice_times)
+    if created_at <= 0.0:
         return -2.0
-    total = 0.0
-    for t in node.practice_times:
-        dt = max(1e-3, now - float(t))
-        total += math.pow(dt, -decay)
-    if total <= 0.0:
-        return -2.0
-    bll = math.log(total)
-    # Recency nudges: a node practiced long ago and never since fades a bit.
+
+    age = max(1e-3, now - created_at)
+    mass = math.pow(age, -decay)
     if decay_half_life and decay_half_life > 0.0:
-        last = max(node.practice_times)
-        age = max(0.0, now - last)
-        bll *= math.exp(-age / (decay_half_life * 2.0))
-    return bll
+        mass *= math.exp(-age / (decay_half_life * 2.0))
+    # Keep the graph's established floor so direct query seeds and spreading
+    # can still recover an old node. Familiarity is added above that floor;
+    # applying it before the clamp would erase the bounded benefit for almost
+    # every realistically-aged node.
+    retained = max(-2.0, math.log(max(mass, 1e-300)))
+    familiarity = 1.0 + (
+        MAX_EXPOSURE_BOOST * exposure_saturation(node.recall_count)
+    )
+    return retained + math.log(familiarity)
 
 
 def _node_strength(node: Node) -> float:
@@ -83,7 +87,10 @@ def _node_strength(node: Node) -> float:
 
 def _edge_strength(edge: Edge) -> float:
     """The `u->v` edge weight in [0, 1]."""
-    base = float(getattr(edge, "weight", 0.5) or 0.5)
+    if isinstance(edge, CoOccurrenceEdge):
+        base = edge.effective_weight()
+    else:
+        base = float(getattr(edge, "weight", 0.5) or 0.5)
     base = max(0.0, min(1.0, base))
     # Strong relationship signals and episode-vector impact push the weight
     # up from the centre.

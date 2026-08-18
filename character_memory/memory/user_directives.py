@@ -3,7 +3,7 @@
 import json
 from typing import TYPE_CHECKING, Any, Optional
 
-from ..rag.base import as_queries
+from ..rag.base import Query, as_queries
 from .base import ExtractionSpec, MemoryItem
 from .structured import StructuredMemory
 
@@ -50,33 +50,18 @@ class UserDirectiveMemory(StructuredMemory):
         except (TypeError, ValueError):
             return []
 
-    def recall(
+    def _additional_relevance(
         self,
-        query: str,
-        user_id: str,
-        limit: int,
-        sticky_limit: int = 10,
-        state_changing: bool = True,
-    ) -> list[MemoryItem]:
-        items = super().recall(query, user_id, limit, sticky_limit, state_changing=state_changing)
-        # Keyword boost: directives whose keywords appear in the query are
-        # surfaced even if hybrid recall missed them. `query` may be a single
-        # string or a list of ``(text, weight)`` pairs (history-aware
-        # retrieval); join every weighted text so a directive is boosted when
-        # its keyword shows up in any recent message.
+        query: Query,
+        rows_by_id: dict[int, dict[str, Any]],
+    ) -> dict[int, float]:
+        """Treat an explicit keyword match as maximum retrieval relevance."""
         ql = " ".join(q for q, _ in as_queries(query)).lower()
-        rows_by_id = {r["id"]: r for r in self.store.select(self.table, {"user_id": user_id})}
-        have = {int(it.metadata["id"]) for it in items}
-        boosted = []
-        for rid, row in rows_by_id.items():
-            if rid in have:
-                continue
-            if any(kw and kw.lower() in ql for kw in self._keywords(row)):
-                boosted.append((self._effective(row), row))
-        boosted.sort(key=lambda kv: kv[0], reverse=True)
-        for score, row in boosted[: max(0, limit - len(items))]:
-            items.append(self.row_item(row, score))
-        return items
+        return {
+            rid: 1.0
+            for rid, row in rows_by_id.items()
+            if any(kw and kw.lower() in ql for kw in self._keywords(row))
+        }
 
     def row_text(self, row: dict[str, Any]) -> str:
         kws = self._keywords(row)

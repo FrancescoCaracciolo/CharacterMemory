@@ -34,8 +34,9 @@ class Node:
     created_at: float = 0.0
     last_recalled: Optional[float] = None
     recall_count: int = 0
-    #: Exact list of practice-event timestamps (creation + every recall). The
-    #: ACT-R base-level learning formula sums over these exactly.
+    #: Historical practice-event timestamps (creation + every recall). Kept
+    #: for persistence compatibility and diagnostics; scoring now uses the
+    #: bounded recall-count signal instead of summing this list.
     practice_times: list[float] = field(default_factory=list)
     #: `"<memory_name>:<row_id>"` — back-reference to the source row, so a
     #: dedup report can be mapped to graph mutations. Empty for nodes not

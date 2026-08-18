@@ -559,12 +559,11 @@ class KnowledgeGraphRetriever:
     def _seed_activations(self, query: str) -> dict[str, float]:
         """RRF-score the query against the node-text index + seed the SelfNode.
 
-        Each hit contributes two things: a fixed base (so a lexical/semantic
-        match always meaningfully lifts a node above the ACT-R decay floor)
-        plus the RRF score scaled by ``match_gain`` (so better matches rank
-        higher within the matched set). Without the fixed base the tiny RRF
-        scores (~0.02-0.05) are drowned by the BLL term and query relevance
-        is invisible in the ranking.
+        Each hit contributes two things: a relevance-scaled base (so a strong
+        lexical/semantic match meaningfully lifts a node above the ACT-R decay
+        floor without amplifying marginal candidates) plus the RRF score
+        scaled by ``match_gain``. Without the base the tiny RRF scores
+        (~0.02-0.05) are drowned by the BLL term.
         """
         seeds: dict[str, float] = {}
         if self.graph.SELF_ID in self.graph.nodes:
@@ -578,16 +577,22 @@ class KnowledgeGraphRetriever:
             hits = self.hybrid.search(query, k=max(10, self.config.hops * 8))
         except Exception:
             hits = []
-        # Fixed per-hit base scaled by rank: the top hit gets the full base,
-        # trailing hits get less. This makes "matched, ranked" nodes clearly
-        # outrank "unmatched but not decayed" ones.
+        # Per-hit base scaled by both rank and qualified retrieval relevance.
         n_hits = max(1, len(hits))
         for rank, h in enumerate(hits):
             nid = h.metadata.get("id")
             if not (isinstance(nid, str) and nid in self.graph.nodes):
                 continue
+            relevance = max(
+                0.0,
+                min(1.0, float(h.metadata.get("normalized_relevance", 1.0))),
+            )
+            if relevance <= 0.0:
+                continue
             rank_base = self.config.match_base * (1.0 - 0.6 * rank / n_hits)
-            seeds[nid] = seeds.get(nid, 0.0) + rank_base + float(h.score) * self.config.match_gain
+            seeds[nid] = seeds.get(nid, 0.0) + (
+                rank_base * relevance + float(h.score) * self.config.match_gain
+            )
         return seeds
 
     def test_activation(self, query: str, *, user_id: Optional[str] = None) -> dict[str, float]:
@@ -675,10 +680,10 @@ class KnowledgeGraphRetriever:
         `timestamp_style` must match the one the caller will render with so
         the measurement and the final body agree.
 
-        When `state_changing` is True (the default) the surfaced nodes get a
-        practice event appended and the Hebbian step strengthens the
-        co-occurrence edges between co-activated nodes. Read-only previews
-        pass `state_changing=False`.
+        When `state_changing` is True (the default) surfaced nodes update
+        exposure telemetry and receive the bounded familiarity benefit; the
+        Hebbian step also strengthens co-occurrence edges up to their cap.
+        Read-only previews pass `state_changing=False`.
         """
         if not self.graph.nodes:
             return []
@@ -738,7 +743,10 @@ class KnowledgeGraphRetriever:
                 if edge is None:
                     continue
                 edge.co_recall_count += 1
-                edge.weight = min(1.0, float(edge.weight) + lr)
+                edge.weight = min(
+                    float(edge.creation_weight or 0.0) + 0.10,
+                    float(edge.weight) + lr,
+                )
 
     # --------------------------------------------------------------- rendering
     @staticmethod

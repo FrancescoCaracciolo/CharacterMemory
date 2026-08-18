@@ -186,7 +186,12 @@ class StructuredAdapter(MemoryAdapter):
         )
         return [r["user_id"] for r in rows]
 
-    def _record(self, row: dict[str, Any], score: Optional[float] = None) -> MemoryRecord:
+    def _record(
+        self,
+        row: dict[str, Any],
+        score: Optional[float] = None,
+        retrieval_meta: Optional[dict[str, Any]] = None,
+    ) -> MemoryRecord:
         # Use the memory's own effective-importance (episodic weights in emotion).
         eff = self._safe_effective(row)
         fields = dict(row)
@@ -197,6 +202,15 @@ class StructuredAdapter(MemoryAdapter):
             "created_at": row.get("created_at"),
             "last_recalled": row.get("last_recalled"),
         }
+        if retrieval_meta:
+            for key in (
+                "bm25_score",
+                "dense_similarity",
+                "rrf_relevance",
+                "normalized_relevance",
+            ):
+                if key in retrieval_meta:
+                    meta[key] = retrieval_meta[key]
         if self.m.name == "episodic":
             try:
                 item = self.m.row_item(row, eff or 0.0)
@@ -261,7 +275,10 @@ class StructuredAdapter(MemoryAdapter):
         ranked = self._ranked_rows(q, user_id)
         total = len(ranked)
         start = (page - 1) * size
-        return [self._record(r, score=s) for r, s in ranked[start : start + size]], total
+        return [
+            self._record(r, score=s, retrieval_meta=m)
+            for r, s, m in ranked[start : start + size]
+        ], total
 
     def search_created_between(
         self,
@@ -281,7 +298,10 @@ class StructuredAdapter(MemoryAdapter):
         )
         total = len(ranked)
         start = (page - 1) * size
-        return [self._record(r, score=s) for r, s in ranked[start : start + size]], total
+        return [
+            self._record(r, score=s, retrieval_meta=m)
+            for r, s, m in ranked[start : start + size]
+        ], total
 
     def _ranked_rows(
         self,
@@ -290,7 +310,7 @@ class StructuredAdapter(MemoryAdapter):
         *,
         created_from: Optional[float] = None,
         created_before: Optional[float] = None,
-    ) -> list[tuple[dict, float]]:
+    ) -> list[tuple[dict, float, dict[str, Any]]]:
         q = (q or "").strip()
         if not q:
             return []
@@ -307,12 +327,12 @@ class StructuredAdapter(MemoryAdapter):
                     user_id, created_from, created_before
                 )
             }
-            out: list[tuple[dict, float]] = []
+            out: list[tuple[dict, float, dict[str, Any]]] = []
             for h in hits:
                 rid = h.metadata.get("id")
                 row = rows_by_id.get(rid)
                 if row:
-                    out.append((row, float(h.metadata.get("similarity") or h.score)))
+                    out.append((row, float(h.score), dict(h.metadata or {})))
             if out:
                 return out
         # Lexical fallback (embedding server down / no hits): substring + count.
@@ -330,7 +350,7 @@ class StructuredAdapter(MemoryAdapter):
         *,
         created_from: Optional[float] = None,
         created_before: Optional[float] = None,
-    ) -> list[tuple[dict, float]]:
+    ) -> list[tuple[dict, float, dict[str, Any]]]:
         ql = q.lower()
         rows = self._created_rows(user_id, created_from, created_before)
         scored: list[tuple[float, dict]] = []
@@ -339,7 +359,19 @@ class StructuredAdapter(MemoryAdapter):
             if ql in hay:
                 scored.append((float(hay.count(ql)), r))
         scored.sort(key=lambda t: t[0], reverse=True)
-        return [(r, s) for s, r in scored]
+        return [
+            (
+                r,
+                s,
+                {
+                    "bm25_score": s,
+                    "dense_similarity": 0.0,
+                    "rrf_relevance": 0.0,
+                    "normalized_relevance": 1.0,
+                },
+            )
+            for s, r in scored
+        ]
 
 
 class CalendarAdapter(MemoryAdapter):

@@ -291,7 +291,15 @@ class CharacterAgent:
         sticky = m.sticky_threshold
 
         def hybrid() -> HybridSearch:
-            return HybridSearch(self.embedder)  # type: ignore[arg-type]
+            min_similarity = (
+                self.config.embedding.retrieval_min_similarity
+                if self.config is not None
+                else None
+            )
+            return HybridSearch(  # type: ignore[arg-type]
+                self.embedder,
+                min_dense_similarity=min_similarity,
+            )
 
         # A shared deduplicator, built when dedup is enabled. It is *not*
         # injected into memories — it runs as a post-extraction step on the
@@ -545,6 +553,21 @@ class CharacterAgent:
             path = os.path.join(self.save_directory, f"{name}_index")
             if self._has_index(name + "_index"):
                 mem.load(path)
+                # SQLite is authoritative for structured memories.  A
+                # truncated/empty nodes snapshot must never hide durable rows
+                # merely because the index directory still exists.
+                structured = mem.records if isinstance(mem, WorldMemory) else mem
+                if (
+                    isinstance(structured, StructuredMemory)
+                    and structured.hybrid.count == 0
+                    and structured.store.select(structured.table, limit=1)
+                ):
+                    print(
+                        f"[memory] empty {name!r} index with non-empty SQLite "
+                        "table; rebuilding from rows."
+                    )
+                    mem.rebuild_index()
+                    mem.persist(path)
             else:
                 mem.rebuild_index()
                 mem.persist(path)

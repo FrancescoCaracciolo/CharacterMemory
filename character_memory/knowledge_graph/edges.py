@@ -154,18 +154,34 @@ class CoOccurrenceEdge(Edge):
 
     `co_create=True` marks edges created at ingestion time (two nodes that
     appeared in the same source batch). `co_recall_count` is incremented by
-    the Hebbian step each time both endpoints activate above threshold
-    during a recall — the Hebbian "cells that fire together wire together".
+    the Hebbian step each time both endpoints activate above threshold.
+    Prompt-driven weight growth saturates at 0.10 above creation weight.
     """
 
     kind: str = "co_occurrence"
     co_create: bool = False
     co_recall_count: int = 0
+    # Weight before prompt-driven Hebbian reinforcement. New edges persist the
+    # exact creation value; legacy edges infer the historical defaults.
+    creation_weight: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.creation_weight is None:
+            # A directly-authored edge treats its supplied weight as semantic
+            # creation strength. Legacy persistence inference happens in
+            # edge_from_dict, where absence of the new field is observable.
+            self.creation_weight = float(self.weight)
+
+    def effective_weight(self, max_boost: float = 0.10) -> float:
+        """Weight used by retrieval, clamped for legacy overgrown edges."""
+        base = float(self.creation_weight or 0.0)
+        return min(float(self.weight), base + max(0.0, float(max_boost)))
 
     def _extra_fields(self) -> dict[str, Any]:
         return {
             "co_create": bool(self.co_create),
             "co_recall_count": int(self.co_recall_count),
+            "creation_weight": float(self.creation_weight or 0.0),
         }
 
 
@@ -207,6 +223,10 @@ def edge_from_dict(data: dict[str, Any]) -> Edge:
         return cls(**data)  # type: ignore[return-value]
     valid = {f.name for f in _dc.fields(cls)}  # type: ignore[arg-type]
     kwargs = {k: v for k, v in data.items() if k in valid}
+    if cls is CoOccurrenceEdge and "creation_weight" not in kwargs:
+        # Historical recall-created edges began at 0.05; ingestion-created
+        # edges began at 0.15. Their persisted weight may already be overgrown.
+        kwargs["creation_weight"] = 0.15 if kwargs.get("co_create") else 0.05
     return cls(**kwargs)  # type: ignore[call-arg]
 
 

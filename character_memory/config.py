@@ -55,6 +55,13 @@ class EmbeddingConfig:
     dim: Optional[int] = None  # inferred from the first request if None
     batch_size: int = 64
     timeout: float = 120.0
+    # Optional role-specific transformations for asymmetric retrieval models.
+    # Empty strings preserve symmetric OpenAI-compatible behavior.
+    retrieval_query_prefix: str = ""
+    retrieval_document_prefix: str = ""
+    # Cosine floor for dense retrieval. None preserves the legacy closed-set
+    # behavior where FAISS always contributes its nearest candidates.
+    retrieval_min_similarity: Optional[float] = None
 
 
 @dataclass

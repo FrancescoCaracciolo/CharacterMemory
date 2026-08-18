@@ -10,6 +10,7 @@ for their BM25+similarity recall.
 """
 
 import json
+import hashlib
 import os
 import warnings
 from collections.abc import Hashable, Iterable
@@ -35,6 +36,8 @@ from llama_index.retrievers.bm25 import BM25Retriever
 DEFAULT_RRF_K = 60
 DEFAULT_CLEANUP_MIN_DELETED = 64
 DEFAULT_CLEANUP_DELETED_RATIO = 0.25
+INDEX_META_SCHEMA_VERSION = 1
+INDEX_META_FILENAME = "index_meta.json"
 
 
 def _matches(where: dict | None, meta: dict) -> bool:
@@ -53,12 +56,18 @@ class HybridSearch(RAGSystem):
         embedder: EmbeddingProvider,
         rrf_k: int = DEFAULT_RRF_K,
         candidate_pool: int = 30,
+        min_dense_similarity: Optional[float] = None,
         cleanup_min_deleted: int = DEFAULT_CLEANUP_MIN_DELETED,
         cleanup_deleted_ratio: float = DEFAULT_CLEANUP_DELETED_RATIO,
     ) -> None:
         self.embedder = embedder
         self.rrf_k = rrf_k
         self.candidate_pool = candidate_pool
+        if min_dense_similarity is not None and not -1.0 <= float(min_dense_similarity) <= 1.0:
+            raise ValueError("min_dense_similarity must be between -1 and 1")
+        self.min_dense_similarity = (
+            None if min_dense_similarity is None else float(min_dense_similarity)
+        )
         self.cleanup_min_deleted = max(1, int(cleanup_min_deleted))
         self.cleanup_deleted_ratio = max(
             0.0, min(1.0, float(cleanup_deleted_ratio))
@@ -80,6 +89,24 @@ class HybridSearch(RAGSystem):
         self._build_bm25()
         self._build_faiss()
 
+    @staticmethod
+    def _normalize_vectors(vecs: "np.ndarray") -> "np.ndarray":
+        """Return contiguous row-wise unit vectors for cosine FAISS search."""
+        arr = np.asarray(vecs, dtype="float32")
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0.0] = 1.0
+        return np.ascontiguousarray(arr / norms)
+
+    def _embed_queries(self, texts: list[str]) -> "np.ndarray":
+        method = getattr(self.embedder, "embed_queries", None)
+        return (method or self.embedder.embed)(texts)
+
+    def _embed_documents(self, texts: list[str]) -> "np.ndarray":
+        method = getattr(self.embedder, "embed_documents", None)
+        return (method or self.embedder.embed)(texts)
+
     def add_documents(self, chunks: list[Chunk]) -> None:
         if not chunks:
             return
@@ -87,7 +114,9 @@ class HybridSearch(RAGSystem):
         new_nodes = [self._chunk_to_node(c, start + i) for i, c in enumerate(chunks)]
         self._nodes.extend(new_nodes)
         # Append dense vectors directly; rebuild the lexical index cheaply.
-        vecs = self.embedder.embed([n.text for n in new_nodes]).astype("float32")
+        vecs = self._normalize_vectors(
+            self._embed_documents([n.text for n in new_nodes])
+        )
         if self._index is None:
             # Normal first-add path: use the vectors already calculated above
             # instead of routing through _build_faiss and embedding them twice.
@@ -99,9 +128,9 @@ class HybridSearch(RAGSystem):
                 # Defensive recovery for an inconsistent in-memory state with
                 # nodes but no dense index. Embed only the pre-existing nodes;
                 # the new batch's vectors are still reused.
-                old_vecs = self.embedder.embed(
-                    [n.text for n in self._nodes[:start]]
-                ).astype("float32")
+                old_vecs = self._normalize_vectors(
+                    self._embed_documents([n.text for n in self._nodes[:start]])
+                )
                 all_vecs = np.concatenate([old_vecs, vecs], axis=0)
                 index = faiss.IndexFlatIP(int(all_vecs.shape[1]))
                 index.add(np.ascontiguousarray(all_vecs))
@@ -210,7 +239,9 @@ class HybridSearch(RAGSystem):
         if not self._nodes:
             self._index = None
             return
-        vecs = self.embedder.embed([n.text for n in self._nodes]).astype("float32")
+        vecs = self._normalize_vectors(
+            self._embed_documents([n.text for n in self._nodes])
+        )
         dim = int(vecs.shape[1])
         index = faiss.IndexFlatIP(dim)
         index.add(np.ascontiguousarray(vecs))
@@ -229,7 +260,7 @@ class HybridSearch(RAGSystem):
         active_count = self.count
         if active_count == 0 or self._index is None:
             return []
-        queries = as_queries(query)
+        queries = [(text, weight) for text, weight in as_queries(query) if weight > 0.0]
         if not queries:
             return []
         pool = min(max(self.candidate_pool, k * 3), active_count)
@@ -237,9 +268,7 @@ class HybridSearch(RAGSystem):
         # Embed every query text in one batch (one round-trip for the dense
         # pass regardless of how many messages are in the window).
         q_texts = [q for q, _ in queries]
-        q_vecs = self.embedder.embed(q_texts).astype("float32")
-        if q_vecs.ndim == 1:  # embed() squeezed a single query to (dim,).
-            q_vecs = q_vecs.reshape(1, -1)
+        q_vecs = self._normalize_vectors(self._embed_queries(q_texts))
 
         # Reciprocal Rank Fusion over result groups, weight-scaled. Normal
         # documents form one group per positional node. A memory may stamp
@@ -248,26 +277,79 @@ class HybridSearch(RAGSystem):
         scores: dict[Hashable, float] = {}
         representative: dict[Hashable, int] = {}
         sim_by_result: dict[Hashable, float] = {}
+        lexical_by_result: dict[Hashable, float] = {}
+        confidence_failure: dict[Hashable, float] = {}
+        max_query_weight = max((weight for _, weight in queries), default=0.0)
+
+        def add_confidence(key: Hashable, confidence: float, weight: float) -> None:
+            if max_query_weight <= 0.0:
+                return
+            weighted = max(
+                0.0,
+                min(1.0, float(confidence) * float(weight) / max_query_weight),
+            )
+            confidence_failure[key] = confidence_failure.get(key, 1.0) * (
+                1.0 - weighted
+            )
+
         for (qtext, weight), qv in zip(queries, q_vecs):
             bm25_hits, dense_hits = self._query_candidates(qtext, qv, pool, where)
-            for pos, rank in bm25_hits:
+            best_lexical = max((lexical for _, _, lexical in bm25_hits), default=0.0)
+            for pos, rank, lexical in bm25_hits:
                 key = self._result_key(pos)
                 scores[key] = scores.get(key, 0.0) + weight / (self.rrf_k + rank + 1)
                 representative.setdefault(key, pos)
+                lexical_by_result[key] = max(
+                    lexical_by_result.get(key, 0.0), lexical
+                )
+                if best_lexical > 0.0:
+                    add_confidence(key, lexical / best_lexical, weight)
             for pos, rank, sim in dense_hits:
                 key = self._result_key(pos)
                 scores[key] = scores.get(key, 0.0) + weight / (self.rrf_k + rank + 1)
                 representative.setdefault(key, pos)
                 if sim > sim_by_result.get(key, -1.0):
                     sim_by_result[key] = sim
+                if self.min_dense_similarity is None:
+                    dense_confidence = max(0.0, min(1.0, sim))
+                elif self.min_dense_similarity < 1.0:
+                    dense_confidence = max(
+                        0.0,
+                        min(
+                            1.0,
+                            (sim - self.min_dense_similarity)
+                            / (1.0 - self.min_dense_similarity),
+                        ),
+                    )
+                else:
+                    dense_confidence = 0.0
+                add_confidence(key, dense_confidence, weight)
 
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
+        # Preserve rank-only RRF as the ordering score and expose it separately
+        # from confidence-based relevance.  A positive lexical match can now
+        # carry full confidence even when the dense model misses it, while
+        # weak dense neighbors cannot masquerade as two-channel agreement.
+        max_rrf = sum(weight for _, weight in queries) * (
+            2.0 / (self.rrf_k + 1)
+        )
         hits: list[Hit] = []
         for key, score in ranked:
             pos = representative[key]
             node = self._nodes[pos]
             meta = dict(node.metadata)
             meta["similarity"] = sim_by_result.get(key, 0.0)
+            meta["dense_similarity"] = sim_by_result.get(key, 0.0)
+            meta["bm25_score"] = lexical_by_result.get(key, 0.0)
+            meta["rrf_relevance"] = (
+                max(0.0, min(1.0, float(score) / max_rrf))
+                if max_rrf > 0.0
+                else 0.0
+            )
+            meta["normalized_relevance"] = max(
+                0.0,
+                min(1.0, 1.0 - confidence_failure.get(key, 1.0)),
+            )
             hits.append(
                 Hit(text=node.text, score=score, source=meta.get("source", ""), metadata=meta)
             )
@@ -280,21 +362,24 @@ class HybridSearch(RAGSystem):
 
     def _query_candidates(
         self, qtext: str, qv: "np.ndarray", pool: int, where: dict | None
-    ) -> tuple[list[tuple[int, int]], list[tuple[int, int, float]]]:
+    ) -> tuple[list[tuple[int, int, float]], list[tuple[int, int, float]]]:
         """Run one query's BM25 + dense passes, returning ranked positional hits.
 
         Returns ``(bm25_hits, dense_hits)`` where each entry is ``(positional,
-        rank)`` (BM25) or ``(positional, rank, similarity)`` (dense). `where`
-        filters on metadata equality. Used by :meth:`search` for each weighted
-        query; the caller fuses the lists with weight-scaled RRF.
+        rank, score)``. Zero-score lexical results and dense results below the
+        configured cosine floor are excluded before RRF. `where` filters on
+        metadata equality.
         """
         # Lexical candidates, keyed by internal positional index.
-        bm25_hits: list[tuple[int, int]] = []
+        bm25_hits: list[tuple[int, int, float]] = []
         if self._bm25 is not None:
             nodes = self._bm25.retrieve(qtext)
             rank = 0
             seen_results: set[Hashable] = set()
             for n in nodes:
+                lexical_score = float(n.score or 0.0)
+                if lexical_score <= 0.0:
+                    continue
                 if not _matches(where, n.metadata):
                     continue
                 pos = int(n.metadata.get("_pos", -1))
@@ -304,7 +389,7 @@ class HybridSearch(RAGSystem):
                 if key in seen_results:
                     continue
                 seen_results.add(key)
-                bm25_hits.append((pos, rank))
+                bm25_hits.append((pos, rank, lexical_score))
                 rank += 1
                 if len(bm25_hits) >= pool:
                     break
@@ -324,6 +409,11 @@ class HybridSearch(RAGSystem):
         seen_results: set[Hashable] = set()
         for nid, sim in zip(idxs[0], sims[0]):
             if nid < 0:
+                continue
+            if (
+                self.min_dense_similarity is not None
+                and float(sim) <= self.min_dense_similarity
+            ):
                 continue
             # Guard against a stale dense index that has more vectors than the
             # current `_nodes` list (e.g. rows deleted from SQLite while the
@@ -364,6 +454,35 @@ class HybridSearch(RAGSystem):
             if not self._is_deleted(n)
         ]
 
+    def _index_fingerprint(self) -> str:
+        """Return a safe fingerprint for vector-producing retrieval behavior."""
+        payload = {
+            "provider": (
+                f"{type(self.embedder).__module__}."
+                f"{type(self.embedder).__qualname__}"
+            ),
+            "provider_fingerprint": getattr(
+                self.embedder, "index_fingerprint", None
+            ),
+            "dense_normalization": "l2-v1",
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _index_metadata(self) -> dict[str, Any]:
+        # An empty index has no vector dimension.  Persisting one must stay an
+        # offline operation instead of probing the embedding endpoint.
+        dim = int(self._index.d) if self._index is not None else None
+        return {
+            "schema_version": INDEX_META_SCHEMA_VERSION,
+            "embedding_fingerprint": self._index_fingerprint(),
+            "dimension": dim,
+            "dense_normalization": "l2-v1",
+            "min_dense_similarity": self.min_dense_similarity,
+        }
+
     def persist(self, path: str) -> None:
         """Persist nodes + dense index to `path` atomically and cross-process safe.
 
@@ -380,6 +499,7 @@ class HybridSearch(RAGSystem):
              "source": n.metadata.get("source", ""), "metadata": n.metadata}
             for i, n in enumerate(self._nodes)
         ]
+        index_meta = self._index_metadata()
         lock_path = os.path.join(path, ".lock")
         # "a+" keeps an existing lock file without truncating it; the file's
         # contents are never read, it only anchors the flock.
@@ -389,6 +509,9 @@ class HybridSearch(RAGSystem):
             nodes_tmp = os.path.join(path, "nodes.json.tmp")
             with open(nodes_tmp, "w", encoding="utf-8") as f:
                 json.dump(nodes_json, f, ensure_ascii=False)
+            meta_tmp = os.path.join(path, f"{INDEX_META_FILENAME}.tmp")
+            with open(meta_tmp, "w", encoding="utf-8") as f:
+                json.dump(index_meta, f, ensure_ascii=False, sort_keys=True)
             if self._index is not None:
                 idx_tmp = os.path.join(path, "faiss.index.tmp")
                 faiss.write_index(self._index, idx_tmp)
@@ -400,6 +523,7 @@ class HybridSearch(RAGSystem):
                     os.remove(os.path.join(path, "faiss.index"))
                 except FileNotFoundError:
                     pass
+            os.replace(meta_tmp, os.path.join(path, INDEX_META_FILENAME))
             # ``nodes.json`` is the publication/commit marker watched by
             # MemorySync. Publish it only after the matching dense state is in
             # place; otherwise a poller can pair new nodes with the old FAISS
@@ -410,6 +534,9 @@ class HybridSearch(RAGSystem):
         idx_file = os.path.join(path, "faiss.index")
         loaded: Optional[faiss.Index] = None
         load_error: Optional[Exception] = None
+        stored_meta: Optional[dict[str, Any]] = None
+        meta_error: Optional[Exception] = None
+        meta_file = os.path.join(path, INDEX_META_FILENAME)
         lock_path = os.path.join(path, ".lock")
         # Read nodes + vectors as one publication. Atomic rename protects each
         # file individually; this shared lock protects the relationship
@@ -422,6 +549,16 @@ class HybridSearch(RAGSystem):
                     os.path.join(path, "nodes.json"), encoding="utf-8"
                 ) as f:
                     data = json.load(f)
+                if os.path.exists(meta_file):
+                    try:
+                        with open(meta_file, encoding="utf-8") as f:
+                            raw_meta = json.load(f)
+                        if isinstance(raw_meta, dict):
+                            stored_meta = raw_meta
+                        else:
+                            raise ValueError("index metadata is not an object")
+                    except Exception as exc:  # noqa: BLE001 - repair below
+                        meta_error = exc
                 if os.path.exists(idx_file):
                     try:
                         loaded = faiss.read_index(idx_file)
@@ -445,24 +582,40 @@ class HybridSearch(RAGSystem):
         rebuild = True
         if loaded is not None:
             expected = getattr(self.embedder, "dim", None)
+            current_fingerprint = self._index_fingerprint()
+            metadata_matches = bool(
+                stored_meta is not None
+                and stored_meta.get("schema_version") == INDEX_META_SCHEMA_VERSION
+                and stored_meta.get("embedding_fingerprint") == current_fingerprint
+                and stored_meta.get("dense_normalization") == "l2-v1"
+                and stored_meta.get("dimension") == expected
+            )
             if (
                 expected is not None
                 and loaded.d == expected
                 and int(loaded.ntotal) == len(self._nodes)
+                and metadata_matches
             ):
                 self._index = loaded
                 rebuild = False
             else:
-                # Embedding dim drifted or nodes/index cardinality diverged.
+                # Embedding behavior/dim drifted, the metadata is legacy, or
+                # nodes/index cardinality diverged.
                 print(
                     f"[rag] dense-index mismatch (index_dim={loaded.d}, "
                     f"embedder_dim={expected}, index_count={loaded.ntotal}, "
-                    f"node_count={len(self._nodes)}); rebuilding active nodes."
+                    f"node_count={len(self._nodes)}, "
+                    f"metadata_matches={metadata_matches}); rebuilding active nodes."
                 )
         elif load_error is not None:
             print(
                 f"[rag] could not load dense index {idx_file!r}: "
                 f"{load_error!r}; rebuilding active nodes."
+            )
+        elif meta_error is not None:
+            print(
+                f"[rag] could not load dense metadata {meta_file!r}: "
+                f"{meta_error!r}; rebuilding active nodes."
             )
         if rebuild:
             # Tombstones do not need new embeddings during a repair. Drop them

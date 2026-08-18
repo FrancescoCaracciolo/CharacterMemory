@@ -11,7 +11,7 @@ from ..emotion_vectors import (
     emotional_impact,
     encode_emotion_vector,
 )
-from .decay import decay_score, age_seconds
+from .decay import decay_score, age_seconds, intrinsic_score
 from .base import ExtractionSpec, MemoryItem
 from .structured import StructuredMemory
 
@@ -99,6 +99,12 @@ class EpisodicMemory(StructuredMemory):
             emotion_impact=impact,
         )
         return base * (1.0 + similarity)
+
+    def _intrinsic(self, row: dict[str, Any]) -> float:
+        vector = self._vector(row)
+        return intrinsic_score(
+            float(row["importance"]), emotional_impact(vector)
+        ) * (1.0 + emotion_similarity(vector, self._current_mood()))
 
     def contradiction_policy(self) -> ContradictionPolicy:
         # Episodic summaries are looser than bare facts; lower bar so the gate

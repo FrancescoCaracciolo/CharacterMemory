@@ -678,6 +678,10 @@ class KnowledgeGraph:
             existing.comment = new.comment  # type: ignore[attr-defined]
         if isinstance(existing, CoOccurrenceEdge) and isinstance(new, CoOccurrenceEdge):
             existing.co_create = existing.co_create or new.co_create
+            existing.creation_weight = max(
+                float(existing.creation_weight or 0.0),
+                float(new.creation_weight or 0.0),
+            )
             # Re-ingesting the same co-create pair must be idempotent: do NOT
             # accumulate co_recall_count here. Only the Hebbian step (a real
             # co-recall event) increments it; take the max for safety.
@@ -748,6 +752,7 @@ class KnowledgeGraph:
             weight=weight,
             co_create=co_create,
             co_recall_count=co_recall_count,
+            creation_weight=weight,
         )
         merged = self.upsert_edge(edge)
         return merged if isinstance(merged, CoOccurrenceEdge) else None
