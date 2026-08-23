@@ -429,6 +429,17 @@ function renderFactFields(item) {
     }),
     worldField(item, "subject_id", "Subject actor", { type: "select", options: worldOptions(draft.actors) }),
     worldField(item, "location_id", "Location", { type: "select", options: worldOptions(draft.locations) }),
+    worldField(item, "temporal_kind", "Validity", {
+      type: "select", options: [
+        { value: "durable", label: "Durable · no expiry" },
+        { value: "temporary", label: "Temporary · expires" },
+      ],
+    }),
+    worldField(item, "valid_until", "Valid until", {
+      placeholder: "2026-08-23T19:00:00+09:00",
+      transform: (value) => value.trim() || null,
+      hint: "Required only for temporary facts; ISO-8601 or an epoch timestamp.",
+    }),
     worldField(item, "importance", "Importance", { type: "number", min: 0, max: 1, step: 0.05 }),
   ];
 }
@@ -555,7 +566,10 @@ function addWorldElement(collection) {
     };
   } else {
     const id = uniqueWorldId(collection, "new_fact");
-    item = { id, content: "", subject_id: null, location_id: null, visibility: "known", importance: 0.8 };
+    item = {
+      id, content: "", subject_id: null, location_id: null, visibility: "known",
+      importance: 0.8, temporal_kind: "durable", valid_until: null,
+    };
   }
   draft[collection].push(item);
   cfgState.worldNew = { collection, index: draft[collection].length - 1 };
@@ -686,6 +700,10 @@ function validateWorldDraft(seed) {
     if (!String(fact.content || "").trim()) throw new Error(`Fact “${fact.id}” needs content.`);
     if (fact.subject_id && !actorIds.has(fact.subject_id)) throw new Error(`Fact “${fact.id}” has an unknown subject actor.`);
     if (fact.location_id && !locationIds.has(fact.location_id)) throw new Error(`Fact “${fact.id}” has an unknown location.`);
+    const temporalKind = fact.temporal_kind || (fact.valid_until ? "temporary" : "durable");
+    if (!['durable', 'temporary'].includes(temporalKind)) throw new Error(`Fact “${fact.id}” has an invalid validity type.`);
+    if (temporalKind === "temporary" && !fact.valid_until) throw new Error(`Temporary fact “${fact.id}” needs a valid-until time.`);
+    if (temporalKind === "durable" && fact.valid_until) throw new Error(`Durable fact “${fact.id}” cannot have a valid-until time.`);
   }
 }
 

@@ -234,8 +234,8 @@ class WorldRoutineCalendarSource(CalendarSource):
         features = self.world.state_store.effective_features(observer)
         if not features.get("routines", True):
             return []
-        actor = self.world.state_store.actor(observer) or {}
-        timezone = str(actor.get("timezone") or self.world.state_store.timezone or "UTC")
+        snapshot = self.world.snapshot(commit=False)
+        timezone = snapshot.timezone
         routines = self.world.state_store.routines(observer)
         out: list[CalendarOccurrence] = []
         zone = _zone(timezone)

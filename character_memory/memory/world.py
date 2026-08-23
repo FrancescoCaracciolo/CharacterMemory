@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
@@ -79,6 +80,24 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, number))
 
 
+def _timestamp(value: Any, *, timezone: str = "UTC") -> Optional[float]:
+    """Normalize an optional epoch/ISO timestamp used by authored facts."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value).strip()
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        return float(text)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid world timestamp {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo(timezone))
+    return parsed.astimezone(UTC).timestamp()
+
+
 @dataclass
 class WorldCommand:
     kind: str
@@ -104,6 +123,20 @@ class WorldEvent:
     location_id: Optional[str] = None
     source_message_id: Optional[int] = None
     created: bool = True
+
+
+@dataclass(frozen=True)
+class RoutineOccurrence:
+    """One routine resolved to an absolute interval in a specific timezone."""
+
+    routine: dict[str, Any]
+    start_at: float
+    end_at: float
+    timezone: str
+
+    @property
+    def id(self) -> str:
+        return str(self.routine.get("id") or "routine")
 
 
 @dataclass
@@ -185,6 +218,8 @@ class WorldStateStore:
             "activity_kind": "TEXT NOT NULL DEFAULT 'idle'",
             "activity": "TEXT NOT NULL DEFAULT 'idle'",
             "activity_started_at": "REAL", "activity_until": "REAL",
+            "activity_source": "TEXT NOT NULL DEFAULT 'seed'",
+            "active_routine_id": "TEXT",
             "interruptible": "INTEGER NOT NULL DEFAULT 1",
             "sleeping": "INTEGER NOT NULL DEFAULT 0",
             "hunger": "REAL NOT NULL DEFAULT 0.2",
@@ -207,6 +242,27 @@ class WorldStateStore:
             "status": "TEXT NOT NULL DEFAULT 'pending'", "dedupe_key": "TEXT UNIQUE",
             "created_at": "REAL NOT NULL", "source": "TEXT NOT NULL DEFAULT 'manual'",
         })
+        # Existing world databases predate explicit activity provenance.  A
+        # legacy marker lets the first projection reconcile those ambiguous
+        # rows against the authored routines instead of trusting stale state.
+        actor_state_columns = set(self.store.columns("world_actor_state"))
+        if "activity_source" not in actor_state_columns:
+            try:
+                self.store.execute(
+                    "ALTER TABLE world_actor_state ADD COLUMN activity_source "
+                    "TEXT NOT NULL DEFAULT 'legacy'"
+                )
+            except sqlite3.OperationalError:
+                if "activity_source" not in self.store.columns("world_actor_state"):
+                    raise
+        if "active_routine_id" not in actor_state_columns:
+            try:
+                self.store.execute(
+                    "ALTER TABLE world_actor_state ADD COLUMN active_routine_id TEXT"
+                )
+            except sqlite3.OperationalError:
+                if "active_routine_id" not in self.store.columns("world_actor_state"):
+                    raise
 
     def meta(self, key: str, default: Any = None) -> Any:
         rows = self.store.select("world_meta", {"key": key})
@@ -260,6 +316,16 @@ class WorldStateStore:
         row["public_activity"] = bool(row.get("public_activity"))
         return row
 
+    def location(self, location_id: Optional[str]) -> Optional[dict[str, Any]]:
+        if not location_id:
+            return None
+        rows = self.store.select("world_locations", {"id": location_id}, limit=1)
+        if not rows:
+            return None
+        row = rows[0]
+        row["tags"] = _loads(row.get("tags"), [])
+        return row
+
     def state(self, actor_id: str) -> Optional[dict[str, Any]]:
         rows = self.store.select("world_actor_state", {"actor_id": actor_id}, limit=1)
         if not rows:
@@ -275,6 +341,26 @@ class WorldStateStore:
         actor = self.actor(actor_id)
         overrides = (actor or {}).get("features", {})
         return {k: bool(overrides[k]) if k in overrides else v for k, v in base.items()}
+
+    def effective_timezone(
+        self, actor_id: str, *, location_id: Optional[str] = None,
+    ) -> str:
+        """Resolve local time from location ancestry, then actor/world defaults."""
+        actor = self.actor(actor_id) or {}
+        if location_id is None:
+            state = self.state(actor_id) or {}
+            location_id = state.get("location_id")
+        seen: set[str] = set()
+        current = location_id
+        while current and current not in seen:
+            seen.add(current)
+            location = self.location(current)
+            if location is None:
+                break
+            if location.get("timezone"):
+                return str(location["timezone"])
+            current = location.get("parent_id")
+        return str(actor.get("timezone") or self.timezone or "UTC")
 
     def routines(self, actor_id: Optional[str] = None) -> list[dict[str, Any]]:
         rows = self.store.select(
@@ -344,11 +430,19 @@ class WorldStateStore:
             lid = str(entry.get("id") or "").strip()
             if not lid:
                 raise ValueError("Every world location needs an id")
+            location_timezone = entry.get("timezone")
+            if location_timezone:
+                try:
+                    ZoneInfo(str(location_timezone))
+                except ZoneInfoNotFoundError as exc:
+                    raise ValueError(
+                        f"Unknown IANA timezone {location_timezone!r} for location {lid!r}"
+                    ) from exc
             location_ids.add(lid)
             self.store.upsert("world_locations", {
                 "id": lid, "name": str(entry.get("name") or lid),
                 "description": str(entry.get("description") or ""),
-                "parent_id": entry.get("parent_id"), "timezone": entry.get("timezone"),
+                "parent_id": entry.get("parent_id"), "timezone": location_timezone,
                 "tags": _json(entry.get("tags") or []),
             }, pk="id")
         for row in self.store.select("world_locations"):
@@ -360,6 +454,13 @@ class WorldStateStore:
             aid = str(entry.get("id") or "").strip()
             if not aid:
                 raise ValueError("Every world actor needs an id")
+            actor_timezone = str(entry.get("timezone") or timezone)
+            try:
+                ZoneInfo(actor_timezone)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError(
+                    f"Unknown IANA timezone {actor_timezone!r} for actor {aid!r}"
+                ) from exc
             overrides = {
                 key: bool(value) for key, value in dict(entry.get("features") or {}).items()
                 if value is not None
@@ -371,7 +472,7 @@ class WorldStateStore:
             self.store.upsert("world_actors", {
                 "id": aid, "name": str(entry.get("name") or aid),
                 "home_location": entry.get("home_location") or entry.get("location_id"),
-                "timezone": entry.get("timezone") or timezone,
+                "timezone": actor_timezone,
                 "public_activity": 1 if entry.get("public_activity") else 0,
                 "features": _json(overrides),
                 "metadata_json": _json(entry.get("metadata") or {}),
@@ -383,6 +484,7 @@ class WorldStateStore:
                     "activity_kind": str(entry.get("activity_kind") or "idle"),
                     "activity": str(entry.get("activity") or "idle"),
                     "activity_started_at": now, "activity_until": None,
+                    "activity_source": "seed", "active_routine_id": None,
                     "interruptible": 1, "sleeping": 1 if entry.get("sleeping") else 0,
                     "hunger": _clip(entry.get("hunger", 0.2)),
                     "energy": _clip(entry.get("energy", 0.8)),
@@ -458,10 +560,10 @@ class RuleBasedWorldSimulator(WorldSimulator):
     @staticmethod
     def _routine_at(
         routines: list[dict[str, Any]], now: float, timezone: str,
-    ) -> Optional[dict[str, Any]]:
+    ) -> Optional[RoutineOccurrence]:
         zone = ZoneInfo(timezone)
         current = datetime.fromtimestamp(now, tz=UTC).astimezone(zone)
-        matches: list[tuple[int, datetime, dict[str, Any]]] = []
+        matches: list[tuple[int, datetime, RoutineOccurrence]] = []
         for routine in routines:
             if not routine.get("enabled"):
                 continue
@@ -478,7 +580,16 @@ class RuleBasedWorldSimulator(WorldSimulator):
                 )
                 end = start + timedelta(minutes=int(routine["duration_minutes"]))
                 if start <= current < end:
-                    matches.append((int(routine.get("priority", 0)), start, routine))
+                    matches.append((
+                        int(routine.get("priority", 0)),
+                        start,
+                        RoutineOccurrence(
+                            routine=routine,
+                            start_at=start.timestamp(),
+                            end_at=end.timestamp(),
+                            timezone=timezone,
+                        ),
+                    ))
         if not matches:
             return None
         matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -515,9 +626,9 @@ class RuleBasedWorldSimulator(WorldSimulator):
     @staticmethod
     def _apply_routine(
         projected: dict[str, Any], actor: dict[str, Any], features: dict[str, bool],
-        routine: Optional[dict[str, Any]], at: float,
+        occurrence: Optional[RoutineOccurrence], at: float,
     ) -> None:
-        if routine is None:
+        if occurrence is None:
             if projected.get("activity_source") == "routine":
                 if features["activities"]:
                     projected.update(activity_kind="idle", activity="idle", activity_started_at=at,
@@ -525,28 +636,37 @@ class RuleBasedWorldSimulator(WorldSimulator):
                 if features["sleep"]:
                     projected["sleeping"] = False
                 projected["activity_source"] = "idle"
+                projected["active_routine_id"] = None
             return
+        routine = occurrence.routine
+        entering = not (
+            projected.get("activity_source") == "routine"
+            and projected.get("active_routine_id") == occurrence.id
+            and projected.get("activity_started_at") == occurrence.start_at
+            and projected.get("activity_until") == occurrence.end_at
+        )
         kind = routine["activity_kind"]
         if features["locations"] and routine.get("location_id"):
             projected["location_id"] = routine["location_id"]
         if features["activities"]:
             projected.update(
                 activity_kind=kind, activity=routine.get("activity") or kind,
-                activity_started_at=at,
-                activity_until=at + int(routine["duration_minutes"]) * 60,
+                activity_started_at=occurrence.start_at,
+                activity_until=occurrence.end_at,
                 interruptible=bool(routine.get("interruptible")),
             )
         if features["sleep"]:
             projected["sleeping"] = kind == "sleep"
-        if kind == "eat" and features["hunger"]:
+        if entering and kind == "eat" and features["hunger"]:
             projected["hunger"] = 0.1
-            projected["last_meal_at"] = at
+            projected["last_meal_at"] = occurrence.start_at
         projected["activity_source"] = "routine"
+        projected["active_routine_id"] = occurrence.id
 
     def _evolve_segment(
         self, projected: dict[str, Any], actor: dict[str, Any], features: dict[str, bool],
         start: float, end: float, *, allow_autonomous: bool,
-        resume_routine: Optional[dict[str, Any]] = None,
+        resume_routine: Optional[RoutineOccurrence] = None,
     ) -> None:
         sim = self.state_store.simulation()
         cursor = start
@@ -598,6 +718,7 @@ class RuleBasedWorldSimulator(WorldSimulator):
                     projected.update(activity_kind="idle", activity="idle", activity_started_at=cursor,
                                      activity_until=None, interruptible=True)
                     projected["activity_source"] = "idle"
+                    projected["active_routine_id"] = None
             elif intervention == "sleep":
                 projected["sleeping"] = True
                 if features["activities"]:
@@ -605,6 +726,7 @@ class RuleBasedWorldSimulator(WorldSimulator):
                 if features["locations"] and actor.get("home_location"):
                     projected["location_id"] = actor["home_location"]
                 projected["activity_source"] = "autonomous"
+                projected["active_routine_id"] = None
             else:
                 projected["hunger"] = 0.1
                 projected["last_meal_at"] = cursor
@@ -613,6 +735,7 @@ class RuleBasedWorldSimulator(WorldSimulator):
                     projected.update(activity_kind="eat", activity="eating", activity_started_at=cursor,
                                      activity_until=meal_end)
                 projected["activity_source"] = "autonomous"
+                projected["active_routine_id"] = None
                 # Prevent a zero-duration retrigger and analytically continue.
                 cursor = min(end, cursor + 1e-6)
 
@@ -621,11 +744,51 @@ class RuleBasedWorldSimulator(WorldSimulator):
         features = self.state_store.effective_features(actor["id"])
         updated = row.get("updated_at")
         start = float(now if updated is None else updated)
-        if now <= start:
+        if now < start:
             return projected
-        timezone = str(actor.get("timezone") or self.state_store.timezone)
         routines = self.state_store.routines(actor["id"])
+        routines_by_id = {str(routine.get("id")): routine for routine in routines}
         boundary_cap = max(1, int(self.state_store.simulation()["max_catchup_events"]))
+
+        # Rows created before activity provenance existed cannot safely be
+        # treated as current. Preserve exact needs/location, but let routines
+        # and autonomous rules reconstruct the activity from this point.
+        if projected.get("activity_source") in {None, "legacy"}:
+            if not projected.get("override_until") or float(projected["override_until"]) <= start:
+                projected.update(
+                    activity_kind="idle", activity="idle", activity_started_at=start,
+                    activity_until=None, activity_source="idle", active_routine_id=None,
+                    interruptible=True, sleeping=False, override_until=None,
+                )
+
+        def expire_override(at: float) -> None:
+            until = projected.get("override_until")
+            if (
+                projected.get("activity_source") == "override"
+                and until is not None
+                and float(until) <= at
+            ):
+                projected.update(
+                    activity_kind="idle", activity="idle", activity_started_at=at,
+                    activity_until=None, activity_source="idle", active_routine_id=None,
+                    interruptible=True, sleeping=False, override_until=None,
+                )
+
+        def stored_occurrence(at: float, timezone: str) -> Optional[RoutineOccurrence]:
+            rid = projected.get("active_routine_id")
+            begun = projected.get("activity_started_at")
+            until = projected.get("activity_until")
+            routine = routines_by_id.get(str(rid)) if rid is not None else None
+            if (
+                projected.get("activity_source") == "routine"
+                and routine is not None
+                and begun is not None
+                and until is not None
+                and float(begun) <= at < float(until)
+            ):
+                return RoutineOccurrence(routine, float(begun), float(until), timezone)
+            return None
+
         boundary_start = start
         if routines and (now - start) > 8 * 86_400:
             scan_days = max(8, boundary_cap // max(1, len(routines) * 2) + 2)
@@ -634,34 +797,80 @@ class RuleBasedWorldSimulator(WorldSimulator):
                 projected["_catchup_skipped"] = max(
                     1, int((boundary_start - start) / 86_400) * len(routines) * 2
                 )
-        boundaries = self._routine_boundaries(
-            routines, boundary_start, now, timezone
-        ) if features["routines"] else []
-        override_until = row.get("override_until")
-        if override_until is not None and start < float(override_until) < now:
-            boundaries.append(float(override_until))
-            boundaries = sorted(set(boundaries))
-        if len(boundaries) > boundary_cap:
-            projected["_catchup_skipped"] = int(projected.get("_catchup_skipped", 0)) + len(boundaries) - boundary_cap
-            boundaries = boundaries[-boundary_cap:]
+
+        # For very long gaps, analytically evolve needs through the skipped
+        # prefix, then resolve detailed routine boundaries in the recent tail.
+        if boundary_start > start:
+            self._evolve_segment(
+                projected, actor, features, start, boundary_start,
+                allow_autonomous=features["autonomous_needs"],
+            )
         cursor = start
-        for boundary in [*boundaries, now]:
-            overridden = bool(row.get("override_until") and float(row["override_until"]) > cursor)
-            routine = self._routine_at(routines, cursor + 1e-4, timezone) if features["routines"] and not overridden else None
-            self._apply_routine(projected, actor, features, routine, cursor)
+        if boundary_start > start:
+            cursor = boundary_start
+        transitions = 0
+        while cursor < now and transitions < boundary_cap:
+            expire_override(cursor)
+            timezone = self.state_store.effective_timezone(
+                actor["id"], location_id=projected.get("location_id")
+            )
+            overridden = bool(
+                projected.get("override_until")
+                and float(projected["override_until"]) > cursor
+            )
+            occurrence = stored_occurrence(cursor + 1e-4, timezone)
+            if occurrence is None and features["routines"] and not overridden:
+                occurrence = self._routine_at(routines, cursor + 1e-4, timezone)
+            self._apply_routine(projected, actor, features, occurrence, cursor)
+
+            # Applying a routine may move the actor into another timezone.
+            # Re-resolve future boundaries there, while preserving the active
+            # occurrence's already-fixed absolute end.
+            timezone = self.state_store.effective_timezone(
+                actor["id"], location_id=projected.get("location_id")
+            )
+            boundaries = (
+                self._routine_boundaries(routines, cursor, now, timezone)
+                if features["routines"] else []
+            )
+            for candidate in (projected.get("override_until"), projected.get("activity_until")):
+                if candidate is not None and cursor < float(candidate) < now:
+                    boundaries.append(float(candidate))
+            boundary = min(boundaries) if boundaries else now
             self._evolve_segment(
                 projected, actor, features, cursor, boundary,
                 allow_autonomous=(
                     not overridden
-                    and (routine is None or bool(routine.get("interruptible", True)))
+                    and (
+                        occurrence is None
+                        or bool(occurrence.routine.get("interruptible", True))
+                    )
                 ),
-                resume_routine=routine,
+                resume_routine=occurrence,
             )
             cursor = boundary
-        if boundaries:
-            routine = self._routine_at(routines, now + 1e-4, timezone) if features["routines"] else None
-            self._apply_routine(projected, actor, features, routine, now)
-        projected.pop("activity_source", None)
+            transitions += 1
+        if cursor < now:
+            projected["_catchup_skipped"] = int(projected.get("_catchup_skipped", 0)) + 1
+            self._evolve_segment(
+                projected, actor, features, cursor, now,
+                allow_autonomous=features["autonomous_needs"],
+            )
+
+        # Reconcile exact state at the requested instant. Occurrence timestamps
+        # remain anchored to their authored start/end, so this is idempotent.
+        expire_override(now)
+        timezone = self.state_store.effective_timezone(
+            actor["id"], location_id=projected.get("location_id")
+        )
+        overridden = bool(
+            projected.get("override_until")
+            and float(projected["override_until"]) > now
+        )
+        occurrence = stored_occurrence(now + 1e-4, timezone)
+        if occurrence is None and features["routines"] and not overridden:
+            occurrence = self._routine_at(routines, now + 1e-4, timezone)
+        self._apply_routine(projected, actor, features, occurrence, now)
         projected["updated_at"] = now
         return projected
 
@@ -691,15 +900,18 @@ class RuleBasedWorldSimulator(WorldSimulator):
                 skipped = int(row.pop("_catchup_skipped", 0) or 0)
                 meaningful = any(old.get(key) != row.get(key) for key in (
                     "location_id", "activity_kind", "activity", "sleeping",
+                    "activity_source", "active_routine_id",
                 ))
                 conn.execute(
                     "UPDATE world_actor_state SET location_id=?, activity_kind=?, activity=?, "
-                    "activity_started_at=?, activity_until=?, interruptible=?, sleeping=?, hunger=?, "
-                    "energy=?, last_meal_at=?, updated_at=?, version=version+1, override_until=? "
+                    "activity_started_at=?, activity_until=?, activity_source=?, active_routine_id=?, "
+                    "interruptible=?, sleeping=?, hunger=?, energy=?, last_meal_at=?, updated_at=?, "
+                    "version=version+1, override_until=? "
                     "WHERE actor_id=?",
                     [row.get("location_id"), row.get("activity_kind"), row.get("activity"),
                      now if row.get("activity_started_at") is None else row.get("activity_started_at"),
                      row.get("activity_until"),
+                     row.get("activity_source") or "idle", row.get("active_routine_id"),
                      1 if row.get("interruptible", True) else 0, 1 if row.get("sleeping") else 0,
                      row.get("hunger", 0.2), row.get("energy", 0.8), row.get("last_meal_at"),
                      now, row.get("override_until"), actor_id],
@@ -829,7 +1041,10 @@ class WorldMemory(Memory):
                 "fatigue_trigger": 0.15, "meal_minutes": 30,
                 "max_catchup_events": 500,
             },
-            "locations": [{"id": "home", "name": "Home", "description": "The character's home."}],
+            "locations": [{
+                "id": "home", "name": "Home", "description": "The character's home.",
+                "timezone": None,
+            }],
             "actors": [{
                 "id": actor_id, "name": character_name, "home_location": "home",
                 "location_id": "home", "activity_kind": "idle", "activity": "relaxing",
@@ -853,11 +1068,19 @@ class WorldMemory(Memory):
             seed = loaded
         encoded = yaml.safe_dump(seed, sort_keys=True, allow_unicode=True)
         stamp = self._now()
+        prior_hash = self.state_store.meta("seed_hash", None)
         if self.state_store.actors():
             self.advance(stamp)
         self.state_store.reconcile_seed(seed, now=stamp)
+        new_hash = hashlib.sha256(encoded.encode()).hexdigest()
+        if prior_hash is not None and str(prior_hash) != new_hash:
+            self.store.execute(
+                "UPDATE world_actor_state SET activity_source='legacy', "
+                "active_routine_id=NULL WHERE override_until IS NULL OR override_until<=?",
+                [stamp],
+            )
         self.store.execute("UPDATE world_actor_state SET updated_at=?", [stamp])
-        self.state_store.set_meta("seed_hash", hashlib.sha256(encoded.encode()).hexdigest())
+        self.state_store.set_meta("seed_hash", new_hash)
         self._reconcile_seed_facts(seed.get("facts") or [])
         return seed
 
@@ -878,6 +1101,10 @@ class WorldMemory(Memory):
                 "location_id": row.get("location_id"),
                 "visibility": row.get("visibility"),
                 "importance": row.get("importance"),
+                "valid_until": row.get("valid_until"),
+                "temporal_kind": _loads(row.get("metadata_json"), {}).get(
+                    "temporal_kind", "temporary" if row.get("valid_until") is not None else "durable"
+                ),
             }
             for row in self.records.all_rows()
             if row.get("source") == "seed"
@@ -894,6 +1121,17 @@ class WorldMemory(Memory):
             if not content:
                 continue
             key = str(fact.get("id") or f"seed_fact_{i}")
+            valid_until = _timestamp(
+                fact.get("valid_until"), timezone=self.state_store.timezone
+            )
+            temporal_kind = str(
+                fact.get("temporal_kind")
+                or ("temporary" if valid_until is not None else "durable")
+            )
+            if temporal_kind == "temporary" and valid_until is None:
+                raise ValueError(f"Temporary seed fact {key!r} requires valid_until")
+            if temporal_kind == "durable" and valid_until is not None:
+                raise ValueError(f"Durable seed fact {key!r} cannot have valid_until")
             wanted.add(key)
             if key in by_key:
                 row = by_key[key]
@@ -901,6 +1139,8 @@ class WorldMemory(Memory):
                     "content": content, "subject_id": fact.get("subject_id"),
                     "location_id": fact.get("location_id"),
                     "visibility": str(fact.get("visibility") or "known"),
+                    "valid_until": valid_until,
+                    "metadata_json": _json({"temporal_kind": temporal_kind}),
                 }
                 if any(row.get(name) != value for name, value in changes.items()):
                     row.update(changes)
@@ -912,6 +1152,7 @@ class WorldMemory(Memory):
                     content, subject_id=fact.get("subject_id"), location_id=fact.get("location_id"),
                     visibility=str(fact.get("visibility") or "known"),
                     importance=float(fact.get("importance", 0.8)), source="seed", dedupe_key=key,
+                    valid_until=valid_until, temporal_kind=temporal_kind,
                 )
         removed = [int(row["id"]) for key, row in by_key.items() if key not in wanted]
         for row_id in removed:
@@ -1031,16 +1272,38 @@ class WorldMemory(Memory):
         for row in self.records.all_rows():
             if row.get("record_type") != "fact":
                 continue
+            valid_until = row.get("valid_until")
+            if valid_until is not None and float(valid_until) <= now:
+                continue
+            metadata = _loads(row.get("metadata_json"), {})
+            # Pre-validity learned rows are ambiguous: preserve them in the
+            # searchable ledger, but do not assert them as exact current state.
+            if (
+                row.get("source") == "extraction"
+                and metadata.get("temporal_kind") not in {"durable", "temporary"}
+            ):
+                continue
             visibility = row.get("visibility")
             if visibility in {"public", "known"} or (
                 visibility == "local" and raw_location and row.get("location_id") == raw_location
             ):
                 local_facts.append(self.records.row_item(row, 1.0).metadata | {"content": row["content"]})
+        local_facts.sort(key=lambda fact: (
+            0 if fact.get("valid_until") is not None else 1,
+            0 if raw_location and fact.get("location_id") == raw_location else 1,
+            -float(fact.get("created_at") or 0),
+            -int(fact.get("id") or 0),
+        ))
         return WorldSnapshot(
-            now=now, timezone=str(observer_actor.get("timezone") or self.state_store.timezone),
+            now=now,
+            timezone=self.state_store.effective_timezone(
+                observer_id, location_id=observer_state.get("location_id")
+            ),
             observer_id=observer_id, observer=observer, location=location,
             visible_actors=visible, local_facts=local_facts[:10],
-            next_action=self.next_action(observer_id, now), features=features,
+            next_action=self.next_action(
+                observer_id, now, location_id=observer_state.get("location_id")
+            ), features=features,
             revision=int(self.state_store.meta("revision", 0) or 0),
         )
 
@@ -1048,12 +1311,14 @@ class WorldMemory(Memory):
         stamp = self._now() if now is None else float(now)
         if commit and self.config.auto_advance:
             self.advance(stamp)
-            states = {a["id"]: self.state_store.state(a["id"]) for a in self.state_store.actors()}
-        else:
-            states = self.simulator.project(stamp)
+        # Always return a projection at the requested instant. This also
+        # reconciles legacy rows when no wall-clock time elapsed since load.
+        states = self.simulator.project(stamp)
         return self._snapshot_from_states({k: v for k, v in states.items() if v is not None}, stamp)
 
-    def next_action(self, actor_id: str, now: float) -> Optional[dict[str, Any]]:
+    def next_action(
+        self, actor_id: str, now: float, *, location_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
         features = self.state_store.effective_features(actor_id)
         scheduled = self.store.execute(
             "SELECT * FROM world_scheduled_actions WHERE actor_id=? AND status='pending' "
@@ -1069,8 +1334,9 @@ class WorldMemory(Memory):
                 return {"at": row["due_at"], "kind": command_kind}
         if not features["routines"]:
             return None
-        actor = self.state_store.actor(actor_id) or {}
-        zone = ZoneInfo(str(actor.get("timezone") or self.state_store.timezone))
+        zone = ZoneInfo(self.state_store.effective_timezone(
+            actor_id, location_id=location_id
+        ))
         current = datetime.fromtimestamp(now, tz=UTC).astimezone(zone)
         candidates: list[tuple[float, dict[str, Any]]] = []
         for routine in self.state_store.routines(actor_id):
@@ -1117,31 +1383,57 @@ class WorldMemory(Memory):
         if snap.features["locations"] and snap.location:
             line = f"You are at {snap.location['name']}"
             if snap.location.get("description"):
-                line += f": {snap.location['description']}"
-            lines.append(line + ".")
+                line += f": {str(snap.location['description']).rstrip('. ')}"
+            lines.append(line.rstrip(". ") + ".")
         if snap.features["activities"] and actor.get("activity"):
-            duration = ""
+            timing: list[str] = []
             if actor.get("activity_started_at") is not None:
-                minutes = max(0, int((snap.now - float(actor["activity_started_at"])) // 60))
-                duration = f" (for {minutes // 60}h {minutes % 60}m)" if minutes >= 60 else f" (for {minutes}m)"
-            lines.append(f"You are currently {actor['activity']}{duration}.")
-        if snap.features["sleep"]:
-            lines.append("You are asleep." if actor.get("sleeping") else "You are awake.")
-        need_bits = []
+                started = datetime.fromtimestamp(
+                    float(actor["activity_started_at"]), tz=UTC
+                ).astimezone(zone)
+                timing.append(f"since {started.strftime('%H:%M')}")
+            if actor.get("activity_until") is not None:
+                until = datetime.fromtimestamp(
+                    float(actor["activity_until"]), tz=UTC
+                ).astimezone(zone)
+                timing.append(f"until {until.strftime('%H:%M')}")
+            suffix = f" ({'; '.join(timing)})" if timing else ""
+            lines.append(f"You are currently {actor['activity']}{suffix}.")
+        state_bits = []
+        if snap.features["sleep"] and actor.get("activity_kind") != "sleep":
+            state_bits.append("asleep" if actor.get("sleeping") else "awake")
         if snap.features["hunger"]:
-            need_bits.append(self._qualitative(float(actor.get("hunger", 0)), ("not hungry", "slightly hungry", "hungry", "very hungry")))
+            state_bits.append("hunger: " + self._qualitative(
+                float(actor.get("hunger", 0)), ("low", "moderate", "high", "very high")
+            ))
         if snap.features["energy"]:
-            need_bits.append(self._qualitative(float(actor.get("energy", 1)), ("exhausted", "tired", "rested", "very energetic")))
-        if need_bits:
-            lines.append("You feel " + " and ".join(need_bits) + ".")
+            state_bits.append("energy reserve: " + self._qualitative(
+                float(actor.get("energy", 1)), ("depleted", "low", "high", "full")
+            ))
+        if state_bits:
+            lines.append("Physical state: " + "; ".join(state_bits) + ".")
         for other in snap.visible_actors:
             detail = other.get("activity") or "present"
             lines.append(f"Also present/visible: {other['name']} ({detail}).")
         for fact in snap.local_facts[:3]:
-            lines.append(f"Known here: {fact['content']}")
+            if fact.get("valid_until") is not None:
+                until = datetime.fromtimestamp(
+                    float(fact["valid_until"]), tz=UTC
+                ).astimezone(zone)
+                prefix = f"Current observation until {until.strftime('%H:%M')}"
+            elif snap.location and fact.get("location_id") == snap.location.get("id"):
+                prefix = f"Known at {snap.location['name']}"
+            else:
+                prefix = "Known world fact"
+            lines.append(f"{prefix}: {fact['content']}")
         if snap.next_action:
             when = datetime.fromtimestamp(float(snap.next_action["at"]), tz=UTC).astimezone(zone)
-            lines.append(f"Next plan at {when.strftime('%H:%M')}: {snap.next_action.get('activity') or snap.next_action['kind']}.")
+            delta_days = (when.date() - local.date()).days
+            day = "today" if delta_days == 0 else "tomorrow" if delta_days == 1 else when.strftime("%Y-%m-%d")
+            lines.append(
+                f"Next plan {day} at {when.strftime('%H:%M')} ({snap.timezone}): "
+                f"{snap.next_action.get('activity') or snap.next_action['kind']}."
+            )
         return "\n".join(lines)
 
     def recall(
@@ -1173,23 +1465,32 @@ class WorldMemory(Memory):
         location_id: Optional[str] = None, visibility: str = "known",
         importance: float = 0.6, source: str = "runtime",
         source_message_ids: Optional[list[int]] = None,
-        dedupe_key: Optional[str] = None,
+        dedupe_key: Optional[str] = None, valid_until: Optional[float] = None,
+        temporal_kind: Optional[str] = None,
     ) -> int:
         text = content.strip()
         if not text:
             raise ValueError("World fact content cannot be empty")
+        expiry = None if valid_until is None else float(valid_until)
+        kind = str(temporal_kind or ("temporary" if expiry is not None else "durable"))
+        if kind not in {"durable", "temporary"}:
+            raise ValueError("World fact temporal_kind must be durable or temporary")
+        if kind == "temporary" and expiry is None:
+            raise ValueError("Temporary world facts require valid_until")
+        if kind == "durable" and expiry is not None:
+            raise ValueError("Durable world facts cannot have valid_until")
         if dedupe_key:
             matches = self.store.select("world_records", {"dedupe_key": dedupe_key})
             if matches:
                 return int(matches[0]["id"])
         row_id = self.records.add(
             WORLD_RECORD_USER_ID, importance, record_type="fact", subject_id=subject_id,
-            location_id=location_id, content=text, occurred_at=None, valid_until=None,
+            location_id=location_id, content=text, occurred_at=None, valid_until=expiry,
             visibility=visibility,
             witnesses=_json([self.observer_id] if visibility == "known" else []),
             source=source,
             source_message_id=None, source_message_ids=_json(source_message_ids or []),
-            dedupe_key=dedupe_key, metadata_json="{}",
+            dedupe_key=dedupe_key, metadata_json=_json({"temporal_kind": kind}),
         )
         self._bump_record_revision()
         return row_id
@@ -1234,8 +1535,12 @@ class WorldMemory(Memory):
             query, WORLD_RECORD_USER_ID, max(limit * 4, limit), state_changing=False
         )
         visible: list[MemoryItem] = []
+        now = self._now()
         for item in items:
             meta = item.metadata
+            valid_until = meta.get("valid_until")
+            if valid_until is not None and float(valid_until) <= now:
+                continue
             visibility = meta.get("visibility")
             witnesses = meta.get("witnesses") or []
             allowed = visibility in {"public", "known"}
@@ -1348,7 +1653,8 @@ class WorldMemory(Memory):
             conn.execute(
                 "UPDATE world_actor_state SET location_id=?, activity_kind=?, activity=?, "
                 "activity_started_at=?, activity_until=?, sleeping=?, hunger=?, energy=?, "
-                "last_meal_at=?, updated_at=?, override_until=?, version=version+1 WHERE actor_id=?",
+                "last_meal_at=?, updated_at=?, override_until=?, activity_source=?, "
+                "active_routine_id=?, version=version+1 WHERE actor_id=?",
                 [*values, command.actor_id],
             )
             rec = conn.execute(
@@ -1448,7 +1754,8 @@ class WorldMemory(Memory):
                     conn.execute(
                         "UPDATE world_actor_state SET location_id=?, activity_kind=?, activity=?, "
                         "activity_started_at=?, activity_until=?, sleeping=?, hunger=?, energy=?, "
-                        "last_meal_at=?, updated_at=?, override_until=?, version=version+1 WHERE actor_id=?",
+                        "last_meal_at=?, updated_at=?, override_until=?, activity_source=?, "
+                        "active_routine_id=?, version=version+1 WHERE actor_id=?",
                         [*values, command.actor_id],
                     )
                     location_id = values[0]
@@ -1534,6 +1841,7 @@ class WorldMemory(Memory):
         return [
             location, activity_kind, activity, now, command.until,
             1 if sleeping else 0, hunger, energy, last_meal, now, command.until,
+            "override", None,
         ], summary
 
     def _fill_command_until(self, command: WorldCommand, now: float) -> None:
@@ -1543,10 +1851,12 @@ class WorldMemory(Memory):
         if command.kind == "eat":
             command.until = now + int(self.state_store.simulation()["meal_minutes"]) * 60
             return
-        actor = self.state_store.actor(command.actor_id) or {}
         features = self.state_store.effective_features(command.actor_id)
         if features["routines"] and isinstance(self.simulator, RuleBasedWorldSimulator):
-            timezone = str(actor.get("timezone") or self.state_store.timezone)
+            state = self.state_store.state(command.actor_id) or {}
+            timezone = self.state_store.effective_timezone(
+                command.actor_id, location_id=state.get("location_id")
+            )
             boundaries = self.simulator._routine_boundaries(
                 self.state_store.routines(command.actor_id), now, now + 8 * 86_400, timezone
             )
@@ -1574,8 +1884,12 @@ class WorldMemory(Memory):
                         "content": {"type": "string"}, "subject_id": {"type": "string"},
                         "location_id": {"type": "string"}, "visibility": {"type": "string"},
                         "importance": {"type": "number"},
+                        "temporal_kind": {
+                            "type": "string", "enum": ["durable", "temporary"]
+                        },
+                        "valid_for_minutes": {"type": "number", "minimum": 1},
                         "source_message_ids": {"type": "array", "items": {"type": "integer"}},
-                    }, "required": ["content", "source_message_ids"]}},
+                    }, "required": ["content", "temporal_kind", "source_message_ids"]}},
                     "events": {"type": "array", "items": {"type": "object", "properties": {
                         "content": {"type": "string"}, "actor_id": {"type": "string"},
                         "location_id": {"type": "string"},
@@ -1590,9 +1904,12 @@ class WorldMemory(Memory):
                 }, "additionalProperties": False,
             },
             instruction=(
-                f"- world_updates: explicit, non-hypothetical facts/events about {char}'s world, "
-                f"plus actions that {char} clearly states they actually completed or are currently doing. "
-                "Do not turn user claims about NPC locations into authoritative actions. Include source_message_ids."
+                f"- world_updates: explicit, non-hypothetical updates about {char}'s world. "
+                "Facts must be classified as durable or temporary; temporary facts require a positive "
+                "valid_for_minutes grounded in the conversation. Put what the character is currently doing "
+                "only in actions, completed behavior only in events, and omit vague future plans without a "
+                "time rather than turning them into current facts. Do not turn user claims about NPC "
+                "locations into authoritative actions. Include source_message_ids."
             ),
         )
 
@@ -1607,12 +1924,25 @@ class WorldMemory(Memory):
             content = str(fact.get("content") or "").strip()
             if not ids or not content:
                 continue
+            temporal_kind = str(fact.get("temporal_kind") or "")
+            if temporal_kind not in {"durable", "temporary"}:
+                continue
+            valid_until = None
+            if temporal_kind == "temporary":
+                try:
+                    valid_for_minutes = float(fact.get("valid_for_minutes"))
+                except (TypeError, ValueError):
+                    continue
+                if valid_for_minutes <= 0:
+                    continue
+                valid_until = self._now() + valid_for_minutes * 60
             key = f"extract:fact:{ids}:{content.lower()}"
             rid = self.add_fact(
                 content, subject_id=fact.get("subject_id"), location_id=fact.get("location_id"),
                 visibility=str(fact.get("visibility") or "known"),
                 importance=_clip(fact.get("importance", 0.6)), source="extraction",
                 source_message_ids=ids, dedupe_key=key,
+                valid_until=valid_until, temporal_kind=temporal_kind,
             )
             row = self.records.get_row(rid)
             if row:

@@ -545,6 +545,8 @@ def _tool_upsert_world_fact(agent: CharacterAgent, mem: Any, args: dict) -> dict
         importance=_clip(_args(args, "importance", 0.6)),
         source="mcp",
         dedupe_key=_args(args, "dedupe_key", None),
+        valid_until=_args(args, "valid_until", None),
+        temporal_kind=_args(args, "temporal_kind", None),
     )
     agent.persist_structured()
     return {"id": row_id}
@@ -1664,6 +1666,8 @@ _register(
         "location_id": {"type": "string"},
         "visibility": {"type": "string", "enum": ["public", "known", "local", "private"]},
         "importance": {"type": "number", "minimum": 0, "maximum": 1},
+        "temporal_kind": {"type": "string", "enum": ["durable", "temporary"]},
+        "valid_until": {"type": "number", "description": "Unix epoch expiry for a temporary fact."},
         "dedupe_key": {"type": "string"},
     }, "required": ["content"]},
     _tool_upsert_world_fact, needs_memory=False, categories=("world",),

@@ -570,6 +570,17 @@ class WorldGraphProjector(GraphSourceProjector):
                     result.skipped += 1
                     continue
                 record_type = str(row.get("record_type") or "fact")
+                metadata = _loads(row.get("metadata_json"), {})
+                if (
+                    record_type == "fact"
+                    and row.get("source") == "extraction"
+                    and metadata.get("temporal_kind") != "durable"
+                ):
+                    # Legacy learned rows predate explicit validity and may be
+                    # stale present-tense observations. Keep them in history,
+                    # but never promote them to durable graph truth.
+                    result.skipped += 1
+                    continue
                 if record_type == "event":
                     if (
                         str(row.get("source") or "") == "simulation"
