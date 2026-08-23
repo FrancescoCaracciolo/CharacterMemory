@@ -97,7 +97,23 @@ def build_context_event(
 ) -> dict[str, Any]:
     """Turn a single-pass context snapshot into the browser event payload."""
     recalls: list[dict[str, Any]] = []
-    for recall in snapshot.recalls.values():
+    for name, section in snapshot.sections.items():
+        recall = snapshot.recalls.get(name)
+        if recall is None:
+            # User-authored prompt blocks have no retrieval diagnostics, but
+            # keeping them in this ordered list lets the live monitor show the
+            # exact /context sequence rather than silently hiding them.
+            recalls.append(
+                {
+                    "name": name,
+                    "title": "Intermediate prompt",
+                    "scope": "prompt",
+                    "body": section,
+                    "section": section,
+                    "items": [],
+                }
+            )
+            continue
         recalls.append(
             {
                 "name": recall.name,
@@ -143,7 +159,9 @@ def build_context_event(
         # fallback for older clients; the structured ``memories`` list above
         # remains the source for exact item rows and diagnostics.
         "context": dict(snapshot.sections),
-        "memory_count": len(recalls),
+        "context_order": list(snapshot.sections),
+        "context_text": "\n\n".join(snapshot.sections.values()),
+        "memory_count": len(snapshot.recalls),
         "item_count": sum(len(r["items"]) for r in recalls),
         "graphs": graphs,
     }

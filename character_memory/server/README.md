@@ -205,20 +205,24 @@ user.
 ```json
 {
   "chat_id": "9b3f1c2a4d5e6f708192...",
+  "context_order": ["character_info", "prompt:style", "dialogue_style"],
+  "context_text": "## Character Information\n...\n\nUse these examples only for style.\n\n## Example Exchanges...",
   "context": {
     "character_info": "## Character Information\n...",
-    "dialogue_style": "## Example Exchanges (style reference)\n...",
-    "user_facts": "## Known facts about user\n...",
-    "user_directives": "## Standing instructions\n...",
-    "episodic": "## Past episodes\n...",
-    "heartbeat": "## Recent activity\n...",
-    "emotion": "## Emotional state\n..."
+    "prompt:style": "Use these examples only for style.",
+    "dialogue_style": "## Example Exchanges (style reference)\n..."
   }
 }
 ```
 
 The `context` object maps each enabled, non-empty memory name to its
-rendered section. Keys that are empty/disabled are omitted. Typical keys:
+rendered section. Character Studio can also insert verbatim intermediate
+prompt blocks between memories; those use stable `prompt:<id>` keys. Empty or
+disabled items are omitted. Typical memory keys:
+
+`context_order` is the authoritative item order, including intermediate
+prompts. `context_text` is the same content already joined with blank lines,
+ready to pass to an LLM without relying on JSON object key ordering.
 
 | Key                | Memory contents                                         |
 |--------------------|---------------------------------------------------------|

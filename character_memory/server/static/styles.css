@@ -1679,6 +1679,7 @@ select option { background: var(--input); color: var(--text); }
   color: var(--text); background: var(--surface-alt); border: 1.5px solid var(--outline); border-radius: 11px;
   transition: opacity .15s, transform .15s, background .15s;
 }
+.cfg-section-row.is-prompt { grid-template-columns: 28px 18px minmax(180px, 1fr) auto 99px; align-items: start; }
 .cfg-section-row:hover { background: var(--surface); transform: translateX(2px); }
 .cfg-section-row.is-disabled { opacity: .62; }
 .cfg-section-row.is-disabled .cfg-section-status { color: var(--text-faint); }
@@ -1687,6 +1688,14 @@ select option { background: var(--input); color: var(--text); }
 .cfg-section-position { color: var(--text-faint); font: 800 9px var(--mono); text-align: center; }
 .cfg-section-row input[type="checkbox"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .cfg-section-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 800; }
+.cfg-section-prompt-editor { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.cfg-section-prompt {
+  width: 100%; min-height: 62px; box-sizing: border-box; resize: vertical;
+  padding: 8px 9px; color: var(--text); background: var(--surface-sunken);
+  border: 1.5px solid var(--outline); border-radius: 8px; outline: none;
+  font: 11.5px/1.45 var(--mono);
+}
+.cfg-section-prompt:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .cfg-section-status { color: var(--good); font: 800 8px var(--sans); letter-spacing: .06em; text-transform: uppercase; }
 .cfg-section-actions { display: flex; justify-content: flex-end; gap: 4px; }
 .cfg-section-move {
@@ -1695,6 +1704,7 @@ select option { background: var(--input); color: var(--text); }
   cursor: pointer; font: 900 13px/1 var(--sans);
 }
 .cfg-section-move:hover:not(:disabled) { color: #302947; background: var(--accent-2); transform: translateY(-1px); }
+.cfg-section-remove:hover:not(:disabled) { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, var(--surface)); }
 .cfg-section-move:disabled { opacity: .28; cursor: default; }
 
 /* Structured world editor. */
@@ -1802,6 +1812,7 @@ select option { background: var(--input); color: var(--text); }
   .world-field.wide { grid-column: auto; }
   .world-command-row { grid-template-columns: 1fr; }
   .cfg-section-row { grid-template-columns: 24px 18px minmax(100px, 1fr) 66px; }
+  .cfg-section-row.is-prompt { grid-template-columns: 24px 18px minmax(100px, 1fr) 99px; }
   .cfg-section-status { display: none; }
 }
 

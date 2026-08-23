@@ -50,6 +50,7 @@ const SECTION_TITLES = Object.fromEntries([
   ...MEMORIES.map((memory) => [memory.name, memory.title]),
   ["knowledge_graph", "Knowledge graph"],
 ]);
+const INTERMEDIATE_PROMPT_PREFIX = "prompt:";
 
 const WORLD_FEATURES = ["locations", "activities", "routines", "hunger", "energy", "sleep", "autonomous_needs"];
 const WORLD_ACTIVITY_KINDS = ["idle", "work", "school", "travel", "eat", "sleep", "leisure", "social", "other"];
@@ -766,7 +767,10 @@ function renderConfig() {
       ? cfg.memory.knowledge_graph_token_budget
       : 1000
   );
-  renderSectionOrder(cfg.section_order || DEFAULT_SECTION_ORDER);
+  renderSectionOrder(
+    cfg.section_order || DEFAULT_SECTION_ORDER,
+    cfg.intermediate_prompts || {},
+  );
 }
 
 function renderMemoryList(mem) {
@@ -803,19 +807,33 @@ function renderMemoryList(mem) {
 }
 
 function sectionEnabled(name) {
+  if (name.startsWith(INTERMEDIATE_PROMPT_PREFIX)) return true;
   if (name === "knowledge_graph") return !!$("cfg-kg").checked;
   const toggle = document.querySelector(`.switch-input[data-mem="${name}"]`);
   return !!(toggle && toggle.checked);
 }
 
-function renderSectionOrder(order) {
+function renderSectionOrder(order, intermediatePrompts = {}) {
   const box = $("cfg-section-order"); clear(box);
+  const promptIds = Object.keys(intermediatePrompts).filter((name) =>
+    name.startsWith(INTERMEDIATE_PROMPT_PREFIX));
+  const validName = (name) => !!SECTION_TITLES[name] || promptIds.includes(name);
   const requested = Array.isArray(order)
-    ? order.filter((name, index) => SECTION_TITLES[name] && order.indexOf(name) === index)
+    ? order.filter((name, index) => validName(name) && order.indexOf(name) === index)
     : [...DEFAULT_SECTION_ORDER];
   const included = new Set(requested);
-  const names = [...requested, ...DEFAULT_SECTION_ORDER.filter((name) => !included.has(name))];
+  const names = [
+    ...requested,
+    ...promptIds.filter((name) => !included.has(name)),
+    ...DEFAULT_SECTION_ORDER.filter((name) => !included.has(name)),
+  ];
   for (const name of names) {
+    if (name.startsWith(INTERMEDIATE_PROMPT_PREFIX)) {
+      box.appendChild(intermediatePromptRow(
+        name, intermediatePrompts[name] || "", included.has(name),
+      ));
+      continue;
+    }
     const include = el("input", {
       type: "checkbox", checked: included.has(name), "data-section-include": name,
       title: `Include ${SECTION_TITLES[name]} in /context`,
@@ -845,30 +863,116 @@ function renderSectionOrder(order) {
   refreshSectionOrderRows();
 }
 
+function intermediatePromptRow(name, value, included = true) {
+  const include = el("input", {
+    type: "checkbox", checked: included, "data-section-include": name,
+    title: "Include this prompt in /context",
+    "aria-label": "Include this intermediate prompt in /context",
+  });
+  include.addEventListener("change", () => { refreshSectionOrderRows(); dirtyMemory(); });
+  const editor = el("textarea", {
+    class: "cfg-section-prompt", rows: "3",
+    placeholder: "Write instructions inserted exactly at this point in /context…",
+    "aria-label": "Intermediate prompt text",
+  });
+  editor.value = value;
+  editor.addEventListener("input", () => { refreshSectionOrderRows(); dirtyMemory(); });
+  const row = el("div", {
+    class: "cfg-section-row is-prompt", "data-section-name": name,
+  }, [
+    el("span", { class: "cfg-section-position", "aria-hidden": "true" }),
+    include,
+    el("label", { class: "cfg-section-prompt-editor" }, [
+      el("span", { class: "cfg-section-title" }, "Intermediate prompt"),
+      editor,
+    ]),
+    el("span", { class: "cfg-section-status" }),
+    el("span", { class: "cfg-section-actions" }, [
+      el("button", {
+        type: "button", class: "cfg-section-move", "data-direction": "up",
+        title: "Move prompt up", "aria-label": "Move prompt up",
+        onclick: () => moveSectionRow(row, -1),
+      }, icon("chevron-up")),
+      el("button", {
+        type: "button", class: "cfg-section-move", "data-direction": "down",
+        title: "Move prompt down", "aria-label": "Move prompt down",
+        onclick: () => moveSectionRow(row, 1),
+      }, icon("chevron-down")),
+      el("button", {
+        type: "button", class: "cfg-section-move cfg-section-remove",
+        title: "Delete prompt", "aria-label": "Delete intermediate prompt",
+        onclick: () => {
+          row.remove(); refreshSectionOrderRows(); dirtyMemory();
+        },
+      }, icon("trash-2")),
+    ]),
+  ]);
+  return row;
+}
+
+function addIntermediatePrompt() {
+  let suffix;
+  do {
+    suffix = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  } while (document.querySelector(`[data-section-name="${INTERMEDIATE_PROMPT_PREFIX}${suffix}"]`));
+  const row = intermediatePromptRow(`${INTERMEDIATE_PROMPT_PREFIX}${suffix}`, "", true);
+  const box = $("cfg-section-order");
+  const activeRows = [...box.querySelectorAll(".cfg-section-row")]
+    .filter(rowIncludedInContext);
+  const lastActive = activeRows[activeRows.length - 1];
+  box.insertBefore(row, lastActive ? lastActive.nextElementSibling : box.firstElementChild);
+  refreshSectionOrderRows();
+  dirtyMemory();
+  row.querySelector("textarea").focus();
+  row.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
 function moveSectionRow(row, direction) {
-  const sibling = direction < 0 ? row.previousElementSibling : row.nextElementSibling;
-  if (!sibling) return;
-  if (direction < 0) row.parentNode.insertBefore(row, sibling);
-  else row.parentNode.insertBefore(sibling, row);
+  const activeRows = [...row.parentNode.querySelectorAll(".cfg-section-row")]
+    .filter(rowIncludedInContext);
+  const index = activeRows.indexOf(row);
+  const target = activeRows[index + direction];
+  if (index < 0 || !target) return;
+  if (direction < 0) row.parentNode.insertBefore(row, target);
+  else row.parentNode.insertBefore(row, target.nextElementSibling);
   refreshSectionOrderRows();
   dirtyMemory();
 }
 
+function rowIncludedInContext(row) {
+  const name = row.dataset.sectionName;
+  const included = row.querySelector("[data-section-include]").checked;
+  if (!included || !sectionEnabled(name)) return false;
+  return !name.startsWith(INTERMEDIATE_PROMPT_PREFIX)
+    || !!row.querySelector("textarea").value.trim();
+}
+
 function refreshSectionOrderRows() {
   const rows = [...document.querySelectorAll("#cfg-section-order .cfg-section-row")];
+  const activeRows = rows.filter(rowIncludedInContext);
   let includedPosition = 0;
-  rows.forEach((row, index) => {
+  rows.forEach((row) => {
     const name = row.dataset.sectionName;
     const enabled = sectionEnabled(name);
+    const isPrompt = name.startsWith(INTERMEDIATE_PROMPT_PREFIX);
+    const hasPromptText = !isPrompt || !!row.querySelector("textarea").value.trim();
     const included = row.querySelector("[data-section-include]").checked;
+    const activeIndex = activeRows.indexOf(row);
+    const reachesContext = activeIndex >= 0;
     row.classList.toggle("is-disabled", !enabled);
     row.classList.toggle("is-excluded", !included);
-    row.querySelector(".cfg-section-position").textContent = included
+    row.querySelector(".cfg-section-position").textContent = reachesContext
       ? String(++includedPosition).padStart(2, "0") : "—";
     const status = row.querySelector(".cfg-section-status");
-    status.textContent = !enabled ? "memory off" : included ? "included" : "omitted";
-    row.querySelector('[data-direction="up"]').disabled = index === 0;
-    row.querySelector('[data-direction="down"]').disabled = index === rows.length - 1;
+    status.textContent = !included ? "omitted"
+      : !enabled ? "memory off"
+      : isPrompt && !hasPromptText ? "empty"
+      : isPrompt ? "inserted" : "included";
+    row.querySelector('[data-direction="up"]').disabled = !reachesContext || activeIndex === 0;
+    row.querySelector('[data-direction="down"]').disabled =
+      !reachesContext || activeIndex === activeRows.length - 1;
   });
 }
 
@@ -900,11 +1004,16 @@ function gatherConfig() {
   const sectionOrder = [...document.querySelectorAll("#cfg-section-order .cfg-section-row")]
     .filter((row) => row.querySelector("[data-section-include]").checked)
     .map((row) => row.dataset.sectionName);
+  const intermediatePrompts = Object.fromEntries(
+    [...document.querySelectorAll("#cfg-section-order .cfg-section-row.is-prompt")]
+      .map((row) => [row.dataset.sectionName, row.querySelector("textarea").value]),
+  );
   return {
     persona: $("cfg-persona").value,
     kg_enabled: $("cfg-kg").checked,
     memory: mem,
     section_order: sectionOrder,
+    intermediate_prompts: intermediatePrompts,
   };
 }
 
@@ -1383,6 +1492,7 @@ function wire() {
 
   $("cfg-save-persona").addEventListener("click", savePersona);
   $("cfg-save-memory").addEventListener("click", saveMemory);
+  $("cfg-add-intermediate-prompt").addEventListener("click", addIntermediatePrompt);
   $("cfg-kg").addEventListener("change", () => {
     $("cfg-kg-token-budget").disabled = !$("cfg-kg").checked;
     if ($("cfg-kg").checked) ensureSectionIncluded("knowledge_graph");

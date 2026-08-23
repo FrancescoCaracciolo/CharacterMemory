@@ -50,7 +50,7 @@ default, unknown keys are ignored so the format is forward-compatible)::
                          world_location_seed }
     prompts:
       system, emotion_note, section_template, *_header, *_header_multi,
-      extraction_*, dedup_*, section_order
+      extraction_*, dedup_*, intermediate_prompts, section_order
 
 Backward compatibility: when ``config.yaml`` is absent but a legacy
 ``character.json`` manifest exists, :func:`load_config` reads the manifest's
@@ -268,6 +268,12 @@ def _build_prompt_config(data: Optional[dict[str, Any]]) -> PromptConfig:
             continue
         if k == "section_order":
             clean[k] = list(v) if isinstance(v, list) else v
+        elif k == "intermediate_prompts":
+            clean[k] = (
+                {str(prompt_id): str(text) for prompt_id, text in v.items()}
+                if isinstance(v, dict)
+                else {}
+            )
         else:
             clean[k] = v if v is not None else ""
     return PromptConfig(**clean)

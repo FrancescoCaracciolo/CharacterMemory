@@ -16,7 +16,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=calendar-world-toggle-1">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=intermediate-prompts-1">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -348,8 +348,13 @@
             </div>
             <div id="cfg-memory-list" class="cfg-memory-list"></div>
             <div class="cfg-section-order-head">
-              <span class="cfg-label">Section order</span>
-              <span class="cfg-hint">Checked sections are returned by <code>/context</code>. Use the arrows to reorder them.</span>
+              <div>
+                <span class="cfg-label">Context order</span>
+                <div class="cfg-hint">Numbered items define <code>context_order</code> and <code>context_text</code>. Empty recalled sections are skipped per request.</div>
+              </div>
+              <button id="cfg-add-intermediate-prompt" class="btn ghost tight" type="button">
+                <i data-lucide="plus" class="icon"></i><span class="btn-label">Intermediate prompt</span>
+              </button>
             </div>
             <div id="cfg-section-order" class="cfg-section-order" aria-label="Context section order"></div>
           </div>
@@ -564,6 +569,6 @@
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[Mnemosyne] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
   <script src="/gui/static/app.js?v=calendar-world-toggle-1"></script>
-  <script src="/gui/static/config.js?v=icons-1"></script>
+  <script src="/gui/static/config.js?v=intermediate-prompts-2"></script>
 </body>
 </html>

@@ -55,6 +55,7 @@ from character_memory.character_config import (
     save_config,
 )
 from character_memory.manifest import MEMORY_NAMES
+from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX
 from .sync import MemorySync
 
 # Two file buckets the GUI knows about. Map to the on-disk directories the
@@ -73,6 +74,7 @@ TOGGLEABLE_MEMORIES = tuple(n for n in MEMORY_NAMES if n != "knowledge_graph")
 # would either collide with relative-path traversal or break on filesystems
 # that hate weird characters.
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,62}$")
+_INTERMEDIATE_PROMPT_RE = re.compile(r"^prompt:[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 # --------------------------------------------------------------------------- #
@@ -142,6 +144,7 @@ class ConfigPatch(BaseModel):
     kg_enabled: Optional[bool] = None
     memory: Optional[dict[str, Any]] = None
     section_order: Optional[list[str]] = None
+    intermediate_prompts: Optional[dict[str, str]] = None
 
 
 class FileWriteRequest(BaseModel):
@@ -400,6 +403,7 @@ def build_admin_router(
             "kg_enabled": os.path.isfile(marker) or mem.enabled_knowledge_graph,
             "memory": memory_view,
             "section_order": list(loaded.prompts.section_order),
+            "intermediate_prompts": dict(loaded.prompts.intermediate_prompts),
         }
 
     @router.put("/characters/{name}/config")
@@ -414,23 +418,50 @@ def build_admin_router(
         persona = loaded.persona
         if patch.persona is not None:
             persona = patch.persona
-        if patch.section_order is not None:
-            unknown = [name for name in patch.section_order if name not in MEMORY_NAMES]
+        candidate_prompts = (
+            dict(prompts.intermediate_prompts)
+            if patch.intermediate_prompts is None
+            else dict(patch.intermediate_prompts)
+        )
+        invalid_prompt_ids = [
+            prompt_id
+            for prompt_id in candidate_prompts
+            if not _INTERMEDIATE_PROMPT_RE.fullmatch(prompt_id)
+        ]
+        if patch.intermediate_prompts is not None and invalid_prompt_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Invalid intermediate prompt ids: {sorted(invalid_prompt_ids)}. "
+                    f"Ids must start with {INTERMEDIATE_PROMPT_PREFIX!r} and use "
+                    "only letters, digits, underscores, or hyphens."
+                ),
+            )
+
+        candidate_order = (
+            list(prompts.section_order)
+            if patch.section_order is None
+            else list(patch.section_order)
+        )
+        if patch.section_order is not None or patch.intermediate_prompts is not None:
+            allowed_sections = set(MEMORY_NAMES) | set(candidate_prompts)
+            unknown = [name for name in candidate_order if name not in allowed_sections]
             duplicates = [
-                name for i, name in enumerate(patch.section_order)
-                if name in patch.section_order[:i]
+                name for i, name in enumerate(candidate_order)
+                if name in candidate_order[:i]
             ]
             if unknown:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Unknown context sections: {sorted(set(unknown))}",
+                    detail=f"Unknown context items: {sorted(set(unknown))}",
                 )
             if duplicates:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Duplicate context sections: {sorted(set(duplicates))}",
+                    detail=f"Duplicate context items: {sorted(set(duplicates))}",
                 )
-            prompts.section_order = list(patch.section_order)
+            prompts.section_order = candidate_order
+            prompts.intermediate_prompts = candidate_prompts
         if patch.memory:
             mem = cfg.memory
             enabled_now: list[str] = []

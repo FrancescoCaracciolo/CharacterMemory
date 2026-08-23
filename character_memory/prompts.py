@@ -9,6 +9,9 @@ the agent at render time.
 from dataclasses import dataclass, field
 
 
+INTERMEDIATE_PROMPT_PREFIX = "prompt:"
+
+
 @dataclass
 class PromptConfig:
     """All prompt templates, each individually overridable."""
@@ -117,7 +120,13 @@ class PromptConfig:
         'Respond ONLY with: {"contradicts": true} or {"contradicts": false}.'
     )
 
-    # Order in which memory sections appear in the prompt.
+    # User-authored context blocks that can be placed between recalled memory
+    # sections. Keys are stable ``prompt:<id>`` tokens referenced by
+    # ``section_order``; values are inserted verbatim (without
+    # ``section_template`` wrapping).
+    intermediate_prompts: dict[str, str] = field(default_factory=dict)
+
+    # Order in which memory sections and intermediate prompt blocks appear.
     section_order: list[str] = field(
         default_factory=lambda: [
             "character_info",

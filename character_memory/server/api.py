@@ -241,6 +241,14 @@ class ContextRequest(BaseModel):
 class ContextResponse(BaseModel):
     chat_id: str
     context: dict[str, str]
+    context_order: list[str] = Field(
+        ...,
+        description="Context item ids in their exact prompt order.",
+    )
+    context_text: str = Field(
+        ...,
+        description="All context items joined in their exact prompt order.",
+    )
 
 
 class SaveRequest(BaseModel):
@@ -364,7 +372,12 @@ def context(req: ContextRequest) -> ContextResponse:
         # Monitoring must never change the thin-client contract or turn a
         # successful recall into a failed request.
         pass
-    return ContextResponse(chat_id=chat.id, context=snapshot.sections)
+    return ContextResponse(
+        chat_id=chat.id,
+        context=snapshot.sections,
+        context_order=list(snapshot.sections),
+        context_text="\n\n".join(snapshot.sections.values()),
+    )
 
 
 @app.get("/api/context-events/{character}")

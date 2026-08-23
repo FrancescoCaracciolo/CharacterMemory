@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from character_memory.llm.base import LLMClient
-from character_memory.prompts import PromptConfig
+from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX, PromptConfig
 from .memory.extract import Extractor, ExtractionContext, build_extraction
 from .memory.base import Memory, MemoryItem, RecallResult
 from .memory.structured import StructuredMemory
@@ -169,10 +169,18 @@ class Character:
         """
         order = self.prompts.section_order if self.prompts is not None else [m.name for m in self.memories]
         template = self.prompts.section_template if self.prompts is not None else "## {title}\n{body}"
+        intermediate_prompts = (
+            self.prompts.intermediate_prompts if self.prompts is not None else {}
+        )
         multi = bool(participants and len(participants) > 1)
         sections: dict[str, str] = {}
         recalls: dict[str, MemoryRecallSnapshot] = {}
         for name in order:
+            if name.startswith(INTERMEDIATE_PROMPT_PREFIX):
+                prompt = intermediate_prompts.get(name, "")
+                if prompt.strip():
+                    sections[name] = prompt
+                continue
             mem = self._by_name.get(name)
             if mem is None or not mem.enabled:
                 continue
@@ -249,7 +257,7 @@ class Character:
         limits: dict[str, int] = {},
         participants: Optional[list[str]] = None,
     ) -> dict[str, str]:
-        """Return `{memory_name: rendered_section}` for enabled, non-empty memories."""
+        """Return ordered rendered memory sections and intermediate prompts."""
         return self.build_context_snapshot(
             query, user_id, limits=limits, participants=participants
         ).sections

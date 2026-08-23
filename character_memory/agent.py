@@ -786,7 +786,7 @@ class CharacterAgent:
     def build_context(
         self, target: Target, *, user_id: str = "default"
     ) -> dict[str, str]:
-        """Return `{memory_name: rendered_section}` for the target."""
+        """Return ordered rendered memory sections and intermediate prompts."""
         return self.build_context_snapshot(target, user_id=user_id).sections
 
     def build_context_snapshot(
