@@ -834,7 +834,7 @@ def _tool_add_heartbeat(agent: CharacterAgent, mem: Any, args: dict) -> dict:
         return _json_error("summary is required.")
     row_id = mem.add_entry(
         summary=summary,
-        kind=str(_args(args, "kind", "discovery")),
+        kind=mem.validate_kind(str(_args(args, "kind", "discovery"))),
         importance=_clip(_args(args, "importance", 0.5)),
     )
     _persist_after_write(agent, mem)
@@ -854,7 +854,7 @@ def _tool_update_heartbeat(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     if _args(args, "summary", None):
         row["summary"] = str(args["summary"]).strip()
     if _args(args, "kind", None):
-        row["kind"] = str(args["kind"])
+        row["kind"] = mem.validate_kind(str(args["kind"]))
     if _args(args, "importance", None) is not None:
         row["importance"] = _clip(args["importance"])
     mem.update_row(row)

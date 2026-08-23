@@ -43,7 +43,11 @@ default, unknown keys are ignored so the format is forward-compatible)::
                          hebbian_threshold, hebbian_lr, self_seed,
                          match_base, match_gain, fact_batch_size,
                          episode_batch_size, wiki_batch_size,
-                         extraction_token_limit }
+                         extraction_token_limit, project_heartbeat,
+                         heartbeat_min_importance, heartbeat_max_nodes,
+                         project_world, world_event_max_nodes,
+                         world_include_simulation_events,
+                         world_location_seed }
     prompts:
       system, emotion_note, section_template, *_header, *_header_multi,
       extraction_*, dedup_*, section_order

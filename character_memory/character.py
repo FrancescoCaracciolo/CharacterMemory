@@ -196,6 +196,44 @@ class Character:
                 items=list(result.items),
                 diagnostics=dict(result.diagnostics or {}),
             )
+        # Heartbeat/world remain first-class prompt memories. If their exact
+        # source row was also activated through the graph, keep the graph's
+        # traversal/diagnostics but suppress duplicate prompt text.
+        kg_recall = recalls.get("knowledge_graph")
+        kg_memory = self._by_name.get("knowledge_graph")
+        if kg_recall is not None and kg_memory is not None:
+            direct_sources: set[str] = set()
+            heartbeat_recall = recalls.get("heartbeat")
+            if heartbeat_recall is not None:
+                direct_sources.update(
+                    f"heartbeat:{item.metadata['id']}"
+                    for item in heartbeat_recall.items
+                    if item.metadata.get("id") is not None
+                )
+            world_recall = recalls.get("world")
+            if world_recall is not None:
+                direct_sources.update(
+                    f"world_records:{item.metadata['id']}"
+                    for item in world_recall.items
+                    if not item.metadata.get("world_current")
+                    and item.metadata.get("id") is not None
+                )
+            filtered = [
+                item
+                for item in kg_recall.items
+                if item.metadata.get("source") not in direct_sources
+            ]
+            if len(filtered) != len(kg_recall.items):
+                if filtered:
+                    body = kg_memory.format(filtered)
+                    section = template.format(title=kg_recall.title, body=body)
+                    kg_recall.items = filtered
+                    kg_recall.body = body
+                    kg_recall.section = section
+                    sections["knowledge_graph"] = section
+                else:
+                    sections.pop("knowledge_graph", None)
+                    recalls.pop("knowledge_graph", None)
         return ContextSnapshot(
             sections=sections,
             recalls=recalls,

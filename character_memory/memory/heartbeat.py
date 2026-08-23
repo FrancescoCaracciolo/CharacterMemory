@@ -26,6 +26,16 @@ class HeartbeatJournal(StructuredMemory):
         "kind": "TEXT NOT NULL DEFAULT 'discovery'",
     }
     text_column = "summary"
+    kinds = frozenset({"discovery", "action"})
+
+    @classmethod
+    def validate_kind(cls, kind: str) -> str:
+        value = str(kind or "").strip().lower()
+        if value not in cls.kinds:
+            raise ValueError(
+                f"Unknown heartbeat kind {kind!r}; expected discovery or action"
+            )
+        return value
 
     def add_entry(
         self,
@@ -35,7 +45,17 @@ class HeartbeatJournal(StructuredMemory):
         importance: float = 0.5,
         user_id: str = "_self",
     ) -> int:
-        return self.add(user_id, importance, summary=summary, kind=kind)
+        return self.add(
+            user_id,
+            importance,
+            summary=summary,
+            kind=self.validate_kind(kind),
+        )
+
+    def add(self, user_id: str, importance: float, **fields: Any) -> int:
+        """Validate the journal subtype, then use StructuredMemory's wiring."""
+        fields["kind"] = self.validate_kind(fields.get("kind", "discovery"))
+        return super().add(user_id, importance, **fields)
 
     def _recall_where(self, user_id: str) -> None:
         # The journal is character-scoped, not per-user.

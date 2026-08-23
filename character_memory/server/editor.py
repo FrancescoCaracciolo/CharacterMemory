@@ -336,6 +336,8 @@ def create_record(agent: Any, memory: Any, values: dict[str, Any]) -> Any:
         return row_id
 
     assert isinstance(memory, StructuredMemory)
+    if memory.name == "heartbeat" and "kind" in clean:
+        clean["kind"] = memory.validate_kind(clean["kind"])
     user_id = clean.pop("user_id", "_self")
     importance = clean.pop("importance", getattr(memory, "default_importance", 0.5))
     if isinstance(memory, EpisodicMemory):
@@ -379,6 +381,8 @@ def update_record(
     if row is None:
         raise KeyError(record_id)
     clean.pop("user_id", None)  # record ownership is immutable from the editor
+    if memory.name == "heartbeat" and "kind" in clean:
+        clean["kind"] = memory.validate_kind(clean["kind"])
     if isinstance(memory, CalendarMemory):
         clean.pop("importance", None)
         memory.update_event(row_id, **clean)

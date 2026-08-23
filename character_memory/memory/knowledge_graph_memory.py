@@ -66,6 +66,7 @@ class KnowledgeGraphMemory(Memory):
         source row for the `update` / `apply_deduplication` paths.
         """
         self._sources = {k: v for k, v in memories.items() if k != self.name}
+        self.retriever.sources_wired = True
 
     def _source_memory_for(self, name: str) -> Optional[Any]:
         return self._sources.get(name)
@@ -158,18 +159,29 @@ class KnowledgeGraphMemory(Memory):
         if not self.enabled:
             return RecallResult()
 
-        items: list[MemoryItem] = []
+        # Participant-specific activation is computed read-only, then shared
+        # graph nodes are merged and recorded once. This prevents a global
+        # heartbeat/world/wiki node from being rendered and practiced once per
+        # human speaker in a group chat.
+        by_node: dict[str, MemoryItem] = {}
         by_participant: dict[str, dict[str, Any]] = {}
         for uid in participants:
             result = self.build_section_result(
-                query, uid, limit, state_changing=state_changing
+                query, uid, limit, state_changing=False
             )
-            items.extend(result.items)
+            for item in result.items:
+                node_id = str(item.metadata.get("node_id") or "")
+                current = by_node.get(node_id)
+                if current is None or item.score > current.score:
+                    by_node[node_id] = item
             if result.items:
                 by_participant[uid] = result.diagnostics
+        items = list(by_node.values())
         if not items:
             return RecallResult()
-        body = self.format_grouped(items, participants)
+        if state_changing:
+            self.retriever.record_recall(items)
+        body = self.format(items)
         return RecallResult(
             items=items,
             body=body,

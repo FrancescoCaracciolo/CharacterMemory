@@ -152,6 +152,12 @@ class KnowledgeGraphConfig:
       source items handled in one KG extraction/ingestion batch.
     - `extraction_token_limit`: maximum source-text tokens in one batch. The
       prompt, JSON schema, and generated response add their own overhead.
+    - `project_heartbeat` / `project_world`: enable deterministic derived
+      graph views of those source memories. Heartbeats are importance-capped;
+      world events are capped and simulator events are excluded by default.
+      Authored world routines and mutable actor state are never projected.
+    - `world_location_seed`: transient retrieval boost for the observer's
+      current location; it does not persist current state as a graph fact.
     """
 
     decay: float = 0.5
@@ -171,6 +177,18 @@ class KnowledgeGraphConfig:
     episode_batch_size: int = 50
     wiki_batch_size: int = 3
     extraction_token_limit: int = 10_000
+    # Deterministic, no-LLM projections from character-scoped memories. The
+    # source memories remain authoritative; the graph stores only a derived
+    # view and reconciles it by source fingerprint.
+    project_heartbeat: bool = True
+    heartbeat_min_importance: float = 0.6
+    heartbeat_max_nodes: int = 200
+    project_world: bool = True
+    world_event_max_nodes: int = 500
+    world_include_simulation_events: bool = False
+    # Runtime-only activation boost for the observer's current location.
+    # The snapshot itself is never persisted into the graph.
+    world_location_seed: float = 0.6
 
 
 @dataclass

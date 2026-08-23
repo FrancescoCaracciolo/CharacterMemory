@@ -112,6 +112,25 @@ class KnowledgeGraph:
     def get_node(self, node_id: str) -> Optional[Node]:
         return self.nodes.get(node_id)
 
+    def find_by_external_ref(self, external_ref: str) -> Optional[Node]:
+        """Return the node carrying ``external_ref``, if any."""
+        if not external_ref:
+            return None
+        return next(
+            (
+                node
+                for node in self.nodes.values()
+                if external_ref in (getattr(node, "external_refs", []) or [])
+            ),
+            None,
+        )
+
+    def bind_external_ref(self, node: Node, external_ref: str) -> Node:
+        """Attach a stable source identifier to a canonical node."""
+        if external_ref and external_ref not in node.external_refs:
+            node.external_refs.append(external_ref)
+        return node
+
     def remove_node(self, node_id: str) -> None:
         """Remove a node and every edge that touched it."""
         if node_id not in self.nodes:
@@ -464,6 +483,7 @@ class KnowledgeGraph:
             return []
         removed: list[str] = []
         absorbed_aliases: list[str] = []
+        absorbed_refs: list[str] = []
         for node in list(self.nodes.values()):
             if not isinstance(node, PersonNode):
                 continue
@@ -478,6 +498,7 @@ class KnowledgeGraph:
             for c in [node.name, *(node.aliases or [])]:
                 if c and c.lower() not in target:
                     absorbed_aliases.append(c)
+            absorbed_refs.extend(node.external_refs or [])
             self._rewire_edges(node.id, self.SELF_ID)
             self.remove_node(node.id)
             removed.append(node.id)
@@ -489,6 +510,9 @@ class KnowledgeGraph:
                     [*(self_node.text.split(". ") if self_node.text else []), *absorbed_aliases]
                 ))
                 self_node.text = ". ".join(s for s in seen if s and s.lower() != "the character") or "the character"
+                self_node.external_refs = list(dict.fromkeys([
+                    *(self_node.external_refs or []), *absorbed_refs
+                ]))
         return removed
 
     def _pick_person_survivor(self, member_ids: list[str]) -> str:
@@ -552,6 +576,9 @@ class KnowledgeGraph:
             survivor.user_ids = list(dict.fromkeys([
                 *(survivor.user_ids or []), survivor.user_id,
                 *(dup.user_ids or []), dup.user_id,
+            ]))
+            survivor.external_refs = list(dict.fromkeys([
+                *(survivor.external_refs or []), *(dup.external_refs or [])
             ]))
             self._rewire_edges(rid, survivor_id)
             self.remove_node(rid)

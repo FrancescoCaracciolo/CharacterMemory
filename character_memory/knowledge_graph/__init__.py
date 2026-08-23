@@ -42,6 +42,13 @@ from .nodes import (
     node_from_dict,
 )
 from .persistence import has_persisted, load_graph, save_graph
+from .projectors import (
+    GraphSourceProjector,
+    ProjectionResult,
+    get_graph_source_projector,
+    graph_source_projectors,
+    register_graph_source_projector,
+)
 from .retriever import (
     KnowledgeGraphConfig,
     KnowledgeGraphRetriever,
@@ -81,6 +88,12 @@ __all__ = [
     "save_graph",
     "load_graph",
     "has_persisted",
+    # source projection
+    "GraphSourceProjector",
+    "ProjectionResult",
+    "register_graph_source_projector",
+    "get_graph_source_projector",
+    "graph_source_projectors",
     # retriever
     "KnowledgeGraphRetriever",
     "KnowledgeGraphRetrivier",

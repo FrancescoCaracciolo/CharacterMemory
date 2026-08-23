@@ -42,6 +42,10 @@ class Node:
     #: dedup report can be mapped to graph mutations. Empty for nodes not
     #: derived from a single source row (e.g. the SelfNode).
     source: str = ""
+    #: Stable identifiers owned by external/source systems. A wiki entity and
+    #: a WorldMemory location can therefore resolve to one canonical graph
+    #: node without making either source own the other source's node.
+    external_refs: list[str] = field(default_factory=list)
     #: Transient activation populated at retrieval time; never persisted.
     activation: float = 0.0
 
@@ -57,6 +61,7 @@ class Node:
             "recall_count": self.recall_count,
             "practice_times": list(self.practice_times),
             "source": self.source,
+            "external_refs": list(self.external_refs),
         }
         # Dataclass-only extra fields (the subclasses' data).
         for k, v in self._extra_fields().items():

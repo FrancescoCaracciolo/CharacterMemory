@@ -75,8 +75,12 @@ from .memory import (
     SELF_OWNER,
 )
 from .knowledge_graph import (
+    GraphSourceProjector,
     KnowledgeGraphRetriever,
     KnowledgeGraphRetrivier,
+    ProjectionResult,
+    get_graph_source_projector,
+    register_graph_source_projector,
 )
 from .manifest import MEMORY_NAMES, CharacterManifest
 from .prompts import PromptConfig
@@ -211,6 +215,10 @@ __all__ = [
     "KnowledgeGraphMemory",
     "KnowledgeGraphRetriever",
     "KnowledgeGraphRetrivier",
+    "GraphSourceProjector",
+    "ProjectionResult",
+    "register_graph_source_projector",
+    "get_graph_source_projector",
     "SQLiteStore",
     "Extractor",
     "ExtractionContext",

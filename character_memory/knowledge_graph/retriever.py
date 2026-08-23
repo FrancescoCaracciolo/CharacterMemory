@@ -65,10 +65,12 @@ from .persistence import (
     save_graph,
     sync_hybrid_index,
 )
+from .projectors import ProjectionResult, graph_source_projectors
 
 
 _NodeAddedCallback = Callable[[Node], None]
 _LLMProgressCallback = Callable[[int, int], None]
+_PROJECTION_META_TABLE = "kg_projection_meta"
 
 
 class _BuildProgress:
@@ -128,6 +130,12 @@ class KnowledgeGraphRetriever:
         # extraction context-aware and relevance-filtered, and to drive the
         # self-dedup pass. Set by the agent at build time.
         self.character: Optional[dict[str, Any]] = None
+        # Source projectors are active only when an agent/adapter explicitly
+        # wires the source-memory catalog. Standalone retrievers keep their
+        # historical behavior until a caller opts into that wiring.
+        self.sources_wired = False
+        self._pending_projection_meta: dict[str, tuple[int, str]] = {}
+        self._last_projection_report: dict[str, dict[str, int]] = {}
 
     # --------------------------------------------------------------- backends
     def load(
@@ -149,6 +157,85 @@ class KnowledgeGraphRetriever:
         self.hybrid = hybrid
         self.store = store
         return self
+
+    # ------------------------------------------------------- source projection
+    def _ensure_projection_meta(self) -> None:
+        if self.store is None:
+            return
+        self.store.create_table(
+            _PROJECTION_META_TABLE,
+            {
+                "projector": "TEXT PRIMARY KEY",
+                "version": "INTEGER NOT NULL",
+                "fingerprint": "TEXT NOT NULL",
+            },
+            pk="projector",
+        )
+
+    def reconcile_sources(
+        self, *, force: bool = False, sync_index: bool = True
+    ) -> dict[str, dict[str, int]]:
+        """Reconcile every registered projector against its source memory.
+
+        The operation is deterministic and never calls the LLM. Projection
+        metadata is staged here and committed only after :meth:`save` has
+        durably published the matching graph and hybrid index.
+        """
+        if not self.sources_wired or self.store is None:
+            return {}
+        self._ensure_projection_meta()
+        reports: dict[str, dict[str, int]] = {}
+        changed = False
+        for projector in graph_source_projectors():
+            memory = self._source_memory_for(projector.source_memory)
+            fingerprint = projector.fingerprint(memory, self.config)
+            rows = self.store.select(
+                _PROJECTION_META_TABLE, {"projector": projector.name}, limit=1
+            )
+            current = rows[0] if rows else None
+            pending = self._pending_projection_meta.get(projector.name)
+            already_current = bool(
+                current
+                and int(current.get("version") or 0) == int(projector.version)
+                and str(current.get("fingerprint") or "") == fingerprint
+            )
+            already_pending = pending == (int(projector.version), fingerprint)
+            if not force and (already_current or already_pending):
+                continue
+            result: ProjectionResult = projector.reconcile(
+                self.graph,
+                memory,
+                self.config,
+                character=self.character,
+            )
+            reports[projector.name] = result.to_dict()
+            changed = changed or result.changed
+            self._pending_projection_meta[projector.name] = (
+                int(projector.version),
+                fingerprint,
+            )
+        if changed:
+            self._dedup_persons()
+            if sync_index:
+                self._sync_index()
+        self._last_projection_report = reports
+        return reports
+
+    def _commit_projection_meta(self) -> None:
+        if self.store is None or not self._pending_projection_meta:
+            return
+        self._ensure_projection_meta()
+        for name, (version, fingerprint) in self._pending_projection_meta.items():
+            self.store.upsert(
+                _PROJECTION_META_TABLE,
+                {
+                    "projector": name,
+                    "version": version,
+                    "fingerprint": fingerprint,
+                },
+                pk="projector",
+            )
+        self._pending_projection_meta.clear()
 
     # --------------------------------------------------------------- ingestion
     def ingest(
@@ -213,6 +300,11 @@ class KnowledgeGraphRetriever:
                     self.config, "extraction_token_limit", _EXTRACTION_TOKEN_LIMIT
                 ),
             )
+
+        # Built-in and third-party character-scoped projections share this
+        # registry-driven path. Full builds force them even when an older
+        # projection fingerprint is present in SQLite.
+        self.reconcile_sources(force=True, sync_index=False)
 
         self._known_users = known_users or [n.user_id for n in self.graph.nodes_of_kind("person")]
         # Deterministic self-healing: collapse any person node that is actually
@@ -300,6 +392,10 @@ class KnowledgeGraphRetriever:
                 _on_llm_request_done=progress.request_done,
                 _sync_index=False,
             )
+            # Run once more after wiki extraction so deterministic heartbeat
+            # name matching and world identity refs can reuse the final typed
+            # person/entity catalog produced by the LLM pass.
+            self.reconcile_sources(force=True, sync_index=False)
         # A combined full ingest used to embed once after memories and again
         # after wiki. Build the authoritative final snapshot exactly once.
         self._rebuild_index()
@@ -568,6 +664,30 @@ class KnowledgeGraphRetriever:
         seeds: dict[str, float] = {}
         if self.graph.SELF_ID in self.graph.nodes:
             seeds[self.graph.SELF_ID] = self.config.self_seed
+        # Runtime world context is a seed, not durable knowledge. Only the
+        # observer's current location participates; mutable gauges and visible
+        # actors remain exclusively in WorldMemory.
+        world = self._source_memory_for("world") if self.sources_wired else None
+        if (
+            self.config.project_world
+            and float(self.config.world_location_seed) > 0.0
+            and world is not None
+            and getattr(world, "enabled", False)
+        ):
+            try:
+                snapshot = world.snapshot(commit=False)
+                location_id = str(snapshot.observer.get("location_id") or "")
+                location = self.graph.find_by_external_ref(
+                    f"world:location:{location_id}"
+                )
+                if location is not None:
+                    seeds[location.id] = seeds.get(location.id, 0.0) + float(
+                        self.config.world_location_seed
+                    )
+            except Exception:
+                # World projection remains optional; a bad custom simulator
+                # must not prevent ordinary KG recall.
+                pass
         # `query` may be a bare string or a list of (text, weight) pairs
         # (history-aware retrieval). Skip only when there is no usable text at
         # all; hybrid.search already fuses the weighted list itself.
@@ -719,6 +839,21 @@ class KnowledgeGraphRetriever:
             self._hebbian_step(set(surfaced_ids))
         return items
 
+    def record_recall(self, items: Iterable[MemoryItem]) -> None:
+        """Record one merged recall (used by multi-participant rendering)."""
+        surfaced: set[str] = set()
+        now = self._now()
+        for item in items:
+            node_id = item.metadata.get("node_id")
+            node = self.graph.nodes.get(str(node_id)) if node_id is not None else None
+            if node is None or node.id in surfaced:
+                continue
+            node.activation = max(node.activation, float(item.score))
+            node.touch(now)
+            surfaced.add(node.id)
+        if surfaced:
+            self._hebbian_step(surfaced)
+
     def _hebbian_step(self, surfaced: set[str]) -> None:
         """Strengthen co-occurrence edges between co-activated nodes.
 
@@ -778,10 +913,25 @@ class KnowledgeGraphRetriever:
             text = f"{getattr(node, 'name', node.text)} ({getattr(node, 'kind_label', 'thing')})"
         else:
             text = node.text or node.id
+        source = str(getattr(node, "source", "") or "")
+        origin = source.split(":", 1)[0] if source else ""
+        if source.startswith("heartbeat:"):
+            text = (
+                f"Heartbeat finding: {text}"
+                if kind == "fact"
+                else f"Heartbeat action: {text}"
+            )
+        elif source.startswith((
+            "world_location:", "world_actor:", "world_routine:", "world_records:"
+        )):
+            text = f"World {'fact' if kind == 'fact' else 'event'}: {text}"
         metadata: dict[str, Any] = {
             "node_id": node.id,
             "node_kind": kind,
             "activation": float(activation),
+            "source": source,
+            "origin": origin,
+            "external_refs": list(getattr(node, "external_refs", []) or []),
         }
         # Surfaced so prompt rendering can stamp the node's age (see
         # item_bullet); None on nodes never assigned a creation time.
@@ -814,6 +964,7 @@ class KnowledgeGraphRetriever:
     def save(self, path: str) -> "KnowledgeGraphRetriever":
         if self.hybrid is None or self.store is None:
             return self
+        self.reconcile_sources(sync_index=False)
         self.graph = save_graph(
             self.graph,
             self.store,
@@ -822,6 +973,7 @@ class KnowledgeGraphRetriever:
             replace=self._replace_on_next_save,
         )
         self._replace_on_next_save = False
+        self._commit_projection_meta()
         self._known_users = self._graph_user_ids()
         return self
 
@@ -839,6 +991,12 @@ class KnowledgeGraphRetriever:
             # stale/missing FAISS index is rebuilt on the next save().
             pass
         self._known_users = self._graph_user_ids()
+        # Existing graphs are backfilled exactly once per projector version or
+        # source fingerprint. Publishing here preserves build()'s no-LLM load
+        # contract while making new derived sources immediately available.
+        self.reconcile_sources(sync_index=False)
+        if self._pending_projection_meta:
+            self.save(path)
         return self
 
     def has_persisted(self, path: str) -> bool:
@@ -851,6 +1009,7 @@ class KnowledgeGraphRetriever:
         self.graph = KnowledgeGraph()
         self._known_users = []
         self._replace_on_next_save = True
+        self._pending_projection_meta.clear()
         return self
 
     # ----------------------------------------------------------------- helpers

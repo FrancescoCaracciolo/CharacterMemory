@@ -678,6 +678,19 @@ class CharacterAgent:
         if isinstance(kg, KnowledgeGraphMemory):
             kg.persist(os.path.join(self.save_directory, "kg_index"))
 
+    def reconcile_knowledge_graph_sources(self) -> dict[str, dict[str, int]]:
+        """Reconcile registered KG projectors and durably publish the result."""
+        self._require_loaded()
+        kg = self.memories.get(_KG_MEMORY)
+        if not isinstance(kg, KnowledgeGraphMemory):
+            raise RuntimeError(
+                f"Character {self.character_name!r} does not have the "
+                "knowledge_graph memory enabled."
+            )
+        reports = kg.retriever.reconcile_sources(force=True, sync_index=False)
+        kg.persist(os.path.join(self.save_directory, "kg_index"))
+        return reports
+
     # Target resolution
     def _as_chat(self, target: Union[Chat, str]) -> Optional[Chat]:
         """Resolve a `Chat` or chat id to a `Chat` (or `None` if missing)."""
