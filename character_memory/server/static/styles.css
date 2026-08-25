@@ -1664,6 +1664,7 @@ select option { background: var(--input); color: var(--text); }
 .live-empty-mark { color: var(--accent); font: 28px/1 var(--display); opacity: .7; }
 .live-timeline-empty { flex: 1; min-height: 210px; }
 .live-timeline-panel:has(.live-timeline-item) .live-timeline-empty { display: none; }
+.live-embed-toolbar, .live-embed-drawer, .live-embed-backdrop { display: none; }
 .world-json { max-height: 280px; overflow: auto; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-2); white-space: pre-wrap; font: 11px/1.5 var(--mono); }
 .world-seed { min-height: 360px; }
 .world-command-row { display: grid; grid-template-columns: 180px minmax(180px, 1fr) auto; gap: 8px; }
@@ -1814,6 +1815,147 @@ select option { background: var(--input); color: var(--text); }
   .cfg-section-row { grid-template-columns: 24px 18px minmax(100px, 1fr) 66px; }
   .cfg-section-row.is-prompt { grid-template-columns: 24px 18px minmax(100px, 1fr) 99px; }
   .cfg-section-status { display: none; }
+}
+
+/* Iframe-first live knowledge graph.  This route deliberately reuses the
+   normal Live recall DOM and renderer, then removes all application chrome.
+   The only controls left are graph navigation, a participant picker when a
+   group chat needs one, and the last-recall drawer requested by the host. */
+html.live-graph-embed,
+html.live-graph-embed body {
+  width: 100%; height: 100%; min-width: 0; overflow: hidden;
+}
+html.live-graph-embed body { background: var(--bg); }
+html.live-graph-embed .app { position: relative; width: 100%; height: 100dvh; overflow: hidden; }
+html.live-graph-embed .topbar,
+html.live-graph-embed .app > .main,
+html.live-graph-embed #cfg-pane,
+html.live-graph-embed .live-head,
+html.live-graph-embed .live-new,
+html.live-graph-embed .live-timeline-panel,
+html.live-graph-embed .live-layout > .live-main,
+html.live-graph-embed .live-graph-head,
+html.live-graph-embed .live-graph-side,
+html.live-graph-embed .live-graph-legend,
+html.live-graph-embed #memory-editor,
+html.live-graph-embed #api-key-overlay,
+html.live-graph-embed #toast,
+html.live-graph-embed #delete-overlay,
+html.live-graph-embed #wiz-overlay {
+  display: none !important;
+}
+html.live-graph-embed .live-pane {
+  position: relative; display: flex !important; flex: 1 1 auto;
+  width: 100%; height: 100%; min-height: 0; overflow: hidden; background: var(--bg);
+}
+html.live-graph-embed .live-layout {
+  flex: 1 1 auto; display: block; width: 100%; height: 100%; min-height: 0;
+  padding: 0; overflow: hidden;
+}
+html.live-graph-embed .live-graph-panel {
+  width: 100%; height: 100%; min-height: 0; overflow: hidden;
+  border: 0; border-radius: 0; box-shadow: none; background: var(--bg);
+}
+html.live-graph-embed .live-graph-shell {
+  flex: 1 1 auto; width: 100%; height: 100%; min-height: 0; display: block;
+}
+html.live-graph-embed .live-graph-canvas-wrap,
+html.live-graph-embed .live-graph-canvas-wrap .graph-cy {
+  width: 100%; height: 100%; min-height: 0;
+}
+html.live-graph-embed .live-graph-panel > .live-empty {
+  flex: 1 1 auto; width: 100%; height: 100%; min-height: 0;
+  padding: 90px 24px 30px;
+}
+html.live-graph-embed .live-graph-nav { left: 12px; bottom: 12px; }
+html.live-graph-embed .live-embed-toolbar {
+  position: fixed; z-index: 30; top: max(10px, env(safe-area-inset-top)); left: 10px; right: 10px;
+  display: flex; align-items: center; min-width: 0; gap: 8px; padding: 8px;
+  color: var(--text); background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border: 2px solid var(--outline); border-radius: 14px; box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+}
+html.live-graph-embed .live-embed-connection {
+  display: flex; align-items: center; flex: 0 1 auto; min-width: 0; gap: 7px;
+  color: var(--text-dim); font: 700 10px var(--mono); white-space: nowrap;
+}
+html.live-graph-embed .live-embed-connection > span:last-child {
+  overflow: hidden; text-overflow: ellipsis;
+}
+html.live-graph-embed .live-embed-identity {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--text-faint);
+  font: 700 10px var(--mono); text-align: center; text-overflow: ellipsis; white-space: nowrap;
+}
+html.live-graph-embed .live-embed-toolbar .user-filter {
+  flex: 0 1 118px; min-width: 82px; max-width: 130px; height: 37px; padding: 6px 8px;
+  font: 700 10px var(--mono);
+}
+html.live-graph-embed .live-embed-recalls-btn {
+  flex: 0 0 auto; min-height: 38px; padding: 7px 10px; color: #302947;
+  background: var(--accent-2); border: 2px solid var(--outline); border-radius: 10px;
+  box-shadow: 2px 2px 0 var(--shadow-color); font-weight: 850;
+}
+html.live-graph-embed .live-embed-recalls-btn:hover { background: color-mix(in srgb, var(--accent-2) 82%, white); }
+html.live-graph-embed .live-embed-recalls-count {
+  min-width: 22px; padding: 1px 6px; color: var(--text); background: var(--surface);
+  border: 1.5px solid var(--outline); border-radius: 999px; font: 800 10px var(--mono);
+}
+html.live-graph-embed .live-embed-backdrop {
+  position: fixed; z-index: 38; inset: 0; display: block; width: 100%; height: 100%;
+  padding: 0; border: 0; background: color-mix(in srgb, var(--overlay) 62%, transparent);
+}
+html.live-graph-embed .live-embed-drawer {
+  position: fixed; z-index: 40; top: calc(max(10px, env(safe-area-inset-top)) + 58px);
+  right: 10px; bottom: max(10px, env(safe-area-inset-bottom));
+  display: flex; flex-direction: column; width: min(430px, calc(100% - 20px)); min-height: 0;
+  overflow: hidden; color: var(--text); background: var(--surface);
+  border: 2px solid var(--outline); border-radius: 16px; box-shadow: 6px 8px 0 var(--shadow-color);
+}
+html.live-graph-embed .live-embed-drawer-head {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 13px 14px 11px; border-bottom: 2px solid var(--outline); background: var(--surface-alt);
+}
+html.live-graph-embed .live-embed-drawer-head h2 { margin: 2px 0 0; font-size: 18px; }
+html.live-graph-embed .live-embed-drawer-head .modal-close { position: static; flex: 0 0 auto; }
+html.live-graph-embed .live-embed-drawer-actions { display: flex; align-items: center; gap: 5px; }
+html.live-graph-embed .live-embed-drawer-actions .btn {
+  min-height: 34px; padding: 6px 8px; border: 1.5px solid var(--outline); font-size: 9px;
+}
+html.live-graph-embed .live-embed-request {
+  flex: 0 0 auto; padding: 10px 13px; color: var(--text-dim); background: var(--surface-sunken);
+  border-bottom: 1.5px solid var(--outline); font: 650 10.5px/1.4 var(--mono); overflow-wrap: anywhere;
+}
+html.live-graph-embed #live-embed-recalls {
+  flex: 1 1 0; height: 0; min-height: 0; max-height: none; overflow-x: hidden; overflow-y: auto;
+  padding: 9px; scroll-padding: 9px; scrollbar-gutter: stable; touch-action: pan-y;
+  overscroll-behavior-x: none; overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch;
+}
+/* The details cards must contribute their full height to scrollHeight. Their
+   shared overflow:hidden style otherwise lets flexbox shrink and clip them,
+   which made the drawer appear completely non-scrollable. */
+html.live-graph-embed #live-embed-recalls > .live-memory { flex: 0 0 auto; }
+html.live-graph-embed #live-embed-recalls:focus-visible { outline-offset: -4px; }
+html.live-graph-embed #live-embed-recalls .live-memory-prompt { display: none; }
+html.live-graph-embed #live-embed-recalls .live-memory-body { padding-left: 11px; }
+html.live-graph-embed #live-embed-recalls-empty { flex: 1 1 auto; min-height: 0; }
+
+@media (orientation: portrait), (max-width: 600px) {
+  html.live-graph-embed .live-embed-toolbar {
+    align-items: stretch; flex-wrap: wrap; gap: 6px; padding: 7px;
+  }
+  html.live-graph-embed .live-embed-connection { flex: 1 1 120px; order: 1; }
+  html.live-graph-embed .live-embed-identity { flex: 1 1 calc(100% - 150px); order: 2; text-align: right; }
+  html.live-graph-embed .live-embed-toolbar .user-filter { flex: 1 1 90px; max-width: none; order: 3; min-height: 40px; }
+  html.live-graph-embed .live-embed-recalls-btn { flex: 1 1 190px; order: 4; min-height: 42px; }
+  html.live-graph-embed .live-embed-drawer {
+    top: calc(max(10px, env(safe-area-inset-top)) + 102px); left: 8px; right: 8px;
+    bottom: max(8px, env(safe-area-inset-bottom)); width: auto; border-radius: 14px;
+  }
+  html.live-graph-embed .live-embed-drawer-head { align-items: flex-start; flex-wrap: wrap; }
+  html.live-graph-embed .live-embed-drawer-actions { width: 100%; justify-content: flex-end; }
+  html.live-graph-embed .live-graph-nav { bottom: max(12px, env(safe-area-inset-bottom)); }
+  html.live-graph-embed .live-graph-nav .graph-nav-btn { width: 44px; height: 44px; }
+  html.live-graph-embed .live-graph-panel > .live-empty { padding-top: 132px; }
 }
 
 /* ====================================================================== */

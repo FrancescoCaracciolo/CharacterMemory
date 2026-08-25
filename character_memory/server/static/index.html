@@ -7,6 +7,9 @@
   <title>Mnemosyne — Character Memory</title>
   <script>
     (() => {
+      if (location.pathname.replace(/\/+$/, "") === "/gui/embed/knowledge-graph") {
+        document.documentElement.classList.add("live-graph-embed");
+      }
       let saved = null;
       try { saved = localStorage.getItem("cm_theme"); } catch (error) { /* storage may be disabled */ }
       const theme = saved === "light" || saved === "dark"
@@ -16,7 +19,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=intermediate-prompts-1">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=live-graph-embed-2">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -187,6 +190,7 @@
         </div>
         <div class="live-head-actions">
           <span id="live-follow-label" class="live-follow-label">Following latest</span>
+          <a id="live-embed-link" class="btn ghost" href="/gui/embed/knowledge-graph" target="_blank" rel="noopener" title="Open the minimal knowledge-graph view made for iframes"><i data-lucide="panel-top-open" class="icon"></i><span class="btn-label">Iframe graph</span></a>
           <button id="live-follow" class="btn ghost" type="button"><i data-lucide="arrow-up-to-line" class="icon"></i><span class="btn-label">Follow latest</span></button>
           <button id="live-expand" class="btn ghost" type="button">Expand all</button>
           <button id="live-collapse" class="btn ghost" type="button">Collapse all</button>
@@ -194,6 +198,18 @@
       </header>
       <div id="live-new" class="live-new hidden" role="status" aria-live="polite">
         <button id="live-new-btn" type="button">New request received · show latest</button>
+      </div>
+      <div id="live-embed-toolbar" class="live-embed-toolbar" aria-label="Live knowledge graph controls">
+        <div class="live-embed-connection" title="Live /context connection">
+          <span id="live-embed-status-dot" class="live-status-dot connecting"></span>
+          <span id="live-embed-status">Connecting…</span>
+        </div>
+        <span id="live-embed-identity" class="live-embed-identity">Waiting for /context</span>
+        <button id="live-embed-recalls-btn" class="btn live-embed-recalls-btn" type="button" aria-controls="live-embed-drawer" aria-expanded="false">
+          <i data-lucide="layers-3" class="icon"></i>
+          <span id="live-embed-recalls-label">Recalled memories</span>
+          <span id="live-embed-recalls-count" class="live-embed-recalls-count">0</span>
+        </button>
       </div>
       <div class="live-layout">
         <aside class="live-timeline-panel">
@@ -250,6 +266,27 @@
           </div>
         </section>
       </div>
+      <button id="live-embed-backdrop" class="live-embed-backdrop hidden" type="button" aria-label="Close recalled memories"></button>
+      <aside id="live-embed-drawer" class="live-embed-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="live-embed-drawer-title" aria-hidden="true">
+        <header class="live-embed-drawer-head">
+          <div>
+            <div class="live-panel-label">Last /context</div>
+            <h2 id="live-embed-drawer-title">Recalled memories</h2>
+          </div>
+          <div class="live-embed-drawer-actions">
+            <button id="live-embed-expand" class="btn ghost" type="button">Expand</button>
+            <button id="live-embed-collapse" class="btn ghost" type="button">Collapse</button>
+            <button id="live-embed-drawer-close" class="modal-close" type="button" aria-label="Close recalled memories"><i data-lucide="x" class="icon"></i></button>
+          </div>
+        </header>
+        <div id="live-embed-request" class="live-embed-request">Waiting for the first context request.</div>
+        <div id="live-embed-recalls" class="live-recalls" role="region" aria-label="Recalled memory items" tabindex="0"></div>
+        <div id="live-embed-recalls-empty" class="live-empty">
+          <span class="live-empty-mark"><i data-lucide="layers-3" class="icon"></i></span>
+          <strong>No recalled memories yet</strong>
+          <span>The latest request will appear here automatically.</span>
+        </div>
+      </aside>
     </div>
 
     <!-- Schema-driven editor for structured memories and emotion state. -->
@@ -568,7 +605,7 @@
   </div>
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[Mnemosyne] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
-  <script src="/gui/static/app.js?v=calendar-world-toggle-1"></script>
+  <script src="/gui/static/app.js?v=live-graph-embed-2"></script>
   <script src="/gui/static/config.js?v=intermediate-prompts-2"></script>
 </body>
 </html>

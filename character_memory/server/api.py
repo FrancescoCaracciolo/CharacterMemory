@@ -46,7 +46,7 @@ import os
 import queue
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -453,21 +453,31 @@ if os.path.isdir(STATIC_DIR):
     app.mount("/gui/static", StaticFiles(directory=STATIC_DIR), name="gui-static")
 
 
+@app.get("/gui/embed/knowledge-graph", response_class=HTMLResponse)
 @app.get("/gui", response_class=HTMLResponse)
-def gui() -> HTMLResponse:
-    """Serve the single-page memory browser.
+def gui(request: Request) -> HTMLResponse:
+    """Serve the single-page memory browser or its iframe graph surface.
 
     The page talks to the `/api/memories/...` endpoints below. Characters are
     listed via `GET /`. The HTML is served with `no-cache` (assets are
     cache-busted via ``?v=`` query strings, the shell must always revalidate)
     so a browser never keeps an index.html that references assets which no
-    longer exist.
+    longer exist.  ``/gui/embed/knowledge-graph`` uses the same shell and
+    renderer, but the client detects that path and exposes only the live graph
+    plus its recalled-memory drawer.  Keeping one shell prevents the normal
+    Live recall view and the iframe view from drifting apart.
     """
     index = os.path.join(STATIC_DIR, "index.html")
     if not os.path.isfile(index):
         raise HTTPException(status_code=404, detail="GUI assets not built.")
     with open(index, encoding="utf-8") as f:
-        return HTMLResponse(f.read(), headers={"Cache-Control": "no-cache"})
+        headers = {"Cache-Control": "no-cache"}
+        if request.url.path.rstrip("/") == "/gui/embed/knowledge-graph":
+            # Make the browser-facing iframe contract explicit. This surface
+            # is read-only; the SSE data endpoint still enforces the configured
+            # API key independently.
+            headers["Content-Security-Policy"] = "frame-ancestors *"
+        return HTMLResponse(f.read(), headers=headers)
 
 
 @app.get("/api/memories/{character}")

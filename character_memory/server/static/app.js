@@ -13,6 +13,8 @@
 
 const API = "";
 const SIZE = 25;
+const LIVE_GRAPH_EMBED_PATH = "/gui/embed/knowledge-graph";
+const LIVE_GRAPH_EMBED = location.pathname.replace(/\/+$/, "") === LIVE_GRAPH_EMBED_PATH;
 
 // ---------------------------------------------------------------- API key
 // Optional server auth (CM_API_KEY / --api-key on the server). The key is
@@ -25,15 +27,23 @@ const CALENDAR_WORLD_ROUTINES_KEY = "cm_calendar_show_world_routines";
 function storedApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ""; } catch (error) { return ""; }
 }
+function embeddedUrlApiKey() {
+  // A host may pass the key to the iframe because EventSource cannot attach
+  // headers and third-party storage can be partitioned by the browser.  Keep
+  // this scoped to the dedicated read-only surface; never persist the query
+  // value or propagate it into the normal GUI's share link.
+  return LIVE_GRAPH_EMBED ? (new URLSearchParams(location.search).get("api_key") || "") : "";
+}
+function activeApiKey() { return storedApiKey() || embeddedUrlApiKey(); }
 function storedCalendarWorldRoutines() {
   try { return localStorage.getItem(CALENDAR_WORLD_ROUTINES_KEY) !== "false"; } catch (error) { return true; }
 }
 function authHeaders() {
-  const key = storedApiKey();
+  const key = activeApiKey();
   return key ? { "X-API-Key": key } : {};
 }
 function authQuery(url) {
-  const key = storedApiKey();
+  const key = activeApiKey();
   if (!key) return url;
   return url + (url.includes("?") ? "&" : "?") + "api_key=" + encodeURIComponent(key);
 }
@@ -57,6 +67,7 @@ const state = {
   live: {
     events: new Map(), selectedId: null, follow: true, source: null,
     connection: "closed", graph: {}, graphUser: "", openMemory: new Set(), openInitialized: false,
+    embedOpenMemory: new Set(), embedOpenInitialized: false,
     _gv: null, _active: false,
   },
 };
@@ -540,7 +551,11 @@ async function loadCharacters() {
   clear(sel);
   for (const c of state.characters) sel.appendChild(el("option", { value: c }, c));
   if (!state.characters.length) {
-    showError("No characters found. Start the server from the project root (so ./assets is visible), or set CM_ASSETS_DIR.");
+    const message = "No characters found. Start the server from the project root (so ./assets is visible), or set CM_ASSETS_DIR.";
+    if (LIVE_GRAPH_EMBED) {
+      liveSetConnection("error", "No character");
+      if ($("live-embed-identity")) $("live-embed-identity").textContent = message;
+    } else showError(message);
     return false;
   }
   state.character = state.character && state.characters.includes(state.character)
@@ -2274,6 +2289,17 @@ function liveUrl() {
   return `${location.pathname}?${params.toString()}${location.hash || ""}`;
 }
 
+function liveEmbedUrl() {
+  const params = new URLSearchParams();
+  if (state.character) params.set("character", state.character);
+  return `${LIVE_GRAPH_EMBED_PATH}${params.toString() ? "?" + params.toString() : ""}`;
+}
+
+function updateLiveEmbedLink() {
+  const link = $("live-embed-link");
+  if (link) link.href = liveEmbedUrl();
+}
+
 function updateViewUrl({ replace = false } = {}) {
   const params = new URLSearchParams(location.search);
   const active = $("tab-live").classList.contains("active")
@@ -2289,6 +2315,9 @@ function liveSetConnection(kind, label) {
   const dot = $("live-status-dot"), text = $("live-status");
   if (dot) dot.className = `live-status-dot ${kind}`;
   if (text) text.textContent = label;
+  const embedDot = $("live-embed-status-dot"), embedText = $("live-embed-status");
+  if (embedDot) embedDot.className = `live-status-dot ${kind}`;
+  if (embedText) embedText.textContent = label.replace("Listening for /context", "Live");
 }
 
 function closeLiveStream() {
@@ -2433,16 +2462,21 @@ function liveMemories(event) {
   return [];
 }
 
-function renderLiveRecalls(event) {
-  const box = $("live-recalls"); clear(box);
+function renderLiveRecallsInto(event, box, empty) {
+  if (!box) return;
+  clear(box);
   const memories = liveMemories(event);
-  const firstRender = !state.live.openInitialized;
-  if (firstRender) for (const memory of memories) state.live.openMemory.add(memory.name);
-  $("live-empty").classList.toggle("hidden", !!memories.length);
+  const embedded = box.id === "live-embed-recalls";
+  const openMemory = embedded ? state.live.embedOpenMemory : state.live.openMemory;
+  const firstRender = embedded ? !state.live.embedOpenInitialized : !state.live.openInitialized;
+  // The full Live recall tab keeps its established expanded-first behaviour.
+  // The narrow iframe drawer starts as a navigable list of collapsed groups.
+  if (firstRender && !embedded) for (const memory of memories) openMemory.add(memory.name);
+  if (empty) empty.classList.toggle("hidden", !!memories.length);
   for (const memory of memories) {
-    const known = state.live.openMemory.has(memory.name);
+    const known = openMemory.has(memory.name);
     const items = liveMemoryItems(memory);
-    const details = el("details", { class: "live-memory", open: firstRender || known }, []);
+    const details = el("details", { class: "live-memory", open: (!embedded && firstRender) || known }, []);
     const summary = el("summary", { class: "live-memory-summary" }, [
       icon("chevron-down", "live-memory-chev"),
       el("span", { class: "live-memory-name", title: memory.name }, memory.title || memory.name),
@@ -2468,13 +2502,24 @@ function renderLiveRecalls(event) {
     }
     details.appendChild(body);
     details.addEventListener("toggle", () => {
-      if (details.open) state.live.openMemory.add(memory.name);
-      else state.live.openMemory.delete(memory.name);
-      state.live.openInitialized = true;
+      if (details.open) openMemory.add(memory.name);
+      else openMemory.delete(memory.name);
+      if (embedded) state.live.embedOpenInitialized = true;
+      else state.live.openInitialized = true;
     });
     box.appendChild(details);
   }
-  state.live.openInitialized = true;
+  if (embedded) state.live.embedOpenInitialized = true;
+  else state.live.openInitialized = true;
+}
+
+function renderLiveEmbedRecalls(event) {
+  renderLiveRecallsInto(event, $("live-embed-recalls"), $("live-embed-recalls-empty"));
+}
+
+function renderLiveRecalls(event) {
+  renderLiveRecallsInto(event, $("live-recalls"), $("live-empty"));
+  renderLiveEmbedRecalls(event);
 }
 
 function graphNodeText(node) {
@@ -2549,6 +2594,29 @@ function renderLiveGraph(event) {
   requestAnimationFrame(() => state.live._gv && state.live._gv.resize());
 }
 
+function updateLiveEmbedSummary(event) {
+  const identity = $("live-embed-identity");
+  const label = $("live-embed-recalls-label");
+  const count = $("live-embed-recalls-count");
+  const request = $("live-embed-request");
+  const memoryCount = Number(event && event.memory_count) || liveMemories(event).length;
+  const itemCount = Number(event && event.item_count) || liveMemories(event)
+    .reduce((total, memory) => total + liveMemoryItems(memory).length, 0);
+  if (identity) {
+    const speaker = event && event.user ? event.user : "unknown";
+    identity.textContent = `${event && event.character || state.character || "Character"} · ${speaker} · ${liveTime(event && event.created_at)}`;
+  }
+  if (label) label.textContent = memoryCount === 1 ? "1 recalled memory" : `${memoryCount} recalled memories`;
+  if (count) {
+    count.textContent = String(itemCount);
+    count.title = `${itemCount} recalled item${itemCount === 1 ? "" : "s"}`;
+  }
+  if (request) {
+    const message = event && event.message ? event.message : "(empty message)";
+    request.textContent = `${event && event.user || "unknown"}: ${message}`;
+  }
+}
+
 function renderLiveEvent(event) {
   if (!event) return;
   const request = $("live-request"); clear(request); request.classList.remove("hidden");
@@ -2566,6 +2634,7 @@ function renderLiveEvent(event) {
   if (query) request.appendChild(el("div", { class: "live-request-query" }, [
     el("b", {}, "weighted retrieval"), " ", query,
   ]));
+  updateLiveEmbedSummary(event);
   renderLiveRecalls(event);
   try {
     renderLiveGraph(event);
@@ -2591,6 +2660,7 @@ function renderLiveLatest() {
   const newest = latestLiveEvent();
   if (!newest) {
     $("live-request").classList.add("hidden"); $("live-empty").classList.remove("hidden");
+    if ($("live-embed-recalls-empty")) $("live-embed-recalls-empty").classList.remove("hidden");
     renderLiveTimeline(); return;
   }
   selectLiveEvent(String(newest.id), { follow: true });
@@ -2621,6 +2691,53 @@ function wireLiveControls() {
   $("live-zoom-out").addEventListener("click", () => state.live._gv && state.live._gv.zoomOut());
 }
 
+function setLiveEmbedDrawer(open) {
+  const drawer = $("live-embed-drawer");
+  const backdrop = $("live-embed-backdrop");
+  const button = $("live-embed-recalls-btn");
+  if (!drawer || !backdrop || !button) return;
+  drawer.classList.toggle("hidden", !open);
+  drawer.setAttribute("aria-hidden", open ? "false" : "true");
+  backdrop.classList.toggle("hidden", !open);
+  button.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) requestAnimationFrame(() => $("live-embed-recalls") && $("live-embed-recalls").focus());
+}
+
+function wireLiveEmbedControls() {
+  updateLiveEmbedLink();
+  if (!LIVE_GRAPH_EMBED) return;
+  const toolbar = $("live-embed-toolbar");
+  const participant = $("live-graph-user");
+  const recallsButton = $("live-embed-recalls-btn");
+  if (toolbar && participant && recallsButton) toolbar.insertBefore(participant, recallsButton);
+  recallsButton.addEventListener("click", () => {
+    setLiveEmbedDrawer(recallsButton.getAttribute("aria-expanded") !== "true");
+  });
+  $("live-embed-drawer-close").addEventListener("click", () => setLiveEmbedDrawer(false));
+  $("live-embed-backdrop").addEventListener("click", () => setLiveEmbedDrawer(false));
+  $("live-embed-expand").addEventListener("click", () => {
+    const selected = state.live.events.get(state.live.selectedId);
+    if (!selected) return;
+    for (const memory of liveMemories(selected)) state.live.embedOpenMemory.add(memory.name);
+    state.live.embedOpenInitialized = true;
+    renderLiveEmbedRecalls(selected);
+    $("live-embed-recalls").focus();
+  });
+  $("live-embed-collapse").addEventListener("click", () => {
+    const selected = state.live.events.get(state.live.selectedId);
+    state.live.embedOpenMemory.clear();
+    state.live.embedOpenInitialized = true;
+    if (selected) renderLiveEmbedRecalls(selected);
+    $("live-embed-recalls").focus();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && recallsButton.getAttribute("aria-expanded") === "true") {
+      setLiveEmbedDrawer(false);
+      recallsButton.focus();
+    }
+  });
+}
+
 function activateLive() {
   state.live._active = true;
   connectLiveStream();
@@ -2645,6 +2762,7 @@ function resetCharacterView() {
   state.graph = { data: null, q: "", user: "", full: state.graph.full, _gv: null, _wired: graphControlsWired };
   state.live.events.clear(); state.live.selectedId = null; state.live.graphUser = "";
   state.live.openMemory.clear(); state.live.openInitialized = false;
+  state.live.embedOpenMemory.clear(); state.live.embedOpenInitialized = false;
   if (state.live._gv) { try { state.live._gv.destroy(); } catch (error) {} state.live._gv = null; }
   $("q").value = "";
   $("graph-q").value = "";
@@ -2728,6 +2846,7 @@ async function init() {
   // state and settings before the controls are first wired/rendered.
   loadGraphUI();
   wireLiveControls();
+  wireLiveEmbedControls();
   wireApiKeyDialog();
   $("refresh").addEventListener("click", () => loadOverview());
   $("add-memory").addEventListener("click", () => openMemoryEditor());
@@ -2739,6 +2858,7 @@ async function init() {
   });
   $("character").addEventListener("change", (e) => {
     state.character = e.target.value;
+    updateLiveEmbedLink();
     updateViewUrl();
     resetCharacterView();
     if (state.live._active) connectLiveStream();
@@ -2769,13 +2889,23 @@ async function init() {
   try {
     const ok = await loadCharacters();
     if (ok) {
-      await loadOverview();
-      const initialTab = ["browse", "configure", "live"].includes(new URLSearchParams(location.search).get("tab"))
-        ? new URLSearchParams(location.search).get("tab") : "browse";
-      setTab(initialTab, { history: false });
+      updateLiveEmbedLink();
+      if (LIVE_GRAPH_EMBED) {
+        // The iframe route needs only character discovery + the /context SSE.
+        // Avoid loading the hidden archive/configurator surfaces entirely.
+        setTab("live", { history: false });
+      } else {
+        await loadOverview();
+        const initialTab = ["browse", "configure", "live"].includes(new URLSearchParams(location.search).get("tab"))
+          ? new URLSearchParams(location.search).get("tab") : "browse";
+        setTab(initialTab, { history: false });
+      }
     }
   } catch (e) {
-    showError(e.message);
+    if (LIVE_GRAPH_EMBED) {
+      liveSetConnection("error", "Connection failed");
+      if ($("live-embed-identity")) $("live-embed-identity").textContent = e.message;
+    } else showError(e.message);
   }
 }
 
@@ -2816,12 +2946,13 @@ function wireTabs() {
     if (requestedCharacter && state.characters.includes(requestedCharacter) && requestedCharacter !== state.character) {
       state.character = requestedCharacter;
       $("character").value = requestedCharacter;
+      updateLiveEmbedLink();
       resetCharacterView();
       if (state.live._active) connectLiveStream();
-      await loadOverview();
+      if (!LIVE_GRAPH_EMBED) await loadOverview();
     }
     const tab = new URLSearchParams(location.search).get("tab");
-    setTab(["browse", "configure", "live"].includes(tab) ? tab : "browse", { history: false });
+    setTab(LIVE_GRAPH_EMBED ? "live" : (["browse", "configure", "live"].includes(tab) ? tab : "browse"), { history: false });
   });
 }
 wireTabs();

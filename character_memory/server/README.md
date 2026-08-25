@@ -403,6 +403,11 @@ Features:
   graph contributed, the captured activation field. The monitor keeps the
   latest 25 events per character in memory for the current server session; it
   does not add a second durable chat log.
+- **Iframe knowledge graph** — the Live recall header links to
+  `/gui/embed/knowledge-graph?character=Kurisu`, a read-only, chrome-free view
+  that always follows the newest `/context` activation. It is designed for a
+  portrait iframe and has one top button that opens the latest request's
+  recalled-memory list.
 
 Keyboard: `/` focuses search, `Esc` clears it.
 
@@ -418,6 +423,28 @@ The HTML page. Static assets (`styles.css`, `app.js`) are served from
 
 Use `?tab=live&character=<name>` to deep-link directly to the live recall
 monitor. The browser reconnects automatically if the SSE connection drops.
+
+### `GET /gui/embed/knowledge-graph`
+
+Minimal live knowledge-graph surface intended to be embedded directly:
+
+```html
+<iframe
+  src="http://localhost:8000/gui/embed/knowledge-graph?character=Kurisu"
+  title="Live memory activations"
+></iframe>
+```
+
+The route shares the same SSE event and canvas renderer as Live recall, shows
+only the newest activation field, and explicitly allows framing. The top
+**Recalled memories** button opens a vertically scrolling drawer containing the
+items returned by the latest `/context` request. Group chats get a participant
+selector only when more than one graph is present.
+
+With `CM_API_KEY` enabled, a same-origin browser session reuses the key already
+stored by the normal GUI. A host that cannot use that storage may append
+`&api_key=<key>` to the iframe URL; as with the SSE fallback, query-string keys
+can appear in access logs.
 
 ---
 
