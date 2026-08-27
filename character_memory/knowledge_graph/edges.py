@@ -200,6 +200,25 @@ class ChatEdge(Edge):
     kind: str = "chat"
 
 
+@dataclass
+class WikiAssociationEdge(Edge):
+    """Symmetric semantic association derived from one wiki section.
+
+    The source list makes associations refreshable without confusing them
+    with learned co-occurrence edges. Multiple sections may contribute the
+    same pair; all their provenance tags are retained.
+    """
+
+    kind: str = "wiki_association"
+    sources: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.sources = list(dict.fromkeys(str(s) for s in self.sources if s))
+
+    def _extra_fields(self) -> dict[str, Any]:
+        return {"sources": list(self.sources)}
+
+
 EDGE_CLASSES: dict[str, type[Edge]] = {
     "relation": RelationEdge,
     "fact": FactEdge,
@@ -207,12 +226,18 @@ EDGE_CLASSES: dict[str, type[Edge]] = {
     "episode": EpisodeEdge,
     "co_occurrence": CoOccurrenceEdge,
     "chat": ChatEdge,
+    "wiki_association": WikiAssociationEdge,
 }
 
 #: Edge kinds the graph treats as undirected when walking neighbours. A
 #: transition between A and B is stored once; both A and B see each other as
 #: neighbours regardless of which is `src`.
-SYMMETRIC_KINDS: set[str] = {"transition", "co_occurrence", "chat"}
+SYMMETRIC_KINDS: set[str] = {
+    "transition",
+    "co_occurrence",
+    "chat",
+    "wiki_association",
+}
 
 
 def edge_from_dict(data: dict[str, Any]) -> Edge:
@@ -238,6 +263,7 @@ __all__ = [
     "EpisodeEdge",
     "CoOccurrenceEdge",
     "ChatEdge",
+    "WikiAssociationEdge",
     "EDGE_CLASSES",
     "SYMMETRIC_KINDS",
     "edge_from_dict",

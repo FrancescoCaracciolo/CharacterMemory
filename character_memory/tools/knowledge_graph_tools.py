@@ -40,6 +40,7 @@ def _node_record(
     record: dict[str, Any] = {
         "node_id": node.id,
         "kind": node.kind,
+        "internal": bool(getattr(node, "internal", False)),
         "source": node.source,
         "text": text,
         "truncated": truncated,
@@ -77,6 +78,11 @@ class SearchKnowledgeGraph(Tool):
                 "maximum": 6000,
                 "default": 2500,
             },
+            "include_internal": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include internal wiki provenance anchors for diagnostics.",
+            },
         },
         "required": ["query"],
     }
@@ -90,11 +96,16 @@ class SearchKnowledgeGraph(Tool):
         user_id: Optional[str] = None,
         limit: int = 8,
         max_chars_each: int = 2500,
+        include_internal: bool = False,
     ) -> dict[str, Any]:
         memory = _kg_memory(self.agent)
         cap = max(1, min(30, int(limit)))
         max_chars = max(300, min(6000, int(max_chars_each)))
-        activation = memory.retriever.test_activation(query, user_id=user_id)
+        activation = memory.retriever.test_activation(
+            query,
+            user_id=user_id,
+            include_internal=include_internal,
+        )
         ranked = sorted(activation.items(), key=lambda item: item[1], reverse=True)
         records = [
             _node_record(node, activation=score, max_chars=max_chars)
@@ -105,6 +116,7 @@ class SearchKnowledgeGraph(Tool):
         return {
             "query": query,
             "user_id": user_id,
+            "include_internal": bool(include_internal),
             "count": len(records),
             "nodes": records,
         }
@@ -135,6 +147,11 @@ class GetKnowledgeGraphNodes(Tool):
                 "type": "string",
                 "description": "Apply the configured privacy scope for this user; omit for unrestricted administration.",
             },
+            "include_internal": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include internal wiki provenance anchors for diagnostics.",
+            },
         },
         "required": ["node_ids"],
     }
@@ -147,11 +164,15 @@ class GetKnowledgeGraphNodes(Tool):
         node_ids: list[str],
         max_chars_each: int = 6000,
         user_id: Optional[str] = None,
+        include_internal: bool = False,
     ) -> dict[str, Any]:
         memory = _kg_memory(self.agent)
         ids = [str(node_id) for node_id in node_ids[:20]]
         max_chars = max(500, min(12000, int(max_chars_each)))
-        visible = memory.retriever.visible_node_ids(user_id=user_id)
+        visible = memory.retriever.visible_node_ids(
+            user_id=user_id,
+            include_internal=include_internal,
+        )
         nodes = [
             memory.retriever.graph.get_node(node_id)
             if node_id in visible
@@ -160,6 +181,7 @@ class GetKnowledgeGraphNodes(Tool):
         ]
         return {
             "requested_node_ids": ids,
+            "include_internal": bool(include_internal),
             "count": sum(node is not None for node in nodes),
             "nodes": [
                 _node_record(node, max_chars=max_chars)
@@ -196,6 +218,11 @@ class GetKnowledgeGraphNeighbors(Tool):
                 "type": "string",
                 "description": "Apply the configured privacy scope for this user; omit for unrestricted administration.",
             },
+            "include_internal": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include internal wiki provenance anchors for diagnostics.",
+            },
         },
         "required": ["node_id"],
     }
@@ -209,13 +236,22 @@ class GetKnowledgeGraphNeighbors(Tool):
         limit: int = 12,
         max_chars_each: int = 1800,
         user_id: Optional[str] = None,
+        include_internal: bool = False,
     ) -> dict[str, Any]:
         memory = _kg_memory(self.agent)
         graph = memory.retriever.graph
-        visible = memory.retriever.visible_node_ids(user_id=user_id)
+        visible = memory.retriever.visible_node_ids(
+            user_id=user_id,
+            include_internal=include_internal,
+        )
         anchor = graph.get_node(str(node_id))
         if anchor is None or anchor.id not in visible:
-            return {"node_id": str(node_id), "count": 0, "neighbors": []}
+            return {
+                "node_id": str(node_id),
+                "include_internal": bool(include_internal),
+                "count": 0,
+                "neighbors": [],
+            }
         cap = max(1, min(50, int(limit)))
         max_chars = max(300, min(5000, int(max_chars_each)))
         neighbors = []
@@ -239,6 +275,7 @@ class GetKnowledgeGraphNeighbors(Tool):
                 break
         return {
             "node_id": anchor.id,
+            "include_internal": bool(include_internal),
             "anchor": _node_record(anchor, max_chars=max_chars),
             "count": len(neighbors),
             "neighbors": neighbors,

@@ -1,6 +1,7 @@
 """User summary: a consolidated per-user profile (name, aliases, quick summary)."""
 
 import json
+import sqlite3
 from typing import TYPE_CHECKING, Any, Optional
 
 from .base import ExtractionSpec, MemoryItem
@@ -33,6 +34,29 @@ class UserSummaryMemory(StructuredMemory):
     # base importance so :meth:`StructuredMemory.recall` injects it regardless
     # of the query.
     default_importance: float = 1.0
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialise the memory and migrate the profile refresh timestamp.
+
+        ``updated_at`` is intentionally not part of ``extra_columns``: it is
+        managed by this memory, not exposed as an editor field. Existing
+        databases get the column lazily when the character is loaded.
+        """
+        super().__init__(*args, **kwargs)
+        if "updated_at" not in self.store.columns(self.table):
+            try:
+                self.store.execute(
+                    f"ALTER TABLE {self.table} ADD COLUMN updated_at REAL"
+                )
+            except sqlite3.OperationalError:
+                # Another process may have completed the same additive
+                # migration between the column check and ALTER TABLE.
+                if "updated_at" not in self.store.columns(self.table):
+                    raise
+        self.store.execute(
+            f"UPDATE {self.table} SET updated_at = created_at "
+            "WHERE updated_at IS NULL"
+        )
 
     @staticmethod
     def _parse_aliases(raw: Any) -> list[str]:
@@ -100,6 +124,17 @@ class UserSummaryMemory(StructuredMemory):
             )
         return row_id
 
+    def add(self, user_id: str, importance: float, **fields: Any) -> int:
+        """Insert a profile row and stamp its initial refresh time."""
+        fields["updated_at"] = self._now()
+        return super().add(user_id, importance, **fields)
+
+    def update_row(self, row: dict[str, Any]) -> None:
+        """Write a profile row and stamp the refresh time."""
+        updated = dict(row)
+        updated["updated_at"] = self._now()
+        super().update_row(updated)
+
     def get_summary(self, user_id: str) -> Optional[dict[str, Any]]:
         """Return the stored profile for `user_id`, or `None`."""
         rows = self.store.select(
@@ -126,9 +161,31 @@ class UserSummaryMemory(StructuredMemory):
     # Extraction ----------------------------------------------------------
     def extraction_spec(self, context: "ExtractionContext | None" = None) -> ExtractionSpec:
         user = context.user_name if context else "the user"
+        users = (
+            list(context.participants)
+            if context is not None and context.participants
+            else [user]
+        )
+        baselines: list[str] = []
+        for uid in users:
+            row = self.get_summary(uid)
+            if row is None:
+                continue
+            aliases = ", ".join(self._parse_aliases(row.get("aliases"))) or "(none)"
+            baselines.append(
+                f"Current stored profile for {uid}: name={row.get('name', uid)}; "
+                f"aliases={aliases}; summary={row.get('summary', '')}"
+            )
+        baseline_note = ""
+        if baselines:
+            baseline_note = (
+                "\nCurrent stored profile(s) to use as the preservation baseline:\n"
+                + "\n".join(f"- {line}" for line in baselines)
+            )
         return ExtractionSpec(
             field="user_summaries",
             per_user=True,
+            snapshot=True,
             schema={
                 "type": "array",
                 "items": {
@@ -147,7 +204,9 @@ class UserSummaryMemory(StructuredMemory):
                 f"they go by), and a `summary`: a quick, self-contained description of "
                 f"who they are (interests, role, personality, key facts). Produce one "
                 f"item per person, written from {user}'s perspective using the real "
-                f"name."
+                f"name. When a current stored profile is provided, return the complete "
+                f"merged profile and preserve all details that are not contradicted."
+                f"{baseline_note}"
             ),
         )
 

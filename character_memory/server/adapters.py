@@ -200,6 +200,7 @@ class StructuredAdapter(MemoryAdapter):
             "importance": row.get("importance"),
             "recall_count": row.get("recall_count"),
             "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
             "last_recalled": row.get("last_recalled"),
         }
         if retrieval_meta:
@@ -651,6 +652,7 @@ class KnowledgeGraphAdapter(MemoryAdapter):
         meta = {
             "node_id": getattr(node, "id", ""),
             "node_kind": getattr(node, "kind", ""),
+            "internal": bool(getattr(node, "internal", False)),
             "created_at": getattr(node, "created_at", None),
             "last_recalled": getattr(node, "last_recalled", None),
             "recall_count": getattr(node, "recall_count", 0),
@@ -919,6 +921,7 @@ def read_graph(
     include_co_occurrence: bool = False,
     full: bool = False,
     retrieve_k: int = 30,
+    include_internal: bool = False,
     precomputed_trace: Optional[dict[str, float]] = None,
     precomputed_retrieved: Optional[set[str]] = None,
     precomputed_breakdowns: Optional[dict[str, dict[str, Any]]] = None,
@@ -948,7 +951,12 @@ def read_graph(
     if not isinstance(mem, KnowledgeGraphMemory):
         raise KeyError("knowledge_graph")
     retriever = mem.retriever
-    visible_ids = set(retriever.visible_node_ids(user_id=user))
+    visible_ids = set(
+        retriever.visible_node_ids(
+            user_id=user,
+            include_internal=include_internal,
+        )
+    )
     full = bool(full)
     if full:
         node_budget = max(1, min(6000, int(limit or 6000)))
@@ -970,9 +978,17 @@ def read_graph(
     trace = precomputed_trace
     trace_is_precomputed = trace is not None
     if trace is None and q and q.strip():
-        trace = retriever.test_activation(q.strip(), user_id=user)
+        trace = retriever.test_activation(
+            q.strip(),
+            user_id=user,
+            include_internal=include_internal,
+        )
     elif trace is None:
-        trace = retriever.test_activation("", user_id=user)
+        trace = retriever.test_activation(
+            "",
+            user_id=user,
+            include_internal=include_internal,
+        )
     trace = {str(nid): float(score) for nid, score in trace.items()}
     if trace_is_precomputed:
         # A captured context trace already represents the active participant
@@ -1083,6 +1099,7 @@ def read_graph(
         d = {
             "id": node.id,
             "kind": node.kind,
+            "internal": bool(getattr(node, "internal", False)),
             "text": node.text or node.id,
             "activation": raw,
             "activation_norm": float((raw - a_min) / a_span),
@@ -1133,10 +1150,19 @@ def read_graph(
     else:
         edge_objs.sort(key=lambda e: float(e.weight or 0.0), reverse=True)
     edge_objs = edge_objs[:edge_budget]
-    edges = [
-        {"id": e.id, "kind": e.kind, "src": e.src, "dst": e.dst, "weight": float(e.weight)}
-        for e in edge_objs
-    ]
+    edges = []
+    for edge in edge_objs:
+        record = {
+            "id": edge.id,
+            "kind": edge.kind,
+            "src": edge.src,
+            "dst": edge.dst,
+            "weight": float(edge.weight),
+        }
+        sources = getattr(edge, "sources", None)
+        if sources:
+            record["sources"] = list(sources)
+        edges.append(record)
     self_node = retriever.graph.SELF_ID if retriever.graph.SELF_ID in visible_ids else None
     visible_edge_count = sum(
         1
@@ -1147,6 +1173,7 @@ def read_graph(
         "character": agent.character_name,
         "query": q or "",
         "user": user,
+        "include_internal": bool(include_internal),
         "mode": "trace" if trace_is_precomputed else ("full" if full else "subgraph"),
         "self_node": self_node,
         "nodes": nodes,
@@ -1156,5 +1183,6 @@ def read_graph(
         "overview": retriever.overview(
             user_id=user,
             allowed_node_ids=visible_ids if trace_is_precomputed else None,
+            include_internal=include_internal,
         ),
     }

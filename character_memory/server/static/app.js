@@ -282,6 +282,7 @@ function metaRow(rec) {
   if (rec.user_id) parts.push(["user", rec.user_id]);
   if (rec.id != null) parts.push(["id", String(rec.id)]);
   if (m.created_at) parts.push(["created", relTime(m.created_at)]);
+  if (m.updated_at) parts.push(["updated", relTime(m.updated_at)]);
   if (m.last_recalled) parts.push(["recalled", relTime(m.last_recalled)]);
   if (m.recall_count != null) parts.push(["×", String(m.recall_count)]);
   return el("div", { class: "card-meta" },
@@ -1257,6 +1258,7 @@ const GRAPH_KIND_LABEL = {
 const GRAPH_EDGE_COLOR = {
   relation: "graph-edge-relation", fact: "graph-edge-fact", episode: "graph-edge-episode",
   transition: "graph-edge-transition", co_occurrence: "graph-edge-cooccurrence",
+  wiki_association: "graph-edge-wiki-association",
 };
 const GRAPH_FONT = '"JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace';
 
@@ -1303,6 +1305,7 @@ const EMBED_COLOR_OPTIONS = {
   color_episode_edge: ["--graph-edge-episode"],
   color_transition_edge: ["--graph-edge-transition"],
   color_cooccurrence_edge: ["--graph-edge-cooccurrence"],
+  color_wiki_association_edge: ["--graph-edge-wiki-association"],
   color_edge: ["--graph-edge-default"],
 };
 
@@ -1764,7 +1767,7 @@ function createGraphViz(canvas, opts) {
       const aA = (activeId && !e._hot) ? baseA * 0.45 : baseA;
       ctx.strokeStyle = hexA(col, aA);
       ctx.lineWidth = (e._hot ? lw * 1.5 : lw);
-      if (e.kind === "co_occurrence") ctx.setLineDash([4, 5]); else ctx.setLineDash([]);
+      if (e.kind === "co_occurrence" || e.kind === "wiki_association") ctx.setLineDash([4, 5]); else ctx.setLineDash([]);
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
     ctx.setLineDash([]);

@@ -15,9 +15,9 @@ Ingestion drivers, one per source memory family:
 - :func:`ingest_episodes` — one EpisodeNode per `episodic` row plus
   EpisodeEdges to every participant.
 - :func:`ingest_wiki` — flat, no-LLM fallback: header chunks -> FactNodes.
-- :func:`ingest_wiki_llm` — typed wiki ingest: sections -> FactNodes +
-  PersonNodes (relevant characters) + EntityNodes (named things) +
-  EpisodeNodes (story events).
+- :func:`ingest_wiki_llm` — typed wiki ingest: sections -> internal FactNodes
+  (provenance anchors) + PersonNodes (relevant characters) + EntityNodes
+  (named things) + EpisodeNodes (story events).
 
 Entity/people extraction is **context-aware and relevance-filtered**. Both the
 fact-extraction and wiki-extraction prompts are told:
@@ -56,6 +56,7 @@ from .edges import (
     EpisodeEdge,
     FactEdge,
     RelationEdge,
+    WikiAssociationEdge,
 )
 from .graph import KnowledgeGraph, slugify
 from .nodes import EntityNode, EpisodeNode, FactNode, Node, PersonNode
@@ -788,6 +789,21 @@ def wire_chat_edges(graph: KnowledgeGraph, *, weight: float = 0.1) -> None:
 
 
 # ----------------------------------------------------------------------- wiki
+def _drop_wiki_projection(graph: KnowledgeGraph) -> None:
+    """Remove the refreshable wiki-derived projection from ``graph``."""
+    for node in list(graph.nodes.values()):
+        if (node.source or "").startswith("wiki:") and node.kind in (
+            "fact",
+            "episode",
+        ):
+            graph.remove_node(node.id)
+    for edge in list(graph.edges.values()):
+        if not isinstance(edge, WikiAssociationEdge):
+            continue
+        if any(source.startswith("wiki:") for source in edge.sources):
+            graph.remove_edge(edge.id)
+
+
 def ingest_wiki(
     graph: KnowledgeGraph,
     sections: Iterable[dict[str, Any]],
@@ -800,6 +816,7 @@ def ingest_wiki(
     drop existing ``wiki:*`` nodes first (the retriever does this on every
     run) so re-ingesting never duplicates.
     """
+    _drop_wiki_projection(graph)
     created: list[str] = []
     now = _now()
     for sec in sections:
@@ -1054,17 +1071,20 @@ def ingest_wiki_llm(
 ) -> list[str]:
     """LLM wiki ingest: sections -> FactNodes + PersonNodes + EntityNodes + EpisodeNodes.
 
-    Each header-chunked wiki section becomes a ``FactNode(type='wiki')`` linked
-    to the SelfNode (so it activates on character/world queries). An LLM then
+    Each header-chunked wiki section becomes an internal
+    ``FactNode(type='wiki')`` linked to the SelfNode (so it can support
+    provenance and activation without surfacing the full chunk). An LLM then
     extracts, per section: relevant **people** (``PersonNode``, keyed by a
     canonical key with aliases merged, only protagonist/close/supporting kept),
     named **entities** (``EntityNode`` — place/org/object/concept; generic
     nouns dropped), and story **events** (``EpisodeNode``). All extracted nodes
-    are wired to the section fact and to each other via co-occurrence, so the
-    wiki becomes a typed subgraph rather than flat fact chunks. Idempotent: the
-    retriever drops prior ``wiki:*`` fact/episode nodes first; person/entity
-    nodes dedupe by key/name and are preserved.
+    are wired to the section anchor and to each other with refreshable
+    wiki-association edges, so the wiki becomes a typed subgraph rather than
+    flat public fact chunks. Idempotent: prior ``wiki:*`` facts/episodes and
+    associations are dropped first; person/entity nodes dedupe by key/name and
+    are preserved.
     """
+    _drop_wiki_projection(graph)
     items = list(enumerate(sections))
     if not items:
         return []
@@ -1115,7 +1135,6 @@ def ingest_wiki_llm(
                 graph.mark_character_scope(entity)
 
     created_fact_ids: list[str] = []
-    section_participants: dict[str, set[str]] = {}
     now = _now()
     for i, sec in items:
         text = str(sec.get("text") or "").strip()
@@ -1135,6 +1154,7 @@ def ingest_wiki_llm(
             created_at=now,
             source=f"wiki:{source}:{header}",
             practice_times=[now],
+            internal=True,
         )
         graph.add_node(fact)
         graph.mark_character_scope(fact)
@@ -1152,7 +1172,8 @@ def ingest_wiki_llm(
             )
         )
         ext = extractions.get(i, {})
-        participants: set[str] = {graph.SELF_ID}
+        person_ids: list[str] = []
+        entity_ids: list[str] = []
         # Relevant people -> PersonNode (canonical key, aliases merged). The
         # SelfNode's own character is represented by `self`, not a person node.
         for p in ext.get("persons", []):
@@ -1184,7 +1205,7 @@ def ingest_wiki_llm(
                     timestamp=now,
                 )
             )
-            participants.add(person.id)
+            person_ids.append(person.id)
         # Named entities -> EntityNode.
         for e in ext.get("entities", []):
             ent = graph.ensure_entity(
@@ -1205,9 +1226,10 @@ def ingest_wiki_llm(
                     timestamp=now,
                 )
             )
-            participants.add(ent.id)
-        if ext.get("is_event"):
-            summary = ext.get("event_summary") or text
+            entity_ids.append(ent.id)
+        semantic_ids: list[str] = list(dict.fromkeys([*person_ids, *entity_ids]))
+        if ext.get("is_event") and ext.get("event_summary"):
+            summary = str(ext["event_summary"]).strip()
             eid = graph.next_id("episode")
             ep = EpisodeNode(
                 id=eid,
@@ -1223,9 +1245,7 @@ def ingest_wiki_llm(
             )
             graph.add_node(ep)
             graph.mark_character_scope(ep)
-            for pid in participants:
-                if pid == graph.SELF_ID:
-                    continue
+            for pid in person_ids:
                 graph.upsert_edge(
                     EpisodeEdge(
                         id="",
@@ -1239,9 +1259,39 @@ def ingest_wiki_llm(
                         recall=False,
                     )
                 )
-            participants.add(eid)
-        section_participants[fid] = participants
-    _wire_co_occurrence(graph, section_participants, co_create=True)
+            semantic_ids.append(eid)
+
+        # Keep the source anchor in the graph for provenance and activation,
+        # but connect it symmetrically so hidden anchors can still bridge the
+        # character seed to the visible semantic nodes.
+        section_source = f"wiki:{source}:{header}"
+        for target in [graph.SELF_ID, *dict.fromkeys(semantic_ids)]:
+            graph.upsert_edge(
+                WikiAssociationEdge(
+                    id="",
+                    kind="wiki_association",
+                    src=fid,
+                    dst=target,
+                    weight=0.15,
+                    sources=[section_source],
+                )
+            )
+
+        # Direct visible topology keeps the graph useful after anchors are
+        # filtered out of normal retrieval and visualization.
+        visible_ids = list(dict.fromkeys(semantic_ids))
+        for i, left in enumerate(visible_ids):
+            for right in visible_ids[i + 1 :]:
+                graph.upsert_edge(
+                    WikiAssociationEdge(
+                        id="",
+                        kind="wiki_association",
+                        src=left,
+                        dst=right,
+                        weight=0.15,
+                        sources=[section_source],
+                    )
+                )
     return created_fact_ids
 
 

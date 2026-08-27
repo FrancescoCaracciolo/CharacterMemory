@@ -73,6 +73,15 @@ _PROVENANCE_NOTE = (
     "support it. Cite only IDs shown in the transcript."
 )
 
+_SNAPSHOT_NOTE = (
+    "Snapshot fields ({fields}) are complete replacement values, not deltas. "
+    "When returning an item for one of these fields, start from the current "
+    "stored snapshot supplied in that field's instructions, preserve every "
+    "non-contradicted detail, and incorporate genuinely durable new details "
+    "from the recent conversation. Return an empty array only when no profile "
+    "exists or the conversation adds nothing that changes it."
+)
+
 # Legacy header/footer kept for the no-context path (backward compatibility).
 _INSTRUCTION_HEADER = (
     "You are a memory extractor for a role-play character. Analyze the recent "
@@ -168,6 +177,11 @@ def _format_instruction(specs: list[ExtractionSpec], context: ExtractionContext)
             context.multi_note.format(participants=", ".join(context.participants))
         )
     parts.append(context.footer)
+    snapshot_specs = [s for s in specs if s.snapshot]
+    if snapshot_specs:
+        parts.append(
+            _SNAPSHOT_NOTE.format(fields=", ".join(s.field for s in snapshot_specs))
+        )
     return "\n\n".join(parts)
 
 
@@ -215,6 +229,11 @@ def build_extraction(
         )
     else:
         instruction = _format_instruction(specs, context)
+    snapshot_specs = [s for s in specs if s.snapshot]
+    if snapshot_specs and context is None:
+        instruction += "\n\n" + _SNAPSHOT_NOTE.format(
+            fields=", ".join(s.field for s in snapshot_specs)
+        )
     return schema, instruction
 
 

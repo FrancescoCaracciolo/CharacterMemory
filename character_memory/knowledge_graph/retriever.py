@@ -385,9 +385,6 @@ class KnowledgeGraphRetriever:
         are preserved, so re-running is idempotent), then the node-text index
         is rebuilt.
         """
-        for node in list(self.graph.nodes.values()):
-            if (node.source or "").startswith("wiki:") and node.kind in ("fact", "episode"):
-                self.graph.remove_node(node.id)
         if self.llm is not None:
             ingest_wiki_llm(
                 self.graph,
@@ -846,20 +843,32 @@ class KnowledgeGraphRetriever:
         *,
         user_id: Optional[str] = None,
         user_ids: Optional[Iterable[str]] = None,
+        include_internal: bool = False,
     ) -> frozenset[str]:
-        """Return nodes retrievable by the supplied user/participant union.
+        """Return public nodes retrievable by the supplied viewer union.
+
+        Internal provenance nodes are included only when
+        ``include_internal=True``.
 
         An empty identity or ``privacy=none`` intentionally means unrestricted
         access for backwards-compatible administrative and standalone calls.
         """
         viewers = self._viewer_ids(user_id, user_ids)
         if self._privacy_mode() is KnowledgeGraphPrivacy.NONE or not viewers:
-            return frozenset(self.graph.nodes)
+            visible = frozenset(self.graph.nodes)
+        else:
+            visible = frozenset(
+                node.id
+                for node in self.graph.nodes.values()
+                if node.character_scoped
+                or bool(viewers.intersection(node.memory_owners or []))
+            )
+        if include_internal:
+            return visible
         return frozenset(
-            node.id
-            for node in self.graph.nodes.values()
-            if node.character_scoped
-            or bool(viewers.intersection(node.memory_owners or []))
+            node_id
+            for node_id in visible
+            if not bool(getattr(self.graph.nodes[node_id], "internal", False))
         )
 
     def is_node_visible(
@@ -868,8 +877,13 @@ class KnowledgeGraphRetriever:
         *,
         user_id: Optional[str] = None,
         user_ids: Optional[Iterable[str]] = None,
+        include_internal: bool = False,
     ) -> bool:
-        return node_id in self.visible_node_ids(user_id=user_id, user_ids=user_ids)
+        return node_id in self.visible_node_ids(
+            user_id=user_id,
+            user_ids=user_ids,
+            include_internal=include_internal,
+        )
 
     def _seed_activations(
         self,
@@ -971,8 +985,12 @@ class KnowledgeGraphRetriever:
         *,
         user_id: Optional[str] = None,
         user_ids: Optional[Iterable[str]] = None,
+        include_internal: bool = False,
     ) -> dict[str, float]:
-        """Return the full `{node_id: activation}` trace for `query`.
+        """Return the public `{node_id: activation}` trace for `query`.
+
+        Internal provenance nodes participate in the calculation but are
+        omitted unless ``include_internal`` is true.
 
         Read-only: does not bump practice times or run the Hebbian step. Also
         stashes a per-node ``score_breakdown`` (BLL / spread / seed / emotion
@@ -983,14 +1001,44 @@ class KnowledgeGraphRetriever:
             return {}
         viewers = self._viewer_ids(user_id, user_ids)
         mode = self._privacy_mode()
+        scoped = mode is not KnowledgeGraphPrivacy.NONE and bool(viewers)
+        scoped_ids = (
+            self.visible_node_ids(user_ids=viewers, include_internal=True)
+            if scoped
+            else frozenset(self.graph.nodes)
+        )
         visible = (
-            self.visible_node_ids(user_ids=viewers)
-            if mode is not KnowledgeGraphPrivacy.NONE and viewers
+            scoped_ids
+            if include_internal
+            else frozenset(
+                nid
+                for nid in scoped_ids
+                if not bool(getattr(self.graph.nodes[nid], "internal", False))
+            )
+        )
+        calculation_ids = (
+            scoped_ids
+            if mode is KnowledgeGraphPrivacy.PRIVATE and scoped
             else None
         )
-        calculation_ids = visible if mode is KnowledgeGraphPrivacy.PRIVATE else None
+        queryable_ids = (
+            scoped_ids
+            if include_internal
+            else frozenset(
+                nid
+                for nid in self.graph.nodes
+                if not bool(getattr(self.graph.nodes[nid], "internal", False))
+            )
+        )
+        if mode is KnowledgeGraphPrivacy.PRIVATE and scoped:
+            queryable_ids = visible
+        search_filter = (
+            None
+            if len(queryable_ids) == len(self.graph.nodes)
+            else frozenset(queryable_ids)
+        )
         seeds = self._seed_activations(
-            query, allowed_node_ids=calculation_ids
+            query, allowed_node_ids=search_filter
         )
         # Bias every active participant's PersonNode so "about me/us" wins ties.
         for viewer in viewers:
@@ -1018,8 +1066,7 @@ class KnowledgeGraphRetriever:
             node.activation = float(comp.get("score", 0.0))
             node.score_breakdown = dict(comp)
         trace = {nid: comp["score"] for nid, comp in breakdown.items()}
-        if visible is not None:
-            trace = {nid: score for nid, score in trace.items() if nid in visible}
+        trace = {nid: score for nid, score in trace.items() if nid in visible}
         return trace
 
     def test_activation_details(
@@ -1028,10 +1075,14 @@ class KnowledgeGraphRetriever:
         *,
         user_id: Optional[str] = None,
         user_ids: Optional[Iterable[str]] = None,
+        include_internal: bool = False,
     ) -> dict[str, dict[str, float]]:
         """Read-only activation trace with episode emotion components."""
         activation = self.test_activation(
-            query, user_id=user_id, user_ids=user_ids
+            query,
+            user_id=user_id,
+            user_ids=user_ids,
+            include_internal=include_internal,
         )
         self_node = self.graph.nodes.get(self.graph.SELF_ID)
         current_mood = getattr(self_node, "current_mood", {}) or {}
@@ -1066,6 +1117,7 @@ class KnowledgeGraphRetriever:
         *,
         user_id: Optional[str] = None,
         user_ids: Optional[Iterable[str]] = None,
+        include_internal: bool = False,
         token_budget: int = 1_000,
         state_changing: bool = True,
         timestamp_style: str = "both",
@@ -1091,7 +1143,10 @@ class KnowledgeGraphRetriever:
         if budget == 0:
             return []
         act = self.test_activation(
-            query, user_id=user_id, user_ids=user_ids
+            query,
+            user_id=user_id,
+            user_ids=user_ids,
+            include_internal=include_internal,
         )
         ranked = sorted(
             ((a, nid) for nid, a in act.items() if a >= self.config.min_activation),
@@ -1210,6 +1265,7 @@ class KnowledgeGraphRetriever:
         metadata: dict[str, Any] = {
             "node_id": node.id,
             "node_kind": kind,
+            "internal": bool(getattr(node, "internal", False)),
             "activation": float(activation),
             "source": source,
             "origin": origin,
@@ -1273,14 +1329,20 @@ class KnowledgeGraphRetriever:
             # The SQLite tables are the source of truth for nodes/edges; a
             # stale/missing FAISS index is rebuilt on the next save().
             pass
+        index_needs_repair = not self._hybrid_index_matches_graph()
         scopes_changed = self._ensure_privacy_scopes()
         self._known_users = self._graph_user_ids()
         # Existing graphs are backfilled exactly once per projector version or
         # source fingerprint. Publishing here preserves build()'s no-LLM load
         # contract while making new derived sources immediately available.
         self.reconcile_sources(sync_index=False)
-        if self._pending_projection_meta or scopes_changed:
-            self.save(path)
+        if self._pending_projection_meta or scopes_changed or index_needs_repair:
+            try:
+                self.save(path)
+            except Exception:
+                # A missing embedding service must not make durable SQLite
+                # graph state unloadable; the repair will be retried later.
+                pass
         return self
 
     def has_persisted(self, path: str) -> bool:
@@ -1336,6 +1398,26 @@ class KnowledgeGraphRetriever:
             # persistence/load repair can restore the index.
             pass
 
+    def _hybrid_index_matches_graph(self) -> bool:
+        """Return whether the loaded node-text index matches SQLite graph data."""
+        if self.hybrid is None:
+            return True
+        try:
+            current = self.hybrid.documents
+            desired = graph_index_chunks(self.graph)
+
+            def signature(chunk: Any) -> tuple[str, str, str]:
+                metadata = getattr(chunk, "metadata", {}) or {}
+                return (
+                    str(metadata.get("id") or ""),
+                    str(getattr(chunk, "text", "") or ""),
+                    str(metadata.get("kind") or getattr(chunk, "source", "") or ""),
+                )
+
+            return sorted(map(signature, current)) == sorted(map(signature, desired))
+        except Exception:
+            return False
+
     # ----------------------------------------------------------- introspection
     def overview(
         self,
@@ -1343,6 +1425,7 @@ class KnowledgeGraphRetriever:
         user_id: Optional[str] = None,
         user_ids: Optional[Iterable[str]] = None,
         allowed_node_ids: Optional[Iterable[str]] = None,
+        include_internal: bool = False,
     ) -> dict[str, Any]:
         """A compact graph summary, optionally constrained to one viewer union.
 
@@ -1352,17 +1435,36 @@ class KnowledgeGraphRetriever:
         """
         viewers = self._viewer_ids(user_id, user_ids)
         scoped = (
-            self._privacy_mode() is not KnowledgeGraphPrivacy.NONE
-            and (bool(viewers) or allowed_node_ids is not None)
+            allowed_node_ids is not None
+            or (
+                self._privacy_mode() is not KnowledgeGraphPrivacy.NONE
+                and bool(viewers)
+            )
         )
         if scoped:
             visible = (
                 frozenset(str(node_id) for node_id in allowed_node_ids)
                 if allowed_node_ids is not None
-                else self.visible_node_ids(user_ids=viewers)
+                else self.visible_node_ids(
+                    user_ids=viewers,
+                    include_internal=include_internal,
+                )
             )
         else:
             visible = frozenset(self.graph.nodes)
+            if not include_internal:
+                visible = frozenset(
+                    node_id
+                    for node_id in visible
+                    if not bool(getattr(self.graph.nodes[node_id], "internal", False))
+                )
+        if not include_internal:
+            visible = frozenset(
+                node_id
+                for node_id in visible
+                if node_id in self.graph.nodes
+                and not bool(getattr(self.graph.nodes[node_id], "internal", False))
+            )
         by_kind: dict[str, int] = {}
         for node in self.graph.nodes.values():
             if node.id in visible:

@@ -224,10 +224,20 @@ class KnowledgeGraphMemory(Memory):
             diagnostics={"participants": by_participant},
         )
 
-    def get_memories(self, limit: int = 0) -> list[MemoryItem]:
-        """Every node, rendered as an item (for the GUI's generic browse mode)."""
+    def get_memories(
+        self, limit: int = 0, *, include_internal: bool = False
+    ) -> list[MemoryItem]:
+        """Every public node, or every node when explicitly requested."""
         items: list[MemoryItem] = []
-        for node in list(self.retriever.graph.nodes.values())[: limit or None]:
+        visible = self.retriever.visible_node_ids(
+            include_internal=include_internal
+        )
+        nodes = [
+            node
+            for node in self.retriever.graph.nodes.values()
+            if node.id in visible
+        ]
+        for node in nodes[: limit or None]:
             items.append(self.retriever._node_to_item(node, node.activation))
         return items
 

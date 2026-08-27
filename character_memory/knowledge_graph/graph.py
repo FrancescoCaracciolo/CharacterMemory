@@ -26,6 +26,7 @@ from .edges import (
     CoOccurrenceEdge,
     Edge,
     EpisodeEdge,
+    WikiAssociationEdge,
     edge_from_dict,
 )
 from .nodes import (
@@ -790,6 +791,12 @@ class KnowledgeGraph:
             # The vector is source-of-truth data, not a monotonic strength.
             # Re-ingestion must refresh it when an episodic row is edited.
             existing.emotional_shift = dict(new.emotional_shift)
+        if isinstance(existing, WikiAssociationEdge) and isinstance(
+            new, WikiAssociationEdge
+        ):
+            existing.sources = list(dict.fromkeys([
+                *(existing.sources or []), *(new.sources or [])
+            ]))
 
     def get_edge_between(self, kind: str, src: str, dst: str) -> Optional[Edge]:
         return self.edges.get(self.edge_id(kind, src, dst))
@@ -798,8 +805,9 @@ class KnowledgeGraph:
     def neighbors(self, node_id: str) -> list[tuple[Edge, Node]]:
         """Return `[(edge, neighbour_node)]` for every edge touching `node_id`.
 
-        Symmetric kinds (transition / co_occurrence) are walked from either
-        endpoint; directed kinds are walked from `src` only, so activation
+        Symmetric kinds (transition / co_occurrence / wiki_association) are
+        walked from either endpoint; directed kinds are walked from `src`
+        only, so activation
         spreads along the semantic direction (Person -> Fact, etc.) while
         still allowing undirected traversal of the symmetric edges.
         """

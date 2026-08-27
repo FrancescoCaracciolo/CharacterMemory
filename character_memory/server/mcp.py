@@ -296,7 +296,11 @@ def _tool_graph_overview(agent: CharacterAgent, mem: Any, args: dict) -> dict:
             f"Character {agent.character_name!r} does not have the "
             f"knowledge_graph memory enabled."
         )
-    return {"character": agent.character_name, "graph": kg.retriever.overview()}
+    include_internal = bool(_args(args, "include_internal", False))
+    return {
+        "character": agent.character_name,
+        "graph": kg.retriever.overview(include_internal=include_internal),
+    }
 
 
 def _tool_search_knowledge_graph(agent: CharacterAgent, mem: Any, args: dict) -> dict:
@@ -319,8 +323,16 @@ def _tool_search_knowledge_graph(agent: CharacterAgent, mem: Any, args: dict) ->
     user = _args(args, "user_id", None)
     limit = max(1, min(300, int(_args(args, "limit", 50) or 50)))
     hops = max(0, min(2, int(_args(args, "hops", 1) or 1)))
+    include_internal = bool(_args(args, "include_internal", False))
     try:
-        return read_graph(agent, q=q, user=user, limit=limit, hops_subgraph=hops)
+        return read_graph(
+            agent,
+            q=q,
+            user=user,
+            limit=limit,
+            hops_subgraph=hops,
+            include_internal=include_internal,
+        )
     except KeyError:
         return _json_error("knowledge_graph memory not built.")
 
@@ -1138,7 +1150,17 @@ _register(
     "High-level knowledge-graph stats for the character: total nodes, edges, "
     "per-kind counts, and known users. Errors if the character does not have "
     "the knowledge_graph memory enabled.",
-    {"type": "object", "properties": {}, "required": []},
+    {
+        "type": "object",
+        "properties": {
+            "include_internal": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include internal wiki provenance anchors for diagnostics.",
+            },
+        },
+        "required": [],
+    },
     _tool_graph_overview,
     needs_memory=False,
     categories=("kg",),
@@ -1160,6 +1182,11 @@ _register(
             "user_id": {"type": "string"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 300, "default": 50},
             "hops": {"type": "integer", "minimum": 0, "maximum": 2, "default": 1},
+            "include_internal": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include internal wiki provenance anchors for diagnostics.",
+            },
         },
         "required": [],
     },

@@ -146,12 +146,16 @@ class ExtractionSpec:
       asked to stamp each item with the participant it is about; in single-user
       mode this flag is a no-op (the chat's one user is used). Per-user
       memories set it True; character-scoped memories leave it False.
+    - `snapshot`: when True, the field is a complete replacement snapshot
+      rather than a delta of newly discovered items. The extraction prompt
+      adds a stronger merge/preservation rule after the generic delta footer.
     """
 
     field: str
     schema: dict[str, Any]
     instruction: str
     per_user: bool = False
+    snapshot: bool = False
 
 
 class Memory(ABC):

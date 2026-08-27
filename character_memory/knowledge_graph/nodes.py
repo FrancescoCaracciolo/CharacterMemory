@@ -58,6 +58,10 @@ class Node:
     character_scoped: bool = False
     #: Zero identifies a legacy node whose provenance still needs backfilling.
     privacy_scope_version: int = 0
+    #: Internal source/provenance node. Internal nodes participate in graph
+    #: activation and persistence but are hidden from normal retrieval and
+    #: public graph views unless explicitly requested.
+    internal: bool = False
     #: Transient activation populated at retrieval time; never persisted.
     activation: float = 0.0
 
@@ -77,6 +81,7 @@ class Node:
             "memory_owners": list(self.memory_owners),
             "character_scoped": bool(self.character_scoped),
             "privacy_scope_version": int(self.privacy_scope_version),
+            "internal": bool(self.internal),
         }
         # Dataclass-only extra fields (the subclasses' data).
         for k, v in self._extra_fields().items():

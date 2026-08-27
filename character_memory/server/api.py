@@ -671,6 +671,7 @@ def read_graph(
     include_co_occurrence: bool = Query(False, description="Include co_occurrence edges (default on in full mode)."),
     full: bool = Query(False, description="Return the whole graph (retrieved nodes flagged)."),
     retrieve_k: int = Query(30, ge=1, le=500, description="Top-k nodes flagged 'retrieved' when full."),
+    include_internal: bool = Query(False, description="Include internal wiki provenance anchors for diagnostics."),
 ) -> dict:
     """Return the activation-weighted knowledge-graph for the viz.
 
@@ -693,6 +694,7 @@ def read_graph(
         return read_graph_view(
             agent, q=q, user=user, limit=limit, hops_subgraph=hops, max_edges=max_edges,
             include_co_occurrence=include_co_occurrence, full=full, retrieve_k=retrieve_k,
+            include_internal=include_internal,
         )
     except KeyError:
         raise HTTPException(status_code=404, detail="knowledge_graph memory not built.")
