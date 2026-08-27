@@ -35,6 +35,7 @@ from .nodes import (
     FactNode,
     EpisodeNode,
     EntityNode,
+    PRIVACY_SCOPE_SCHEMA_VERSION,
     node_from_dict,
 )
 
@@ -80,6 +81,9 @@ class KnowledgeGraph:
         existing = self.nodes.get(node.id)
         if existing is not None:
             return existing
+        if node.id == self.SELF_ID or isinstance(node, SelfNode):
+            node.character_scoped = True
+            node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
         self._removed_node_ids.discard(node.id)
         self.nodes[node.id] = node
         self._adj.setdefault(node.id, [])
@@ -104,10 +108,60 @@ class KnowledgeGraph:
         self._removed_node_ids.discard(node.id)
         if node.id in self.nodes:
             # Preserve transient activation across a refresh.
-            node.activation = self.nodes[node.id].activation
+            current = self.nodes[node.id]
+            node.activation = current.activation
+            node.memory_owners = list(dict.fromkeys([
+                *(current.memory_owners or []), *(node.memory_owners or [])
+            ]))
+            node.character_scoped = bool(
+                current.character_scoped or node.character_scoped
+            )
+            node.privacy_scope_version = max(
+                int(current.privacy_scope_version or 0),
+                int(node.privacy_scope_version or 0),
+            )
             self.nodes[node.id] = node
             return node
         return self.add_node(node)
+
+    def mark_user_scope(self, node_or_id: Node | str, user_id: str) -> Optional[Node]:
+        """Add one source-memory owner to a node's durable privacy scope."""
+        node = (
+            self.nodes.get(node_or_id)
+            if isinstance(node_or_id, str)
+            else node_or_id
+        )
+        if node is None:
+            return None
+        owner = str(user_id or "").strip()
+        if owner and owner not in node.memory_owners:
+            node.memory_owners.append(owner)
+        node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
+        return node
+
+    def mark_character_scope(self, node_or_id: Node | str) -> Optional[Node]:
+        """Mark a node as globally shareable character knowledge."""
+        node = (
+            self.nodes.get(node_or_id)
+            if isinstance(node_or_id, str)
+            else node_or_id
+        )
+        if node is None:
+            return None
+        node.character_scoped = True
+        node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
+        return node
+
+    def mark_scope_resolved(self, node_or_id: Node | str) -> Optional[Node]:
+        """Mark a node classified even when it has no visible provenance."""
+        node = (
+            self.nodes.get(node_or_id)
+            if isinstance(node_or_id, str)
+            else node_or_id
+        )
+        if node is not None:
+            node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
+        return node
 
     def get_node(self, node_id: str) -> Optional[Node]:
         return self.nodes.get(node_id)
@@ -166,6 +220,8 @@ class KnowledgeGraph:
             current_mood=dict(current_mood or {}),
             created_at=now,
             practice_times=[now],
+            character_scoped=True,
+            privacy_scope_version=PRIVACY_SCOPE_SCHEMA_VERSION,
         )
         self.add_node(self_node)
         return self_node
@@ -484,6 +540,7 @@ class KnowledgeGraph:
         removed: list[str] = []
         absorbed_aliases: list[str] = []
         absorbed_refs: list[str] = []
+        absorbed_owners: list[str] = []
         for node in list(self.nodes.values()):
             if not isinstance(node, PersonNode):
                 continue
@@ -499,6 +556,7 @@ class KnowledgeGraph:
                 if c and c.lower() not in target:
                     absorbed_aliases.append(c)
             absorbed_refs.extend(node.external_refs or [])
+            absorbed_owners.extend(node.memory_owners or [])
             self._rewire_edges(node.id, self.SELF_ID)
             self.remove_node(node.id)
             removed.append(node.id)
@@ -513,6 +571,11 @@ class KnowledgeGraph:
                 self_node.external_refs = list(dict.fromkeys([
                     *(self_node.external_refs or []), *absorbed_refs
                 ]))
+                self_node.memory_owners = list(dict.fromkeys([
+                    *(self_node.memory_owners or []), *absorbed_owners
+                ]))
+                self_node.character_scoped = True
+                self_node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
         return removed
 
     def _pick_person_survivor(self, member_ids: list[str]) -> str:
@@ -580,6 +643,16 @@ class KnowledgeGraph:
             survivor.external_refs = list(dict.fromkeys([
                 *(survivor.external_refs or []), *(dup.external_refs or [])
             ]))
+            survivor.memory_owners = list(dict.fromkeys([
+                *(survivor.memory_owners or []), *(dup.memory_owners or [])
+            ]))
+            survivor.character_scoped = bool(
+                survivor.character_scoped or dup.character_scoped
+            )
+            survivor.privacy_scope_version = max(
+                int(survivor.privacy_scope_version or 0),
+                int(dup.privacy_scope_version or 0),
+            )
             self._rewire_edges(rid, survivor_id)
             self.remove_node(rid)
         survivor.text = self._person_text(survivor.name, survivor.aliases)

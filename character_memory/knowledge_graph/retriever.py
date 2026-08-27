@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Iterable, Optional
 
-from ..config import KnowledgeGraphConfig
+from ..config import KnowledgeGraphConfig, KnowledgeGraphPrivacy
 from ..llm.base import LLMClient
 from ..llm.embedding_base import EmbeddingProvider
 from ..emotion_vectors import (
@@ -31,6 +31,7 @@ from ..emotion_vectors import (
     emotional_impact,
 )
 from ..memory.base import MemoryItem, item_bullet
+from ..memory.character_base import CharacterInfoMemory
 from ..memory.dedup import DedupReport
 from ..memory.emotion import EmotionStatus
 from ..memory.episodic import EpisodicMemory
@@ -40,7 +41,7 @@ from ..memory.user_summary import UserSummaryMemory
 from ..rag.base import as_queries
 from ..rag.hybrid import HybridSearch
 from .activation import combined_activation, combined_activation_breakdown
-from .edges import CoOccurrenceEdge, EpisodeEdge
+from .edges import CoOccurrenceEdge, EpisodeEdge, FactEdge
 from .graph import KnowledgeGraph
 from .ingest import (
     _EXTRACTION_TOKEN_LIMIT,
@@ -57,7 +58,13 @@ from .ingest import (
     ingest_wiki_llm,
     wire_chat_edges,
 )
-from .nodes import Node, PersonNode
+from .nodes import (
+    EpisodeNode,
+    FactNode,
+    Node,
+    PersonNode,
+    PRIVACY_SCOPE_SCHEMA_VERSION,
+)
 from .persistence import (
     graph_index_chunks,
     has_persisted,
@@ -248,6 +255,9 @@ class KnowledgeGraphRetriever:
         """Full ingest from the given source memories.
 
         Reads each source memory via its public API and (re)builds the graph.
+        A supplied :class:`CharacterInfoMemory` is treated as the character's
+        wiki and goes through the same LLM-backed typed ingestion as
+        :meth:`ingest_wiki`.
         Idempotent for the same inputs: PersonNode/SelfNode are upserts, and
         auto-increment ids (`fact:<n>`, `episode:<n>`) make collisions across
         re-ingests unlikely (call :meth:`reset` first for a clean rebuild).
@@ -301,6 +311,14 @@ class KnowledgeGraphRetriever:
                 ),
             )
 
+        character_info = mems.get("character_info")
+        if isinstance(character_info, CharacterInfoMemory):
+            self.ingest_wiki(
+                self._character_info_sections(character_info),
+                _on_llm_request_done=_on_llm_request_done,
+                _sync_index=False,
+            )
+
         # Built-in and third-party character-scoped projections share this
         # registry-driven path. Full builds force them even when an older
         # projection fingerprint is present in SQLite.
@@ -314,9 +332,27 @@ class KnowledgeGraphRetriever:
         self._dedup_persons()
         # Link facts and episodes learned in the same chat (low-weight bridges).
         wire_chat_edges(self.graph)
+        self._ensure_privacy_scopes()
         if _sync_index:
             self._sync_index()
         return self
+
+    @staticmethod
+    def _character_info_sections(
+        memory: CharacterInfoMemory,
+    ) -> list[dict[str, Any]]:
+        """Convert indexed character-info chunks into wiki ingest sections."""
+        sections: list[dict[str, Any]] = []
+        for item in memory.get_memories():
+            metadata = item.metadata or {}
+            sections.append(
+                {
+                    "text": item.text,
+                    "header": metadata.get("header", ""),
+                    "source": metadata.get("source", "wiki"),
+                }
+            )
+        return sections
 
     def _has_wiki_nodes(self) -> bool:
         """True if any wiki-derived node is already in the graph."""
@@ -382,8 +418,15 @@ class KnowledgeGraphRetriever:
         )
         progress.start()
         with self.graph._observe_node_additions(progress.on_node_added):
+            # This build path receives the authoritative, freshly chunked wiki
+            # sections separately. Exclude CharacterInfoMemory here so the
+            # public ingest() convenience does not run the same LLM pass twice.
             self.ingest(
-                memory_list,
+                [
+                    memory
+                    for memory in memory_list
+                    if not isinstance(memory, CharacterInfoMemory)
+                ],
                 _on_llm_request_done=progress.request_done,
                 _sync_index=False,
             )
@@ -476,6 +519,7 @@ class KnowledgeGraphRetriever:
                             aliases = []
                     name = str(meta.get("name") or uid)
                     p = self.graph.ensure_person(uid, name=name, aliases=aliases or [])
+                    self.graph.mark_user_scope(p, uid)
                     p.text = it.text or p.text
                     if uid not in self._known_users:
                         self._known_users.append(uid)
@@ -536,6 +580,7 @@ class KnowledgeGraphRetriever:
         # Re-link same-chat facts/episodes across the whole graph: a freshly
         # ingested fact should bridge to pre-existing episodes of that chat.
         wire_chat_edges(self.graph)
+        self._ensure_privacy_scopes()
         if sync_index:
             self._sync_index()
         return self
@@ -616,10 +661,16 @@ class KnowledgeGraphRetriever:
             except Exception:
                 pass
             if mem_name == "user_facts":
+                owner = str(row.get("user_id") or "")
+                if owner:
+                    self.graph.mark_user_scope(node, owner)
                 node.content = str(row.get("content") or getattr(node, "content", ""))  # type: ignore[attr-defined]
                 node.confidence = float(row.get("confidence") or 0.5)  # type: ignore[attr-defined]
                 node.importance = float(row.get("importance") or 0.5)  # type: ignore[attr-defined]
             elif mem_name == "episodic":
+                owner = str(row.get("user_id") or "")
+                if owner:
+                    self.graph.mark_user_scope(node, owner)
                 node.summary = str(row.get("summary") or getattr(node, "summary", ""))  # type: ignore[attr-defined]
                 node.emotional_shift = decode_emotion_vector(  # type: ignore[attr-defined]
                     row.get("emotional_shift", "{}"),
@@ -638,9 +689,123 @@ class KnowledgeGraphRetriever:
                     except (ValueError, TypeError):
                         aliases = []
                 if isinstance(node, PersonNode):
+                    owner = str(row.get("user_id") or "")
+                    if owner:
+                        self.graph.mark_user_scope(node, owner)
                     node.name = str(row.get("name") or node.name)
                     node.aliases = list(aliases or [])
                     node.text = self.graph._person_text(node.name, node.aliases)
+
+    def _ensure_privacy_scopes(self) -> bool:
+        """Backfill durable node provenance without an LLM call.
+
+        Fresh ingestion stamps scope eagerly. Persisted graphs created before
+        privacy support carry version zero, so source rows and semantic
+        Fact/Episode edges are used to classify them once. Unknown legacy
+        nodes are marked resolved but deliberately remain invisible to an
+        identity-scoped retrieval.
+        """
+        legacy = [
+            node
+            for node in self.graph.nodes.values()
+            if int(getattr(node, "privacy_scope_version", 0) or 0)
+            < PRIVACY_SCOPE_SCHEMA_VERSION
+        ]
+        if not legacy:
+            return False
+        before = {
+            node.id: (
+                tuple(node.memory_owners or []),
+                bool(node.character_scoped),
+                int(node.privacy_scope_version or 0),
+            )
+            for node in self.graph.nodes.values()
+        }
+
+        self.graph.mark_character_scope(self.graph.SELF_ID)
+        user_ids: set[str] = set()
+        rows_by_source: dict[str, dict[str, dict[str, Any]]] = {}
+        for memory_name in ("user_summary", "emotion", "user_facts", "episodic"):
+            memory = self._source_memory_for(memory_name)
+            if memory is None or not hasattr(memory, "store") or not hasattr(memory, "table"):
+                continue
+            try:
+                rows = memory.store.select(memory.table)
+            except Exception:
+                continue
+            rows_by_source[memory_name] = {
+                str(row.get("id")): row
+                for row in rows
+                if row.get("id") is not None
+            }
+            user_ids.update(
+                str(row.get("user_id") or "")
+                for row in rows
+                if row.get("user_id")
+            )
+
+        character_prefixes = (
+            "wiki:",
+            "heartbeat:",
+            "world_location:",
+            "world_actor:",
+            "world_routine:",
+            "world_records:",
+            "world_identity:",
+        )
+        for node in legacy:
+            source = str(node.source or "")
+            if source.startswith(character_prefixes):
+                self.graph.mark_character_scope(node)
+            memory_name, separator, row_id = source.partition(":")
+            if separator and memory_name in {"user_facts", "episodic", "user_summary"}:
+                row = rows_by_source.get(memory_name, {}).get(row_id)
+                if row is not None:
+                    owner = str(row.get("user_id") or "")
+                    if owner:
+                        self.graph.mark_user_scope(node, owner)
+            if isinstance(node, PersonNode):
+                linked = {
+                    str(node.user_id or ""),
+                    *(str(value) for value in (node.user_ids or [])),
+                } & user_ids
+                for owner in linked:
+                    self.graph.mark_user_scope(node, owner)
+
+        # Content provenance flows only to its direct semantic endpoints. It
+        # never crosses chat/co-occurrence edges into unrelated memories.
+        semantic_edges: dict[str, list[tuple[Any, Node]]] = {}
+        for edge in self.graph.edges.values():
+            if not isinstance(edge, (FactEdge, EpisodeEdge)):
+                continue
+            endpoint = self.graph.nodes.get(edge.src)
+            if endpoint is not None:
+                semantic_edges.setdefault(edge.dst, []).append((edge, endpoint))
+        for content in list(self.graph.nodes.values()):
+            if not isinstance(content, (FactNode, EpisodeNode)):
+                continue
+            endpoints: list[Node] = []
+            for edge, endpoint in semantic_edges.get(content.id, []):
+                endpoints.append(endpoint)
+                if isinstance(content, FactNode) and edge.src == self.graph.SELF_ID:
+                    self.graph.mark_character_scope(content)
+            for endpoint in endpoints:
+                for owner in content.memory_owners or []:
+                    self.graph.mark_user_scope(endpoint, owner)
+                if content.character_scoped:
+                    self.graph.mark_character_scope(endpoint)
+
+        for node in legacy:
+            self.graph.mark_scope_resolved(node)
+        after = {
+            node.id: (
+                tuple(node.memory_owners or []),
+                bool(node.character_scoped),
+                int(node.privacy_scope_version or 0),
+            )
+            for node in self.graph.nodes.values()
+        }
+        return before != after
 
     def _source_memory_for(self, name: str) -> Optional[Any]:
         """The retriever does not hold source memories; the agent resolves them.
@@ -652,7 +817,58 @@ class KnowledgeGraphRetriever:
         return None
 
     # ----------------------------------------------------------- retrieval core
-    def _seed_activations(self, query: str) -> dict[str, float]:
+    @staticmethod
+    def _viewer_ids(
+        user_id: Optional[str], user_ids: Optional[Iterable[str]]
+    ) -> frozenset[str]:
+        values = (
+            [user_ids]
+            if isinstance(user_ids, str)
+            else list(user_ids or [])
+        )
+        if user_id:
+            values.append(user_id)
+        return frozenset(str(value).strip() for value in values if str(value).strip())
+
+    def _privacy_mode(self) -> KnowledgeGraphPrivacy:
+        return KnowledgeGraphPrivacy.coerce(getattr(self.config, "privacy", None))
+
+    def visible_node_ids(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        user_ids: Optional[Iterable[str]] = None,
+    ) -> frozenset[str]:
+        """Return nodes retrievable by the supplied user/participant union.
+
+        An empty identity or ``privacy=none`` intentionally means unrestricted
+        access for backwards-compatible administrative and standalone calls.
+        """
+        viewers = self._viewer_ids(user_id, user_ids)
+        if self._privacy_mode() is KnowledgeGraphPrivacy.NONE or not viewers:
+            return frozenset(self.graph.nodes)
+        return frozenset(
+            node.id
+            for node in self.graph.nodes.values()
+            if node.character_scoped
+            or bool(viewers.intersection(node.memory_owners or []))
+        )
+
+    def is_node_visible(
+        self,
+        node_id: str,
+        *,
+        user_id: Optional[str] = None,
+        user_ids: Optional[Iterable[str]] = None,
+    ) -> bool:
+        return node_id in self.visible_node_ids(user_id=user_id, user_ids=user_ids)
+
+    def _seed_activations(
+        self,
+        query: str,
+        *,
+        allowed_node_ids: Optional[frozenset[str]] = None,
+    ) -> dict[str, float]:
         """RRF-score the query against the node-text index + seed the SelfNode.
 
         Each hit contributes two things: a relevance-scaled base (so a strong
@@ -662,7 +878,13 @@ class KnowledgeGraphRetriever:
         (~0.02-0.05) are drowned by the BLL term.
         """
         seeds: dict[str, float] = {}
-        if self.graph.SELF_ID in self.graph.nodes:
+        if (
+            self.graph.SELF_ID in self.graph.nodes
+            and (
+                allowed_node_ids is None
+                or self.graph.SELF_ID in allowed_node_ids
+            )
+        ):
             seeds[self.graph.SELF_ID] = self.config.self_seed
         # Runtime world context is a seed, not durable knowledge. Only the
         # observer's current location participates; mutable gauges and visible
@@ -680,7 +902,13 @@ class KnowledgeGraphRetriever:
                 location = self.graph.find_by_external_ref(
                     f"world:location:{location_id}"
                 )
-                if location is not None:
+                if (
+                    location is not None
+                    and (
+                        allowed_node_ids is None
+                        or location.id in allowed_node_ids
+                    )
+                ):
                     seeds[location.id] = seeds.get(location.id, 0.0) + float(
                         self.config.world_location_seed
                     )
@@ -694,7 +922,17 @@ class KnowledgeGraphRetriever:
         if self.hybrid is None or not as_queries(query):
             return seeds
         try:
-            hits = self.hybrid.search(query, k=max(10, self.config.hops * 8))
+            if allowed_node_ids is None:
+                # Keep the unrestricted/custom-backend call shape unchanged.
+                hits = self.hybrid.search(
+                    query, k=max(10, self.config.hops * 8)
+                )
+            else:
+                hits = self.hybrid.search(
+                    query,
+                    k=max(10, self.config.hops * 8),
+                    allowed_ids=allowed_node_ids,
+                )
         except Exception:
             hits = []
         # Per-hit base scaled by both rank and qualified retrieval relevance.
@@ -702,6 +940,10 @@ class KnowledgeGraphRetriever:
         for rank, h in enumerate(hits):
             nid = h.metadata.get("id")
             if not (isinstance(nid, str) and nid in self.graph.nodes):
+                continue
+            # HybridSearch applies this during BM25/FAISS calculation. Keep a
+            # defensive boundary here as well for custom RAG implementations.
+            if allowed_node_ids is not None and nid not in allowed_node_ids:
                 continue
             relevance = max(
                 0.0,
@@ -715,7 +957,13 @@ class KnowledgeGraphRetriever:
             )
         return seeds
 
-    def test_activation(self, query: str, *, user_id: Optional[str] = None) -> dict[str, float]:
+    def test_activation(
+        self,
+        query: str,
+        *,
+        user_id: Optional[str] = None,
+        user_ids: Optional[Iterable[str]] = None,
+    ) -> dict[str, float]:
         """Return the full `{node_id: activation}` trace for `query`.
 
         Read-only: does not bump practice times or run the Hebbian step. Also
@@ -725,12 +973,25 @@ class KnowledgeGraphRetriever:
         """
         if not self.graph.nodes:
             return {}
-        seeds = self._seed_activations(query)
-        # Bias the user's own PersonNode so "about me" wins ties.
-        if user_id:
-            person = self.graph.find_person_by_user_id(user_id)
-            pid = person.id if person is not None else f"person:{user_id}"
-            if pid in self.graph.nodes:
+        viewers = self._viewer_ids(user_id, user_ids)
+        mode = self._privacy_mode()
+        visible = (
+            self.visible_node_ids(user_ids=viewers)
+            if mode is not KnowledgeGraphPrivacy.NONE and viewers
+            else None
+        )
+        calculation_ids = visible if mode is KnowledgeGraphPrivacy.PRIVATE else None
+        seeds = self._seed_activations(
+            query, allowed_node_ids=calculation_ids
+        )
+        # Bias every active participant's PersonNode so "about me/us" wins ties.
+        for viewer in viewers:
+            person = self.graph.find_person_by_user_id(viewer)
+            pid = person.id if person is not None else f"person:{viewer}"
+            if (
+                pid in self.graph.nodes
+                and (calculation_ids is None or pid in calculation_ids)
+            ):
                 seeds[pid] = seeds.get(pid, 0.0) + self.config.self_seed * 0.6
         breakdown = combined_activation_breakdown(
             self.graph, seeds,
@@ -741,19 +1002,29 @@ class KnowledgeGraphRetriever:
             hops=self.config.hops,
             base_weight=self.config.base_weight,
             spread_weight=self.config.spread_weight,
+            allowed_node_ids=calculation_ids,
         )
         # Stash on the nodes for the GUI / debugging.
         for nid, node in self.graph.nodes.items():
             comp = breakdown.get(nid, {})
             node.activation = float(comp.get("score", 0.0))
             node.score_breakdown = dict(comp)
-        return {nid: comp["score"] for nid, comp in breakdown.items()}
+        trace = {nid: comp["score"] for nid, comp in breakdown.items()}
+        if visible is not None:
+            trace = {nid: score for nid, score in trace.items() if nid in visible}
+        return trace
 
     def test_activation_details(
-        self, query: str, *, user_id: Optional[str] = None
+        self,
+        query: str,
+        *,
+        user_id: Optional[str] = None,
+        user_ids: Optional[Iterable[str]] = None,
     ) -> dict[str, dict[str, float]]:
         """Read-only activation trace with episode emotion components."""
-        activation = self.test_activation(query, user_id=user_id)
+        activation = self.test_activation(
+            query, user_id=user_id, user_ids=user_ids
+        )
         self_node = self.graph.nodes.get(self.graph.SELF_ID)
         current_mood = getattr(self_node, "current_mood", {}) or {}
         details: dict[str, dict[str, float]] = {}
@@ -786,6 +1057,7 @@ class KnowledgeGraphRetriever:
         query: str,
         *,
         user_id: Optional[str] = None,
+        user_ids: Optional[Iterable[str]] = None,
         token_budget: int = 1_000,
         state_changing: bool = True,
         timestamp_style: str = "both",
@@ -810,7 +1082,9 @@ class KnowledgeGraphRetriever:
         budget = max(0, int(token_budget))
         if budget == 0:
             return []
-        act = self.test_activation(query, user_id=user_id)
+        act = self.test_activation(
+            query, user_id=user_id, user_ids=user_ids
+        )
         ranked = sorted(
             ((a, nid) for nid, a in act.items() if a >= self.config.min_activation),
             reverse=True,
@@ -965,6 +1239,7 @@ class KnowledgeGraphRetriever:
         if self.hybrid is None or self.store is None:
             return self
         self.reconcile_sources(sync_index=False)
+        self._ensure_privacy_scopes()
         self.graph = save_graph(
             self.graph,
             self.store,
@@ -990,12 +1265,13 @@ class KnowledgeGraphRetriever:
             # The SQLite tables are the source of truth for nodes/edges; a
             # stale/missing FAISS index is rebuilt on the next save().
             pass
+        scopes_changed = self._ensure_privacy_scopes()
         self._known_users = self._graph_user_ids()
         # Existing graphs are backfilled exactly once per projector version or
         # source fingerprint. Publishing here preserves build()'s no-LLM load
         # contract while making new derived sources immediately available.
         self.reconcile_sources(sync_index=False)
-        if self._pending_projection_meta:
+        if self._pending_projection_meta or scopes_changed:
             self.save(path)
         return self
 
@@ -1053,14 +1329,52 @@ class KnowledgeGraphRetriever:
             pass
 
     # ----------------------------------------------------------- introspection
-    def overview(self) -> dict[str, Any]:
-        """A compact summary used by the GUI sidebar / MCP `graph_overview`."""
-        c = self.graph.counts()
+    def overview(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        user_ids: Optional[Iterable[str]] = None,
+        allowed_node_ids: Optional[Iterable[str]] = None,
+    ) -> dict[str, Any]:
+        """A compact graph summary, optionally constrained to one viewer union.
+
+        Identity-less callers retain the administrative whole-graph view. The
+        explicit ``allowed_node_ids`` hook is used by live group-chat traces,
+        whose captured visibility may be wider than the chat owner's partition.
+        """
+        viewers = self._viewer_ids(user_id, user_ids)
+        scoped = (
+            self._privacy_mode() is not KnowledgeGraphPrivacy.NONE
+            and (bool(viewers) or allowed_node_ids is not None)
+        )
+        if scoped:
+            visible = (
+                frozenset(str(node_id) for node_id in allowed_node_ids)
+                if allowed_node_ids is not None
+                else self.visible_node_ids(user_ids=viewers)
+            )
+        else:
+            visible = frozenset(self.graph.nodes)
+        by_kind: dict[str, int] = {}
+        for node in self.graph.nodes.values():
+            if node.id in visible:
+                by_kind[node.kind] = by_kind.get(node.kind, 0) + 1
+        edge_count = sum(
+            1
+            for edge in self.graph.edges.values()
+            if edge.src in visible and edge.dst in visible
+        )
+        users = (
+            [uid for uid in self._known_users if uid in viewers]
+            if scoped
+            else list(self._known_users)
+        )
         return {
-            "nodes": len(self.graph),
-            "edges": c.pop("__edges__", 0),
-            "by_kind": c,
-            "users": list(self._known_users),
+            "nodes": sum(by_kind.values()),
+            "edges": edge_count,
+            "by_kind": by_kind,
+            "users": users,
+            "privacy": self._privacy_mode().value,
         }
 
 
@@ -1072,4 +1386,5 @@ __all__ = [
     "KnowledgeGraphRetriever",
     "KnowledgeGraphRetrivier",
     "KnowledgeGraphConfig",
+    "KnowledgeGraphPrivacy",
 ]

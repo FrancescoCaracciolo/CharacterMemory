@@ -20,6 +20,9 @@ from typing import Any, Callable, Optional
 from ..emotion_vectors import emotion_vector
 
 
+PRIVACY_SCOPE_SCHEMA_VERSION = 1
+
+
 def _now(clock: Optional[Callable[[], float]] = None) -> float:
     return (clock or time.time)()
 
@@ -46,6 +49,15 @@ class Node:
     #: a WorldMemory location can therefore resolve to one canonical graph
     #: node without making either source own the other source's node.
     external_refs: list[str] = field(default_factory=list)
+    #: User-memory partitions whose source material contributed this node.
+    #: Canonical entity/person nodes accumulate several owners when reused.
+    memory_owners: list[str] = field(default_factory=list)
+    #: Globally retrievable character knowledge (Self/wiki/heartbeat/world, or
+    #: a fact whose semantic subject is Self). Character-scoped nodes remain
+    #: eligible in every identity-scoped retrieval.
+    character_scoped: bool = False
+    #: Zero identifies a legacy node whose provenance still needs backfilling.
+    privacy_scope_version: int = 0
     #: Transient activation populated at retrieval time; never persisted.
     activation: float = 0.0
 
@@ -62,6 +74,9 @@ class Node:
             "practice_times": list(self.practice_times),
             "source": self.source,
             "external_refs": list(self.external_refs),
+            "memory_owners": list(self.memory_owners),
+            "character_scoped": bool(self.character_scoped),
+            "privacy_scope_version": int(self.privacy_scope_version),
         }
         # Dataclass-only extra fields (the subclasses' data).
         for k, v in self._extra_fields().items():
@@ -261,4 +276,5 @@ __all__ = [
     "EntityNode",
     "NODE_CLASSES",
     "node_from_dict",
+    "PRIVACY_SCOPE_SCHEMA_VERSION",
 ]

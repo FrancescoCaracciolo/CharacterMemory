@@ -38,6 +38,7 @@ from .nodes import (
     FactNode,
     Node,
     PersonNode,
+    PRIVACY_SCOPE_SCHEMA_VERSION,
     SelfNode,
     node_from_dict,
 )
@@ -54,6 +55,7 @@ from .retriever import (
     KnowledgeGraphRetriever,
     KnowledgeGraphRetrivier,
 )
+from ..config import KnowledgeGraphPrivacy
 
 __all__ = [
     # graph
@@ -63,6 +65,7 @@ __all__ = [
     "Node",
     "SelfNode",
     "PersonNode",
+    "PRIVACY_SCOPE_SCHEMA_VERSION",
     "FactNode",
     "EpisodeNode",
     "EntityNode",
@@ -98,4 +101,5 @@ __all__ = [
     "KnowledgeGraphRetriever",
     "KnowledgeGraphRetrivier",
     "KnowledgeGraphConfig",
+    "KnowledgeGraphPrivacy",
 ]

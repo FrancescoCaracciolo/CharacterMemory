@@ -98,6 +98,9 @@ def _put_node(graph: KnowledgeGraph, desired: Node, result: ProjectionResult) ->
         "practice_times": list(current.practice_times),
         "activation": current.activation,
         "external_refs": list(current.external_refs),
+        "memory_owners": list(current.memory_owners),
+        "character_scoped": bool(current.character_scoped),
+        "privacy_scope_version": int(current.privacy_scope_version or 0),
     }
     for key, value in desired.__dict__.items():
         if key not in retained:
@@ -109,6 +112,15 @@ def _put_node(graph: KnowledgeGraph, desired: Node, result: ProjectionResult) ->
     current.external_refs = list(dict.fromkeys([
         *retained["external_refs"], *desired.external_refs
     ]))
+    current.memory_owners = list(dict.fromkeys([
+        *retained["memory_owners"], *desired.memory_owners
+    ]))
+    current.character_scoped = bool(
+        retained["character_scoped"] or desired.character_scoped
+    )
+    current.privacy_scope_version = max(
+        retained["privacy_scope_version"], desired.privacy_scope_version
+    )
     if current.to_dict() != before:
         result.updated += 1
     return current
@@ -315,6 +327,7 @@ class HeartbeatGraphProjector(GraphSourceProjector):
                 )
             desired.add(node_id)
             stored = _put_node(graph, node, result)
+            graph.mark_character_scope(stored)
             _clear_structural_edges(graph, node_id)
             endpoints = [graph.nodes[graph.SELF_ID], *_mentioned_nodes(graph, summary)]
             seen: set[str] = set()
@@ -322,6 +335,7 @@ class HeartbeatGraphProjector(GraphSourceProjector):
                 if endpoint.id in seen or endpoint.id == node_id:
                     continue
                 seen.add(endpoint.id)
+                graph.mark_character_scope(endpoint)
                 if kind == "discovery":
                     graph.upsert_edge(FactEdge(
                         src=endpoint.id,
@@ -425,6 +439,7 @@ class WorldGraphProjector(GraphSourceProjector):
                 graph.add_node(node)
                 result.added += 1
         graph.bind_external_ref(node, ref)
+        graph.mark_character_scope(node)
         return node
 
     @staticmethod
@@ -443,6 +458,7 @@ class WorldGraphProjector(GraphSourceProjector):
             node.source = f"world_identity:location:{location_id}"
             result.added += 1
         graph.bind_external_ref(node, ref)
+        graph.mark_character_scope(node)
         return node
 
     @staticmethod
@@ -523,10 +539,12 @@ class WorldGraphProjector(GraphSourceProjector):
                     practice_times=[created],
                     source=source,
                 ), result)
+                graph.mark_character_scope(stored)
                 _clear_structural_edges(graph, stored.id)
                 for endpoint in dict.fromkeys(
                     node.id for node in endpoints if node is not None
                 ):
+                    graph.mark_character_scope(endpoint)
                     graph.upsert_edge(FactEdge(
                         src=endpoint,
                         dst=stored.id,
@@ -651,8 +669,10 @@ class WorldGraphProjector(GraphSourceProjector):
                     practice_times=[timestamp],
                     source=source,
                 ), result)
+                graph.mark_character_scope(stored)
                 _clear_structural_edges(graph, stored.id)
                 for endpoint in endpoint_ids:
+                    graph.mark_character_scope(endpoint)
                     graph.upsert_edge(EpisodeEdge(
                         src=endpoint,
                         dst=stored.id,

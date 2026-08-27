@@ -18,7 +18,7 @@ small accessor helpers so it stays decoupled from the dataclasses.
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import AbstractSet, Optional
 
 from ..emotion_vectors import emotion_similarity, emotional_impact
 from ..memory.decay import MAX_EXPOSURE_BOOST, exposure_saturation
@@ -120,6 +120,7 @@ def spread_activation(
     hops: int = 2,
     decay_per_hop: float = 0.6,
     floor: float = 0.0,
+    allowed_node_ids: Optional[AbstractSet[str]] = None,
 ) -> dict[str, float]:
     """Propagate activation from `seeds` over up to `hops` neighbours.
 
@@ -132,7 +133,11 @@ def spread_activation(
     pointing at many things spreads less to each). `seeds` provides the
     initial activation (SelfNode base + matched nodes' RRF score).
     """
-    activation: dict[str, float] = {nid: max(floor, float(a)) for nid, a in seeds.items()}
+    activation: dict[str, float] = {
+        nid: max(floor, float(a))
+        for nid, a in seeds.items()
+        if allowed_node_ids is None or nid in allowed_node_ids
+    }
 
     frontier = dict(activation)
     for hop in range(1, max(1, hops) + 1):
@@ -141,10 +146,15 @@ def spread_activation(
         for u_id, u_act in frontier.items():
             if u_act <= 0.0:
                 continue
-            fan = graph.degree(u_id)
+            neighbours = [
+                (edge, neighbour)
+                for edge, neighbour in graph.neighbors(u_id)
+                if allowed_node_ids is None or neighbour.id in allowed_node_ids
+            ]
+            fan = len(neighbours)
             if fan <= 0:
                 continue
-            for edge, neighbour in graph.neighbors(u_id):
+            for edge, neighbour in neighbours:
                 w = _edge_strength(edge) * _node_strength(neighbour)
                 contributed = g * (u_act * w) / fan
                 if contributed <= 0.0:
@@ -169,6 +179,7 @@ def combined_activation(
     hops: int = 2,
     base_weight: float = 1.0,
     spread_weight: float = 1.0,
+    allowed_node_ids: Optional[AbstractSet[str]] = None,
 ) -> dict[str, float]:
     """Final activation per node = `base_weight * BLL + spread_weight * spread`.
 
@@ -185,6 +196,7 @@ def combined_activation(
             now=now, decay=decay, decay_half_life=decay_half_life,
             gain=gain, hops=hops,
             base_weight=base_weight, spread_weight=spread_weight,
+            allowed_node_ids=allowed_node_ids,
         ).items()
     }
 
@@ -200,6 +212,7 @@ def combined_activation_breakdown(
     hops: int = 2,
     base_weight: float = 1.0,
     spread_weight: float = 1.0,
+    allowed_node_ids: Optional[AbstractSet[str]] = None,
 ) -> dict[str, dict[str, float]]:
     """Same fusion as :func:`combined_activation`, but with per-factor detail.
 
@@ -222,17 +235,45 @@ def combined_activation_breakdown(
     The GUI / `test_activation_details` use this to render a score-breakdown.
     """
     bll: dict[str, float] = {}
-    for nid, node in graph.nodes.items():
+    nodes = (
+        graph.nodes.items()
+        if allowed_node_ids is None
+        else (
+            (nid, graph.nodes[nid])
+            for nid in allowed_node_ids
+            if nid in graph.nodes
+        )
+    )
+    for nid, node in nodes:
         bll[nid] = base_level_activation(node, now=now, decay=decay, decay_half_life=decay_half_life)
     # The SelfNode is always "on" — seed it if the caller did not.
     seeds = dict(seeds)
-    if graph.SELF_ID in graph.nodes and graph.SELF_ID not in seeds:
+    if (
+        graph.SELF_ID in graph.nodes
+        and graph.SELF_ID not in seeds
+        and (allowed_node_ids is None or graph.SELF_ID in allowed_node_ids)
+    ):
         seeds[graph.SELF_ID] = 0.5
-    spread = spread_activation(graph, seeds, gain=gain, hops=hops)
+    spread = spread_activation(
+        graph,
+        seeds,
+        gain=gain,
+        hops=hops,
+        allowed_node_ids=allowed_node_ids,
+    )
     out: dict[str, dict[str, float]] = {}
     self_node = graph.nodes.get(graph.SELF_ID)
     current_mood = getattr(self_node, "current_mood", {}) or {}
-    for nid, node in graph.nodes.items():
+    output_nodes = (
+        graph.nodes.items()
+        if allowed_node_ids is None
+        else (
+            (nid, graph.nodes[nid])
+            for nid in allowed_node_ids
+            if nid in graph.nodes
+        )
+    )
+    for nid, node in output_nodes:
         bll_val = bll.get(nid, 0.0)
         spread_val = spread.get(nid, 0.0)
         base_term = base_weight * bll_val

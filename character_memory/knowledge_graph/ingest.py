@@ -405,11 +405,13 @@ def ingest_emotion(
         baseline=getattr(emotion, "baseline", {}) or {},
         current_mood=emotion.get_current_mood(),
     )
+    graph.mark_character_scope(self_node)
     self_node.text = _self_node_text(character)
     for uid in known_users or []:
         if not uid:
             continue
         person = graph.ensure_person(uid)  # make sure the node exists even w/o a summary
+        graph.mark_user_scope(person, uid)
         state = emotion.get_user_state(uid)
         comment = emotion.get_user_comment(uid)
         # Strength of the relationship = mean magnitude of the signed
@@ -457,6 +459,7 @@ def ingest_summaries(graph: KnowledgeGraph, summary: UserSummaryMemory) -> list[
             aliases = []
         name = str(r.get("name") or uid)
         person = graph.ensure_person(uid, name=name, aliases=aliases)
+        graph.mark_user_scope(person, uid)
         person.text = summary.row_text(r)
         person.source = f"user_summary:{r.get('id')}"
         person.created_at = float(r.get("created_at") or 0.0) or person.created_at
@@ -536,6 +539,11 @@ def ingest_facts(
                 chat_id=r.get("chat_id"),
             )
             graph.add_node(fact_node)
+            owner = str(r.get("user_id") or "").strip()
+            if owner:
+                graph.mark_user_scope(fact_node, owner)
+            else:
+                graph.mark_scope_resolved(fact_node)
             created_fact_ids.append(fid)
             ts = float(r.get("created_at") or 0.0) or fact_node.created_at
             confidence = _clip(r.get("confidence", 0.5))
@@ -551,6 +559,8 @@ def ingest_facts(
                 character,
                 existing_id=str(info.get("subject_id") or ""),
             )
+            if owner:
+                graph.mark_user_scope(subj_id, owner)
             graph.upsert_edge(
                 FactEdge(
                     id="",
@@ -572,6 +582,8 @@ def ingest_facts(
                     kind_label=e.get("kind", "thing"),
                     existing_id=e.get("existing_id", ""),
                 )
+                if owner:
+                    graph.mark_user_scope(ent, owner)
                 graph.upsert_edge(
                     FactEdge(
                         id="",
@@ -585,6 +597,11 @@ def ingest_facts(
                     )
                 )
                 participants.add(ent.id)
+            # A fact semantically asserted about the character is character
+            # knowledge even when a user originally supplied the source row.
+            if subj_id == graph.SELF_ID:
+                for participant_id in {fid, *participants}:
+                    graph.mark_character_scope(participant_id)
             fact_participants[fid] = participants
 
     _wire_co_occurrence(graph, fact_participants, co_create=True)
@@ -685,11 +702,16 @@ def ingest_episodes(
                 chat_id=r.get("chat_id"),
             )
             graph.add_node(ep_node)
+            if owner:
+                graph.mark_user_scope(ep_node, owner)
+            else:
+                graph.mark_scope_resolved(ep_node)
             created.append(eid)
             # The owner is always a participant; surface them as a PersonNode.
             participants: set[str] = set()
             if owner:
                 owner_node = graph.ensure_person(owner)
+                graph.mark_user_scope(owner_node, owner)
                 participants.add(owner_node.id)
             else:
                 owner_node = None
@@ -800,6 +822,7 @@ def ingest_wiki(
             practice_times=[now],
         )
         graph.add_node(fact)
+        graph.mark_character_scope(fact)
         created.append(fid)
         graph.upsert_edge(
             FactEdge(
@@ -1076,18 +1099,20 @@ def ingest_wiki_llm(
                     character,
                 ):
                     continue
-                graph.ensure_person_by_key(
+                person = graph.ensure_person_by_key(
                     person_data["key"],
                     name=person_data["name"],
                     aliases=person_data.get("aliases") or [],
                     existing_id=person_data.get("existing_id", ""),
                 )
+                graph.mark_character_scope(person)
             for entity_data in ext.get("entities", []):
-                graph.ensure_entity(
+                entity = graph.ensure_entity(
                     entity_data["name"],
                     kind_label=entity_data.get("kind", "thing"),
                     existing_id=entity_data.get("existing_id", ""),
                 )
+                graph.mark_character_scope(entity)
 
     created_fact_ids: list[str] = []
     section_participants: dict[str, set[str]] = {}
@@ -1112,6 +1137,7 @@ def ingest_wiki_llm(
             practice_times=[now],
         )
         graph.add_node(fact)
+        graph.mark_character_scope(fact)
         created_fact_ids.append(fid)
         graph.upsert_edge(
             FactEdge(
@@ -1145,6 +1171,7 @@ def ingest_wiki_llm(
                 aliases=aliases,
                 existing_id=p.get("existing_id", ""),
             )
+            graph.mark_character_scope(person)
             graph.upsert_edge(
                 FactEdge(
                     id="",
@@ -1165,6 +1192,7 @@ def ingest_wiki_llm(
                 kind_label=e.get("kind", "thing"),
                 existing_id=e.get("existing_id", ""),
             )
+            graph.mark_character_scope(ent)
             graph.upsert_edge(
                 FactEdge(
                     id="",
@@ -1194,6 +1222,7 @@ def ingest_wiki_llm(
                 practice_times=[now],
             )
             graph.add_node(ep)
+            graph.mark_character_scope(ep)
             for pid in participants:
                 if pid == graph.SELF_ID:
                     continue
