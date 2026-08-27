@@ -17,11 +17,14 @@ def emotion_vector(
     value: Any,
     *,
     allowed_axes: Iterable[str] | None = None,
+    ignore_unknown_axes: bool = False,
 ) -> dict[str, float]:
     """Validate and clamp an emotion vector.
 
     Missing axes remain absent (a sparse vector).  When ``allowed_axes`` is
-    provided, unknown names are rejected rather than silently discarded.
+    provided, unknown names are rejected rather than silently discarded unless
+    ``ignore_unknown_axes`` is explicitly enabled at an untrusted boundary such
+    as LLM extraction. Public setters should retain the strict default.
     """
     if not isinstance(value, Mapping):
         raise TypeError("emotional_shift must be an object mapping emotion names to numbers")
@@ -32,6 +35,8 @@ def emotion_vector(
         if not key:
             raise ValueError("emotion-vector keys must be non-empty strings")
         if allowed is not None and key not in allowed:
+            if ignore_unknown_axes:
+                continue
             raise ValueError(
                 f"unknown emotion axis {key!r}; allowed axes: {', '.join(sorted(allowed))}"
             )

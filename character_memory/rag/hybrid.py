@@ -12,9 +12,11 @@ for their BM25+similarity recall.
 import json
 import hashlib
 import os
+import threading
 import warnings
 from collections import OrderedDict
 from collections.abc import Hashable, Iterable
+from functools import wraps
 from typing import Any, Optional
 
 try:
@@ -39,6 +41,17 @@ DEFAULT_CLEANUP_MIN_DELETED = 64
 DEFAULT_CLEANUP_DELETED_RATIO = 0.25
 INDEX_META_SCHEMA_VERSION = 1
 INDEX_META_FILENAME = "index_meta.json"
+
+
+def _synchronized(method):
+    """Serialize access to one HybridSearch instance's positional state."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 def _matches(where: dict | None, meta: dict) -> bool:
@@ -80,6 +93,11 @@ class HybridSearch(RAGSystem):
         self._scoped_bm25_cache: OrderedDict[
             tuple[int, frozenset[int]], Optional[BM25Retriever]
         ] = OrderedDict()
+        # Nodes, BM25 and FAISS are one positional data structure.  A write
+        # must not interleave with another write (or a search): compaction can
+        # otherwise clear/remap nodes while an incremental add is embedding,
+        # leaving vectors and `_pos` values referring to different snapshots.
+        self._state_lock = threading.RLock()
 
     def _invalidate_scoped_search(self) -> None:
         self._index_revision += 1
@@ -93,6 +111,7 @@ class HybridSearch(RAGSystem):
         meta["_pos"] = idx
         return TextNode(text=chunk.text, metadata=meta)
 
+    @_synchronized
     def build(self, chunks: list[Chunk]) -> None:
         self._nodes = [self._chunk_to_node(c, i) for i, c in enumerate(chunks)]
         self._build_bm25()
@@ -100,11 +119,30 @@ class HybridSearch(RAGSystem):
         self._invalidate_scoped_search()
 
     @staticmethod
-    def _normalize_vectors(vecs: "np.ndarray") -> "np.ndarray":
+    def _normalize_vectors(
+        vecs: "np.ndarray", *, expected_count: Optional[int] = None
+    ) -> "np.ndarray":
         """Return contiguous row-wise unit vectors for cosine FAISS search."""
         arr = np.asarray(vecs, dtype="float32")
         if arr.ndim == 1:
+            if expected_count not in (None, 1):
+                raise ValueError(
+                    "Embedding provider returned one vector for "
+                    f"{expected_count} texts"
+                )
             arr = arr.reshape(1, -1)
+        if arr.ndim != 2:
+            raise ValueError(
+                "Embedding provider must return a two-dimensional array; "
+                f"got shape {arr.shape}"
+            )
+        if expected_count is not None and arr.shape[0] != expected_count:
+            raise ValueError(
+                "Embedding provider returned "
+                f"{arr.shape[0]} vectors for {expected_count} texts"
+            )
+        if arr.shape[1] == 0:
+            raise ValueError("Embedding provider returned zero-width vectors")
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms[norms == 0.0] = 1.0
         return np.ascontiguousarray(arr / norms)
@@ -117,36 +155,60 @@ class HybridSearch(RAGSystem):
         method = getattr(self.embedder, "embed_documents", None)
         return (method or self.embedder.embed)(texts)
 
+    @_synchronized
     def add_documents(self, chunks: list[Chunk]) -> None:
         if not chunks:
             return
         start = len(self._nodes)
         new_nodes = [self._chunk_to_node(c, start + i) for i, c in enumerate(chunks)]
         self._nodes.extend(new_nodes)
-        # Append dense vectors directly; rebuild the lexical index cheaply.
-        vecs = self._normalize_vectors(
-            self._embed_documents([n.text for n in new_nodes])
-        )
-        if self._index is None:
-            # Normal first-add path: use the vectors already calculated above
-            # instead of routing through _build_faiss and embedding them twice.
-            if start == 0:
-                index = faiss.IndexFlatIP(int(vecs.shape[1]))
-                index.add(np.ascontiguousarray(vecs))
-                self._index = index
+        try:
+            # Append dense vectors directly; rebuild the lexical index cheaply.
+            vecs = self._normalize_vectors(
+                self._embed_documents([n.text for n in new_nodes]),
+                expected_count=len(new_nodes),
+            )
+            if self._index is None:
+                # Normal first-add path: use the vectors already calculated above
+                # instead of routing through _build_faiss and embedding them twice.
+                if start == 0:
+                    index = faiss.IndexFlatIP(int(vecs.shape[1]))
+                    index.add(np.ascontiguousarray(vecs))
+                    self._index = index
+                else:
+                    # Defensive recovery for an inconsistent in-memory state with
+                    # nodes but no dense index. Rebuild one aligned snapshot. This
+                    # deliberately re-embeds the new batch: concatenating separate
+                    # responses is unsafe if the provider's dimension changed.
+                    warnings.warn(
+                        "HybridSearch found nodes without a dense index; "
+                        "rebuilding all document vectors.",
+                        stacklevel=3,
+                    )
+                    self._build_faiss()
             else:
-                # Defensive recovery for an inconsistent in-memory state with
-                # nodes but no dense index. Embed only the pre-existing nodes;
-                # the new batch's vectors are still reused.
-                old_vecs = self._normalize_vectors(
-                    self._embed_documents([n.text for n in self._nodes[:start]])
-                )
-                all_vecs = np.concatenate([old_vecs, vecs], axis=0)
-                index = faiss.IndexFlatIP(int(all_vecs.shape[1]))
-                index.add(np.ascontiguousarray(all_vecs))
-                self._index = index
-        else:
-            self._index.add(np.ascontiguousarray(vecs))
+                if (
+                    int(self._index.d) != int(vecs.shape[1])
+                    or int(self._index.ntotal) != start
+                ):
+                    # The live embedding service may change dimensions after an
+                    # index was loaded. Cardinality can likewise be stale after a
+                    # previously interrupted mutation. In either case positional
+                    # alignment requires rebuilding every node as one snapshot.
+                    warnings.warn(
+                        "HybridSearch dense index is incompatible with the new "
+                        "document vectors; rebuilding all document vectors.",
+                        stacklevel=3,
+                    )
+                    self._build_faiss()
+                else:
+                    self._index.add(np.ascontiguousarray(vecs))
+        except BaseException:
+            # SQLite remains the source of truth for structured memories. Do
+            # not also leave a failed incremental index mutation in memory;
+            # the next rebuild can recover the already-committed row cleanly.
+            del self._nodes[start:]
+            raise
         self._build_bm25()
         self._invalidate_scoped_search()
 
@@ -155,9 +217,11 @@ class HybridSearch(RAGSystem):
         return bool(node.metadata.get("_deleted", False))
 
     @property
+    @_synchronized
     def deleted_count(self) -> int:
         return sum(1 for node in self._nodes if self._is_deleted(node))
 
+    @_synchronized
     def delete_documents(self, ids: Iterable[Any]) -> int:
         """Tombstone every document matching an application metadata id.
 
@@ -185,6 +249,7 @@ class HybridSearch(RAGSystem):
         self._invalidate_scoped_search()
         return deleted
 
+    @_synchronized
     def cleanup(self) -> int:
         """Physically remove tombstones without re-embedding healthy vectors."""
         deleted = self.deleted_count
@@ -284,7 +349,8 @@ class HybridSearch(RAGSystem):
             self._index = None
             return
         vecs = self._normalize_vectors(
-            self._embed_documents([n.text for n in self._nodes])
+            self._embed_documents([n.text for n in self._nodes]),
+            expected_count=len(self._nodes),
         )
         dim = int(vecs.shape[1])
         index = faiss.IndexFlatIP(dim)
@@ -292,6 +358,7 @@ class HybridSearch(RAGSystem):
         self._index = index
 
     # SEARCH
+    @_synchronized
     def search(
         self,
         query: Query,
@@ -339,7 +406,38 @@ class HybridSearch(RAGSystem):
         # Embed every query text in one batch (one round-trip for the dense
         # pass regardless of how many messages are in the window).
         q_texts = [q for q, _ in queries]
-        q_vecs = self._normalize_vectors(self._embed_queries(q_texts))
+        q_vecs = self._normalize_vectors(
+            self._embed_queries(q_texts), expected_count=len(q_texts)
+        )
+        assert self._index is not None
+        if (
+            int(self._index.d) != int(q_vecs.shape[1])
+            or int(self._index.ntotal) != len(self._nodes)
+        ):
+            # Cover dimension drift that happens after load but before the
+            # next write, as well as interrupted legacy indexes with a stale
+            # vector count. Query and document vectors must share one live
+            # dimensionality before FAISS can search them.
+            warnings.warn(
+                "HybridSearch dense index is incompatible with the live "
+                "query vectors; rebuilding all document vectors.",
+                stacklevel=3,
+            )
+            self._build_faiss()
+            assert self._index is not None
+            if int(self._index.d) != int(q_vecs.shape[1]):
+                # An asymmetric provider may update its model state during
+                # document embedding. Refresh queries once before declaring
+                # the provider contract inconsistent.
+                q_vecs = self._normalize_vectors(
+                    self._embed_queries(q_texts), expected_count=len(q_texts)
+                )
+            if int(self._index.d) != int(q_vecs.shape[1]):
+                raise ValueError(
+                    "Embedding provider returned incompatible query and "
+                    f"document dimensions ({q_vecs.shape[1]} and "
+                    f"{self._index.d})"
+                )
 
         # Reciprocal Rank Fusion over result groups, weight-scaled. Normal
         # documents form one group per positional node. A memory may stamp
@@ -532,10 +630,12 @@ class HybridSearch(RAGSystem):
 
     # --------------------------------------------------------------- persist
     @property
+    @_synchronized
     def count(self) -> int:
         return len(self._nodes) - self.deleted_count
 
     @property
+    @_synchronized
     def documents(self) -> list[Chunk]:
         """Return all active indexed chunks."""
         return [
@@ -577,6 +677,7 @@ class HybridSearch(RAGSystem):
             "min_dense_similarity": self.min_dense_similarity,
         }
 
+    @_synchronized
     def persist(self, path: str) -> None:
         """Persist nodes + dense index to `path` atomically and cross-process safe.
 
@@ -624,6 +725,7 @@ class HybridSearch(RAGSystem):
             # file and mistake the transient count mismatch for corruption.
             os.replace(nodes_tmp, os.path.join(path, "nodes.json"))
 
+    @_synchronized
     def load(self, path: str) -> None:
         idx_file = os.path.join(path, "faiss.index")
         loaded: Optional[faiss.Index] = None

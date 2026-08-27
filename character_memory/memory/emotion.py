@@ -326,8 +326,22 @@ class EmotionStatus(Memory):
         mood = value.get("current_mood")
         changed = False
         if isinstance(mood, dict):
-            self.set_current_mood(mood)
-            changed = True
+            # Structured-output support varies across OpenAI-compatible
+            # models. Keep the public setter strict, but do not let a model's
+            # invented axis (for example ``annoyance``) abort every memory
+            # extracted from the turn.
+            clean_mood = emotion_vector(
+                mood,
+                allowed_axes=self.baseline,
+                ignore_unknown_axes=True,
+            )
+            # If every emitted axis was invented, preserve the prior mood
+            # rather than interpreting the filtered empty object as an
+            # absolute all-zero snapshot. A genuinely empty object retains
+            # the existing public semantics and resets configured axes.
+            if clean_mood or not mood:
+                self.set_current_mood(clean_mood)
+                changed = True
         changed_users: list[str] = []
         for entry in value.get("users") or []:
             if not isinstance(entry, dict):

@@ -181,8 +181,14 @@ class EpisodicMemory(StructuredMemory):
                 continue
             emotional_shift = e.get("emotional_shift", {})
             # Deliberately strict: scalar shifts are not part of this model.
+            # Unknown mapping keys are different: an OpenAI-compatible model
+            # may ignore ``additionalProperties: false`` and invent a close
+            # synonym such as ``annoyance``. Discard those at this untrusted
+            # boundary while keeping direct ``add_episode`` calls strict.
             emotional_shift = emotion_vector(
-                emotional_shift, allowed_axes=self.emotion_baseline
+                emotional_shift,
+                allowed_axes=self.emotion_baseline,
+                ignore_unknown_axes=True,
             )
             # Multi-user: attribute to the participant the LLM named, else the
             # caller's default user (the chat owner / current speaker).
