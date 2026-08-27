@@ -1875,6 +1875,10 @@ html.live-graph-embed .live-embed-toolbar {
   border: 2px solid var(--outline); border-radius: 14px; box-shadow: var(--shadow-sm);
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
+html.live-embed-no-toolbar .live-embed-toolbar { display: none !important; }
+html.live-embed-no-recalls #live-embed-recalls-btn,
+html.live-embed-no-recalls #live-embed-drawer,
+html.live-embed-no-recalls #live-embed-backdrop { display: none !important; }
 html.live-graph-embed .live-embed-connection {
   display: flex; align-items: center; flex: 0 1 auto; min-width: 0; gap: 7px;
   color: var(--text-dim); font: 700 10px var(--mono); white-space: nowrap;

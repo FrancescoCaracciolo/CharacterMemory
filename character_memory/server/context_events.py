@@ -177,7 +177,11 @@ class ContextEventBroker:
             lambda: deque(maxlen=self.max_events)
         )
         self._sequences: dict[str, int] = defaultdict(int)
-        self._subscribers: dict[str, set[queue.Queue[dict[str, Any]]]] = defaultdict(set)
+        # Keep the optional speaker filter with each queue so unrelated
+        # context payloads never enter that subscriber's replay/live stream.
+        self._subscribers: dict[
+            str, dict[queue.Queue[dict[str, Any]], Optional[str]]
+        ] = defaultdict(dict)
         self._lock = threading.RLock()
 
     def publish(self, character: str, event: dict[str, Any]) -> dict[str, Any]:
@@ -188,7 +192,11 @@ class ContextEventBroker:
             enriched["sequence"] = self._sequences[character]
             enriched["id"] = str(enriched["sequence"])
             self._history[character].append(enriched)
-            for subscriber in list(self._subscribers.get(character, ())):
+            for subscriber, user_filter in list(
+                self._subscribers.get(character, {}).items()
+            ):
+                if user_filter is not None and str(enriched.get("user") or "") != user_filter:
+                    continue
                 try:
                     try:
                         subscriber.put_nowait(enriched)
@@ -206,17 +214,28 @@ class ContextEventBroker:
                 except Exception:
                     # A malformed/disconnected subscriber is not allowed to
                     # affect this publish or any other browser.
-                    self._subscribers[character].discard(subscriber)
+                    self._subscribers[character].pop(subscriber, None)
             return enriched
 
     def subscribe(
-        self, character: str, last_event_id: Optional[str] = None
+        self,
+        character: str,
+        last_event_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> tuple[list[dict[str, Any]], queue.Queue[dict[str, Any]], Any]:
-        """Return replayable history, a live queue, and an unsubscribe callback."""
+        """Return replayable history, a queue, and an unsubscribe callback.
+
+        ``user_id`` filters by the event's current speaker. Sequence numbers
+        remain global per character, so filtered clients can legitimately see
+        gaps when other users generate requests.
+        """
         try:
             after = int(last_event_id or 0)
         except (TypeError, ValueError):
             after = 0
+        # Preserve the supplied value exactly: speaker matching is
+        # case-sensitive and does not normalize whitespace.
+        user_filter = str(user_id) if user_id not in (None, "") else None
         subscriber: queue.Queue[dict[str, Any]] = queue.Queue(
             maxsize=self.subscriber_queue_size
         )
@@ -225,15 +244,19 @@ class ContextEventBroker:
                 event
                 for event in self._history.get(character, ())
                 if int(event.get("sequence", 0)) > after
+                and (
+                    user_filter is None
+                    or str(event.get("user") or "") == user_filter
+                )
             ]
-            self._subscribers[character].add(subscriber)
+            self._subscribers[character][subscriber] = user_filter
 
         def unsubscribe() -> None:
             with self._lock:
                 subscribers = self._subscribers.get(character)
                 if subscribers is None:
                     return
-                subscribers.discard(subscriber)
+                subscribers.pop(subscriber, None)
                 if not subscribers:
                     self._subscribers.pop(character, None)
 
@@ -244,6 +267,36 @@ class ContextEventBroker:
             return list(self._history.get(character, ()))
 
 
+def project_context_event(
+    event: dict[str, Any], user_id: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """Project one event for an exact-speaker iframe subscription.
+
+    The graph snapshot was already privacy-scoped during context assembly.
+    For a filtered stream, retain only the selected speaker's graph entry so a
+    group event cannot expose alternate participant-labelled snapshots.
+    """
+    user_filter = str(user_id) if user_id not in (None, "") else None
+    if user_filter is None:
+        return event
+    if str(event.get("user") or "") != user_filter:
+        return None
+    projected = dict(event)
+    graphs = event.get("graphs")
+    # A normal graph payload has list-valued ``nodes``/``edges``. The live
+    # event shape is an outer user->graph mapping; checking the value type
+    # keeps a perfectly valid speaker id such as ``"nodes"`` unambiguous.
+    direct_graph = (
+        isinstance(graphs, dict)
+        and isinstance(graphs.get("nodes"), list)
+        and isinstance(graphs.get("edges"), list)
+    )
+    if isinstance(graphs, dict) and not direct_graph:
+        selected = graphs.get(user_filter)
+        projected["graphs"] = {user_filter: selected} if selected is not None else {}
+    return projected
+
+
 def sse_event(event: dict[str, Any]) -> str:
     payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
     return f"id: {event['id']}\nevent: context\ndata: {payload}\n\n"
@@ -252,6 +305,7 @@ def sse_event(event: dict[str, Any]) -> str:
 __all__ = [
     "ContextEventBroker",
     "build_context_event",
+    "project_context_event",
     "item_payload",
     "sse_event",
 ]

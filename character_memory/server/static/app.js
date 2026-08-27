@@ -1275,6 +1275,115 @@ const GRAPH_SETTINGS = {
 };
 const GRAPH_SETTINGS_DEFAULTS = { ...GRAPH_SETTINGS };
 
+// URL options are deliberately scoped to the iframe surface. They override
+// local preferences for this page only; the normal GUI continues using the
+// persisted GRAPH_SETTINGS values.
+const EMBED_NUMERIC_OPTIONS = {
+  repulsion: [500, 8000],
+  link_distance: [30, 220],
+  gravity: [0, 0.06],
+  particle_speed: [0, 3],
+  label_zoom: [1.2, 4],
+};
+const EMBED_COLOR_OPTIONS = {
+  color_bg: ["--bg", "--graph-a", "--graph-b"],
+  color_label: ["--graph-label"],
+  color_label_shadow: ["--graph-label-shadow"],
+  color_ink: ["--graph-ink"],
+  color_muted: ["--graph-muted"],
+  color_muted_edge: ["--graph-muted-edge"],
+  color_self: ["--graph-node-self"],
+  color_person: ["--graph-node-person"],
+  color_fact: ["--graph-node-fact"],
+  color_episode: ["--graph-node-episode"],
+  color_entity: ["--graph-node-entity"],
+  color_node: ["--graph-node-default"],
+  color_relation_edge: ["--graph-edge-relation"],
+  color_fact_edge: ["--graph-edge-fact"],
+  color_episode_edge: ["--graph-edge-episode"],
+  color_transition_edge: ["--graph-edge-transition"],
+  color_cooccurrence_edge: ["--graph-edge-cooccurrence"],
+  color_edge: ["--graph-edge-default"],
+};
+
+function embedQuery() {
+  return LIVE_GRAPH_EMBED ? new URLSearchParams(location.search) : null;
+}
+
+function embedNumber(query, key, min, max) {
+  if (!query || !query.has(key)) return null;
+  const raw = String(query.get(key) || "").trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? clamp(value, min, max) : null;
+}
+
+function embedBoolean(query, key) {
+  if (!query || !query.has(key)) return null;
+  const value = String(query.get(key) || "").trim().toLowerCase();
+  if (value === "1") return true;
+  if (value === "0") return false;
+  return null;
+}
+
+function embedColor(query, key) {
+  if (!query || !query.has(key)) return null;
+  const raw = String(query.get(key) || "").trim().replace(/^#/, "");
+  // Only fixed six-digit hex is accepted: never put arbitrary URL text into
+  // a CSS declaration. A literal leading '#' must be URL-encoded by callers.
+  return /^[0-9a-f]{6}$/i.test(raw) ? `#${raw}` : null;
+}
+
+function readEmbedOptions() {
+  const query = embedQuery();
+  const numeric = {};
+  for (const [key, [min, max]] of Object.entries(EMBED_NUMERIC_OPTIONS)) {
+    const value = embedNumber(query, key, min, max);
+    if (value != null) numeric[key] = value;
+  }
+  const colors = {};
+  for (const key of Object.keys(EMBED_COLOR_OPTIONS)) {
+    const value = embedColor(query, key);
+    if (value != null) colors[key] = value;
+  }
+  const theme = query && query.has("theme")
+    ? String(query.get("theme") || "").trim().toLowerCase() : "";
+  return {
+    // Speaker filters are exact/case-sensitive; do not normalize whitespace.
+    user: query ? String(query.get("user") || "") : "",
+    theme: ["system", "light", "dark"].includes(theme) ? theme : null,
+    toolbar: embedBoolean(query, "toolbar"),
+    recalls: embedBoolean(query, "recalls"),
+    numeric,
+    colors,
+  };
+}
+const EMBED_OPTIONS = readEmbedOptions();
+
+function applyEmbedOptions() {
+  if (!LIVE_GRAPH_EMBED) return;
+  if (EMBED_OPTIONS.theme) {
+    const resolved = EMBED_OPTIONS.theme === "system"
+      ? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+      : EMBED_OPTIONS.theme;
+    applyTheme(resolved, { persist: false });
+  }
+  for (const [key, value] of Object.entries(EMBED_OPTIONS.numeric)) {
+    const setting = {
+      link_distance: "linkDistance",
+      particle_speed: "particleSpeed",
+      label_zoom: "labelZoom",
+    }[key] || key;
+    GRAPH_SETTINGS[setting] = value;
+  }
+  const root = document.documentElement;
+  for (const [key, value] of Object.entries(EMBED_OPTIONS.colors)) {
+    for (const variable of EMBED_COLOR_OPTIONS[key] || []) root.style.setProperty(variable, value);
+  }
+  root.classList.toggle("live-embed-no-toolbar", EMBED_OPTIONS.toolbar === false);
+  root.classList.toggle("live-embed-no-recalls", EMBED_OPTIONS.recalls === false);
+}
+
 // Persist graph UI choices (settings + full mode + panel visibility) so they
 // survive reloads. Best-effort: ignored if localStorage is unavailable.
 const GRAPH_UI_KEY = "cm_graph_ui_v1";
@@ -2292,6 +2401,8 @@ function liveUrl() {
 function liveEmbedUrl() {
   const params = new URLSearchParams();
   if (state.character) params.set("character", state.character);
+  const selected = state.live.events.get(state.live.selectedId);
+  if (selected && selected.user) params.set("user", selected.user);
   return `${LIVE_GRAPH_EMBED_PATH}${params.toString() ? "?" + params.toString() : ""}`;
 }
 
@@ -2337,7 +2448,11 @@ function connectLiveStream() {
   }
   liveSetConnection("connecting", "Connecting to /context…");
   // EventSource cannot send headers, so the API key rides the query string.
-  const source = new EventSource(authQuery(`${API}/api/context-events/${encodeURIComponent(state.character)}`));
+  const streamParams = new URLSearchParams();
+  if (LIVE_GRAPH_EMBED && EMBED_OPTIONS.user) streamParams.set("user", EMBED_OPTIONS.user);
+  let streamUrl = `${API}/api/context-events/${encodeURIComponent(state.character)}`;
+  if (streamParams.toString()) streamUrl += `?${streamParams}`;
+  const source = new EventSource(authQuery(streamUrl));
   state.live.source = source;
   source.onopen = () => liveSetConnection("connected", "Listening for /context");
   source.onerror = () => {
@@ -2346,6 +2461,11 @@ function connectLiveStream() {
   const receiveContext = (event) => {
     let payload;
     try { payload = JSON.parse(event.data); } catch (error) { return; }
+    if (!payload || typeof payload !== "object") return;
+    // The server applies the same exact-speaker filter, but keep the iframe
+    // boundary defensive in case an intermediary replays an unrestricted SSE.
+    if (LIVE_GRAPH_EMBED && EMBED_OPTIONS.user &&
+        String(payload.user || "") !== EMBED_OPTIONS.user) return;
     const id = String(payload.id || payload.sequence || "");
     if (!id || state.live.events.has(id)) return;
     state.live.events.set(id, payload);
@@ -2619,6 +2739,7 @@ function updateLiveEmbedSummary(event) {
 
 function renderLiveEvent(event) {
   if (!event) return;
+  updateLiveEmbedLink();
   const request = $("live-request"); clear(request); request.classList.remove("hidden");
   request.appendChild(el("div", { class: "live-request-title" }, [
     el("strong", {}, `${event.character || state.character} · /context`),
@@ -2845,6 +2966,9 @@ async function init() {
   // The markup starts closed; this selectively restores a saved graph panel
   // state and settings before the controls are first wired/rendered.
   loadGraphUI();
+  // Query-string values are iframe-only and intentionally win over local
+  // preferences without writing anything back to storage.
+  applyEmbedOptions();
   wireLiveControls();
   wireLiveEmbedControls();
   wireApiKeyDialog();

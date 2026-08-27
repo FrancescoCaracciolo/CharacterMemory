@@ -262,7 +262,8 @@ class KnowledgeGraphRetriever:
         auto-increment ids (`fact:<n>`, `episode:<n>`) make collisions across
         re-ingests unlikely (call :meth:`reset` first for a clean rebuild).
         """
-        mems = {getattr(m, "name", None): m for m in memories}
+        memory_list = list(memories)
+        mems = {getattr(m, "name", None): m for m in memory_list}
 
         # Summaries first so person resolution works during fact ingestion.
         known_users: list[str] = []
@@ -311,8 +312,15 @@ class KnowledgeGraphRetriever:
                 ),
             )
 
-        character_info = mems.get("character_info")
-        if isinstance(character_info, CharacterInfoMemory):
+        character_info = next(
+            (
+                memory
+                for memory in memory_list
+                if isinstance(memory, CharacterInfoMemory)
+            ),
+            None,
+        )
+        if character_info is not None:
             self.ingest_wiki(
                 self._character_info_sections(character_info),
                 _on_llm_request_done=_on_llm_request_done,

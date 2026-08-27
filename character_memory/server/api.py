@@ -87,6 +87,7 @@ from .sync import MemorySync
 from .context_events import (
     ContextEventBroker,
     build_context_event,
+    project_context_event,
     sse_event,
 )
 
@@ -384,11 +385,15 @@ def context(req: ContextRequest) -> ContextResponse:
 def context_events(
     character: str,
     last_event_id: Optional[str] = Header(None, alias="Last-Event-ID"),
+    user: Optional[str] = Query(
+        None,
+        description="Only stream context updates whose current speaker matches this user.",
+    ),
 ) -> StreamingResponse:
     """Stream recent and future `/context` recall snapshots for the GUI."""
     _get_agent(character)
     replay, subscriber, unsubscribe = CONTEXT_EVENTS.subscribe(
-        character, last_event_id=last_event_id
+        character, last_event_id=last_event_id, user_id=user
     )
 
     def stream():
@@ -397,14 +402,18 @@ def context_events(
             # browser enters its listening state before the first request.
             yield ": connected\n\n"
             for event in replay:
-                yield sse_event(event)
+                projected = project_context_event(event, user)
+                if projected is not None:
+                    yield sse_event(projected)
             while True:
                 try:
                     event = subscriber.get(timeout=15.0)
                 except queue.Empty:
                     yield ": keep-alive\n\n"
                     continue
-                yield sse_event(event)
+                projected = project_context_event(event, user)
+                if projected is not None:
+                    yield sse_event(projected)
         finally:
             unsubscribe()
 
