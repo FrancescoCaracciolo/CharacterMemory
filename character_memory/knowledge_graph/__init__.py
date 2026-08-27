@@ -23,7 +23,6 @@ from .edges import (
     FactEdge,
     RelationEdge,
     TransitionEdge,
-    WikiAssociationEdge,
     edge_from_dict,
 )
 from .graph import KnowledgeGraph, slugify
@@ -76,7 +75,6 @@ __all__ = [
     "RelationEdge",
     "FactEdge",
     "TransitionEdge",
-    "WikiAssociationEdge",
     "EpisodeEdge",
     "CoOccurrenceEdge",
     "edge_from_dict",

@@ -15,9 +15,10 @@ Ingestion drivers, one per source memory family:
 - :func:`ingest_episodes` — one EpisodeNode per `episodic` row plus
   EpisodeEdges to every participant.
 - :func:`ingest_wiki` — flat, no-LLM fallback: header chunks -> FactNodes.
-- :func:`ingest_wiki_llm` — typed wiki ingest: sections -> internal FactNodes
-  (provenance anchors) + PersonNodes (relevant characters) + EntityNodes
-  (named things) + EpisodeNodes (story events).
+- :func:`ingest_wiki_llm` — semantic wiki ingest: sections -> internal
+  FactNodes (provenance anchors), atomic visible FactNodes, scored
+  PersonNodes/RelationEdges, EntityNodes (named things), and EpisodeNodes
+  (story events).
 
 Entity/people extraction is **context-aware and relevance-filtered**. Both the
 fact-extraction and wiki-extraction prompts are told:
@@ -56,7 +57,6 @@ from .edges import (
     EpisodeEdge,
     FactEdge,
     RelationEdge,
-    WikiAssociationEdge,
 )
 from .graph import KnowledgeGraph, slugify
 from .nodes import EntityNode, EpisodeNode, FactNode, Node, PersonNode
@@ -432,6 +432,7 @@ def ingest_emotion(
             trust=float(state.get("trust", 0.0)),
             affection=float(state.get("affection", 0.0)),
             comment=comment or "",
+            provenance="emotion",
         )
         stored = graph.upsert_edge(edge)
         # Relationship state is mutable source data. Unlike learned edge
@@ -443,6 +444,7 @@ def ingest_emotion(
             stored.trust = edge.trust
             stored.affection = edge.affection
             stored.comment = edge.comment
+            stored.provenance = "emotion"
 
 
 # -------------------------------------------------------------------- summaries
@@ -790,7 +792,13 @@ def wire_chat_edges(graph: KnowledgeGraph, *, weight: float = 0.1) -> None:
 
 # ----------------------------------------------------------------------- wiki
 def _drop_wiki_projection(graph: KnowledgeGraph) -> None:
-    """Remove the refreshable wiki-derived projection from ``graph``."""
+    """Remove the refreshable wiki-derived projection from ``graph``.
+
+    Wiki facts and episodes are immutable graph projections of the current
+    character-info chunks, so their incident native edges are removed with
+    the nodes.  Wiki-only people/entities and wiki-owned relationship edges
+    are also retired; canonical nodes shared with another source survive.
+    """
     for node in list(graph.nodes.values()):
         if (node.source or "").startswith("wiki:") and node.kind in (
             "fact",
@@ -798,10 +806,24 @@ def _drop_wiki_projection(graph: KnowledgeGraph) -> None:
         ):
             graph.remove_node(node.id)
     for edge in list(graph.edges.values()):
-        if not isinstance(edge, WikiAssociationEdge):
-            continue
-        if any(source.startswith("wiki:") for source in edge.sources):
+        if isinstance(edge, RelationEdge) and edge.provenance == "wiki":
             graph.remove_edge(edge.id)
+    for node in list(graph.nodes.values()):
+        if not isinstance(node, (PersonNode, EntityNode)):
+            continue
+        wiki_refs = [
+            ref for ref in (node.external_refs or []) if ref.startswith("wiki:")
+        ]
+        if not wiki_refs:
+            continue
+        node.external_refs = [
+            ref for ref in (node.external_refs or []) if not ref.startswith("wiki:")
+        ]
+        if node.memory_owners or node.source or node.external_refs:
+            continue
+        # A wiki-only canonical node has no remaining source after its wiki
+        # references and incident wiki projection edges are removed.
+        graph.remove_node(node.id)
 
 
 def ingest_wiki(
@@ -847,9 +869,9 @@ def ingest_wiki(
                 kind="fact",
                 src=graph.SELF_ID,
                 dst=fid,
-                weight=0.5,
+                weight=max(0.3, min(1.0, 0.3 + 0.7 * _clip(sec.get("importance", 0.6)))),
                 confidence=0.9,
-                importance=0.6,
+                importance=_clip(sec.get("importance", 0.6)),
                 timestamp=now,
             )
         )
@@ -857,90 +879,116 @@ def ingest_wiki(
 
 
 # ------------------------------------------------------------------- wiki (LLM)
-# Structured person extraction: each relevant character becomes ONE node
-# keyed by a stable canonical `key`, with all its names folded into
-# `aliases`. `relevance` drives the keep/drop decision (background /
-# mentioned-only people are dropped — this excludes famous people referenced
-# in passing unless they are genuinely part of the story).
-_WIKI_EXTRACTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "sections": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "index": {"type": "integer"},
-                    "is_event": {
-                        "type": "boolean",
-                        "description": "true if this section describes a story event / episode / chapter",
-                    },
-                    "event_summary": {
-                        "type": "string",
-                        "description": "one-sentence summary of the event, if is_event",
-                    },
-                    "persons": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "key": {
-                                    "type": "string",
-                                    "description": (
-                                        "a stable canonical identifier for this person, "
-                                        "lowercase, no spaces (e.g. 'okabe'). Reuse the same "
-                                        "key across sections so the same person becomes one node."
-                                    ),
-                                },
-                                "existing_id": {
-                                    "type": "string",
-                                    "description": (
-                                        "Stable person id from the existing graph "
-                                        "catalog; empty only for a genuinely new person."
-                                    ),
-                                },
-                                "name": {"type": "string", "description": "the most formal / complete name"},
-                                "aliases": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "every other name/nickname used for this person",
-                                },
-                                "relevance": {
-                                    "type": "string",
-                                    "description": "protagonist | close | supporting | background | mentioned",
-                                },
-                            },
-                            "required": ["key", "name", "relevance", "existing_id"],
+# Structured wiki extraction is deliberately richer than the old typed
+# projection.  The source chunk remains an internal anchor, while the LLM
+# emits short semantic facts and a scored event projection that can be wired
+# with the graph's native FactEdge/EpisodeEdge/RelationEdge types.
+_WIKI_EMOTION_DEFAULT_AXES = (
+    "neutral", "joy", "sadness", "anxiety", "anger", "surprise"
+)
+
+
+def _wiki_extraction_schema(emotion_axes: Iterable[str]) -> dict[str, Any]:
+    """Build the wiki schema with the character's configured emotion axes."""
+    shift_schema = {
+        "type": "object",
+        "properties": {
+            axis: {"type": "number", "minimum": 0, "maximum": 1}
+            for axis in emotion_axes
+        },
+        "additionalProperties": False,
+    }
+    relation_schema = {
+        "type": "object",
+        "properties": {
+            "valence": {"type": "number", "minimum": -1, "maximum": 1},
+            "trust": {"type": "number", "minimum": -1, "maximum": 1},
+            "affection": {"type": "number", "minimum": -1, "maximum": 1},
+            "comment": {"type": "string"},
+        },
+        "required": ["valence", "trust", "affection", "comment"],
+        "additionalProperties": False,
+    }
+    person_schema = {
+        "type": "object",
+        "properties": {
+            "key": {"type": "string"},
+            "existing_id": {"type": "string"},
+            "name": {"type": "string"},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "relevance": {"type": "string"},
+            "relation": relation_schema,
+        },
+        "required": [
+            "key", "name", "aliases", "relevance", "existing_id", "relation"
+        ],
+        "additionalProperties": False,
+    }
+    entity_schema = {
+        "type": "object",
+        "properties": {
+            "key": {"type": "string"},
+            "name": {"type": "string"},
+            "existing_id": {"type": "string"},
+            "kind": {"type": "string"},
+        },
+        "required": ["key", "name", "kind", "existing_id"],
+        "additionalProperties": False,
+    }
+    fact_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string"},
+            "importance": {"type": "number", "minimum": 0, "maximum": 1},
+            "self_included": {"type": "boolean"},
+            "person_keys": {"type": "array", "items": {"type": "string"}},
+            "entity_keys": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "content", "importance", "self_included", "person_keys", "entity_keys"
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "self_present": {"type": "boolean"},
+                        "section_importance": {
+                            "type": "number", "minimum": 0, "maximum": 1
                         },
-                    },
-                    "entities": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "existing_id": {
-                                    "type": "string",
-                                    "description": (
-                                        "Stable entity id from the existing graph "
-                                        "catalog; empty only for a genuinely new entity."
-                                    ),
-                                },
-                                "kind": {
-                                    "type": "string",
-                                    "description": "place | organization | object | concept",
-                                },
-                            },
-                            "required": ["name", "kind", "existing_id"],
+                        "persons": {"type": "array", "items": person_schema},
+                        "entities": {"type": "array", "items": entity_schema},
+                        "facts": {"type": "array", "items": fact_schema},
+                        "is_event": {"type": "boolean"},
+                        "event_summary": {"type": "string"},
+                        "event_importance": {
+                            "type": "number", "minimum": 0, "maximum": 1
                         },
+                        "event_self_participates": {"type": "boolean"},
+                        "event_participant_keys": {
+                            "type": "array", "items": {"type": "string"}
+                        },
+                        "emotional_shift": shift_schema,
                     },
+                    "required": [
+                        "index", "self_present", "section_importance", "persons",
+                        "entities", "facts", "is_event", "event_summary",
+                        "event_importance", "event_self_participates",
+                        "event_participant_keys", "emotional_shift",
+                    ],
+                    "additionalProperties": False,
                 },
-                "required": ["index", "is_event", "persons", "entities"],
-            },
-        }
-    },
-    "required": ["sections"],
-}
+            }
+        },
+        "required": ["sections"],
+        "additionalProperties": False,
+    }
 
 # Only people at these relevance levels get a node. `background` and
 # `mentioned` are dropped (covers famous people referenced in passing).
@@ -962,7 +1010,9 @@ _WIKI_EXTRACTION_PROMPT = (
     "Einstein, Mozart, etc. — unless they are genuinely part of the story).\n"
     "   Reuse the SAME `key` across sections for the same person. If the person "
     "is in the catalog below, copy its exact id into `existing_id` instead of "
-    "minting a variant.\n"
+    "minting a variant. Also estimate the character's relationship to that person "
+    "from this source only: signed valence/trust/affection in [-1,1] and a short "
+    "comment; use zero and an empty comment when the source gives no signal.\n"
     "2. ENTITIES — *named, distinctive* things in the character's world only: "
     "places, organizations, objects, concepts. Same rule as facts: the Phonewave / "
     "IBN 5100 / D-Mail / Future Gadget Lab are entities; a generic microwave / "
@@ -970,8 +1020,15 @@ _WIKI_EXTRACTION_PROMPT = (
     "place | organization | object | concept. If a catalog entity is the same "
     "thing under an abbreviation, nickname, capitalization, or longer/shorter "
     "name, return its exact `existing_id`; never invent an id.\n"
-    "3. is_event — true if the section describes a story event/episode; if so, a "
-    "one-sentence event_summary.\n\n"
+    "3. FACTS — split the section into short, self-contained semantic facts. "
+    "For each, calculate importance in [0,1], set `self_included` only when the "
+    "fact is about or directly involves the character, and reference people/entities "
+    "using their exact keys. Do not copy the full source chunk into a fact.\n"
+    "4. is_event — true if the section describes a story event/episode; if so, give "
+    "a non-empty one-sentence event_summary, importance, participant keys, and the "
+    "character's sparse emotional_shift on the configured axes. Set the shift to "
+    "{{}} when the character does not participate. `self_present` controls only the "
+    "section anchor; `event_self_participates` controls the Self→EpisodeEdge.\n\n"
     "{state_clause}"
     "Keep only specifically named elements. Respond ONLY with the JSON object "
     "described by the schema."
@@ -984,10 +1041,27 @@ def _extract_wiki_batch(
     *,
     graph: KnowledgeGraph,
     character: Optional[CharacterContext] = None,
+    emotion_axes: Iterable[str] = _WIKI_EMOTION_DEFAULT_AXES,
     _on_llm_request_done: Optional[Callable[[], None]] = None,
 ) -> dict[int, dict[str, Any]]:
-    """LLM-extract persons/entities/events for one batch of (index, text)."""
-    empty = {i: {"is_event": False, "persons": [], "entities": []} for i, _ in batch}
+    """LLM-extract semantic wiki facts, people, entities and one event."""
+    axes = tuple(str(axis) for axis in emotion_axes if str(axis).strip())
+    empty = {
+        i: {
+            "self_present": False,
+            "section_importance": 0.6,
+            "is_event": False,
+            "event_summary": "",
+            "event_importance": 0.6,
+            "event_self_participates": False,
+            "event_participant_keys": [],
+            "emotional_shift": {},
+            "persons": [],
+            "entities": [],
+            "facts": [],
+        }
+        for i, _ in batch
+    }
     if not batch or llm is None:
         return empty
     numbered = [f"{i}. {t}" for i, t in batch]
@@ -1000,14 +1074,18 @@ def _extract_wiki_batch(
         {"role": "user", "content": "Sections:\n" + "\n".join(numbered)},
     ]
     try:
-        result = llm.chat_structured(messages, _WIKI_EXTRACTION_SCHEMA)
+        result = llm.chat_structured(messages, _wiki_extraction_schema(axes))
     except Exception:
         return empty
     finally:
         if _on_llm_request_done is not None:
             _on_llm_request_done()
+    if not isinstance(result, dict):
+        return empty
     out: dict[int, dict[str, Any]] = {}
     for entry in result.get("sections", []) or []:
+        if not isinstance(entry, dict):
+            continue
         try:
             idx = int(entry.get("index"))
         except (TypeError, ValueError):
@@ -1026,12 +1104,21 @@ def _extract_wiki_batch(
             existing_id = str(p.get("existing_id") or "").strip()
             if not isinstance(graph.nodes.get(existing_id), PersonNode):
                 existing_id = ""
+            relation = p.get("relation") if isinstance(p.get("relation"), dict) else {}
+            if not relation:
+                relation = p
             persons.append({
                 "key": key,
                 "name": name,
                 "aliases": aliases,
                 "relevance": relevance,
                 "existing_id": existing_id,
+                "relation": {
+                    "valence": _clip(relation.get("valence", 0.0), -1.0, 1.0, 0.0),
+                    "trust": _clip(relation.get("trust", 0.0), -1.0, 1.0, 0.0),
+                    "affection": _clip(relation.get("affection", 0.0), -1.0, 1.0, 0.0),
+                    "comment": str(relation.get("comment") or "").strip(),
+                },
             })
         entities: list[dict[str, str]] = []
         for e in entry.get("entities") or []:
@@ -1044,16 +1131,108 @@ def _extract_wiki_batch(
                     existing_id = str(e.get("existing_id") or "").strip()
                     if not isinstance(graph.nodes.get(existing_id), EntityNode):
                         existing_id = ""
+                    key = str(e.get("key") or slugify(name)).strip().lower()
                     entities.append({
+                        "key": key,
                         "name": name,
                         "kind": kind,
                         "existing_id": existing_id,
                     })
+        facts: list[dict[str, Any]] = []
+        for f in entry.get("facts") or []:
+            if not isinstance(f, dict):
+                continue
+            content = str(
+                f.get("content") or f.get("text") or f.get("summary") or ""
+            ).strip()
+            if not content:
+                continue
+            raw_people = f.get("person_keys") or f.get("persons") or f.get("participants") or []
+            raw_entities = f.get("entity_keys") or f.get("entities") or []
+            person_keys: list[str] = []
+            for ref in raw_people:
+                if isinstance(ref, dict):
+                    ref = ref.get("key") or ref.get("id") or ref.get("name")
+                if str(ref).strip():
+                    person_keys.append(str(ref).strip().lower())
+            entity_keys: list[str] = []
+            for ref in raw_entities:
+                if isinstance(ref, dict):
+                    ref = ref.get("key") or ref.get("id") or ref.get("name")
+                if str(ref).strip():
+                    entity_keys.append(str(ref).strip().lower())
+            subject = str(f.get("subject") or "").strip()
+            self_included = bool(
+                f.get("self_included", f.get("involves_self", False))
+            )
+            if subject and _is_self_name(subject, [], character):
+                self_included = True
+            elif subject:
+                person_keys.append(subject.lower())
+            facts.append({
+                "content": content,
+                "importance": _clip(f.get("importance", 0.6)),
+                "self_included": self_included,
+                "person_keys": list(dict.fromkeys(
+                    k for k in person_keys if k
+                )),
+                "entity_keys": list(dict.fromkeys(
+                    k for k in entity_keys if k
+                )),
+            })
+        try:
+            emotional_shift = decode_emotion_vector(
+                entry.get("emotional_shift")
+                or entry.get("event_emotional_shift")
+                or {},
+                allowed_axes=axes,
+            )
+        except (TypeError, ValueError):
+            emotional_shift = {}
+        event_self_participates = bool(
+            entry.get(
+                "event_self_participates",
+                entry.get("self_participates", entry.get("self_included", False)),
+            )
+        )
+        if not event_self_participates:
+            emotional_shift = {}
         out[idx] = {
+            "self_present": bool(
+                entry.get("self_present", entry.get("character_present", False))
+            ),
+            "section_importance": _clip(
+                entry.get("section_importance", entry.get("importance", 0.6))
+            ),
             "is_event": bool(entry.get("is_event")),
-            "event_summary": str(entry.get("event_summary") or "").strip(),
+            "event_summary": str(
+                entry.get("event_summary") or entry.get("summary") or ""
+            ).strip(),
+            "event_importance": _clip(
+                entry.get("event_importance", entry.get("importance", 0.6))
+            ),
+            "event_self_participates": event_self_participates,
+            "event_participant_keys": list(dict.fromkeys(
+                str(
+                    k.get("key") or k.get("id") or k.get("name")
+                    if isinstance(k, dict)
+                    else k
+                ).strip().lower()
+                for k in (
+                    entry.get("event_participant_keys")
+                    or entry.get("participants")
+                    or []
+                )
+                if str(
+                    k.get("key") or k.get("id") or k.get("name")
+                    if isinstance(k, dict)
+                    else k
+                ).strip()
+            )),
+            "emotional_shift": emotional_shift,
             "persons": persons,
             "entities": entities,
+            "facts": facts,
         }
     out.update({i: empty[i] for i, _ in batch if i not in out})
     return out
@@ -1069,25 +1248,19 @@ def ingest_wiki_llm(
     character: Optional[CharacterContext] = None,
     _on_llm_request_done: Optional[Callable[[], None]] = None,
 ) -> list[str]:
-    """LLM wiki ingest: sections -> FactNodes + PersonNodes + EntityNodes + EpisodeNodes.
+    """Build a native semantic graph from LLM-extracted wiki sections.
 
-    Each header-chunked wiki section becomes an internal
-    ``FactNode(type='wiki')`` linked to the SelfNode (so it can support
-    provenance and activation without surfacing the full chunk). An LLM then
-    extracts, per section: relevant **people** (``PersonNode``, keyed by a
-    canonical key with aliases merged, only protagonist/close/supporting kept),
-    named **entities** (``EntityNode`` — place/org/object/concept; generic
-    nouns dropped), and story **events** (``EpisodeNode``). All extracted nodes
-    are wired to the section anchor and to each other with refreshable
-    wiki-association edges, so the wiki becomes a typed subgraph rather than
-    flat public fact chunks. Idempotent: prior ``wiki:*`` facts/episodes and
-    associations are dropped first; person/entity nodes dedupe by key/name and
-    are preserved.
+    Each section keeps one hidden full-text FactNode as a provenance anchor.
+    The LLM additionally emits atomic visible facts, relevant people/entities,
+    and an optional scored episode.  All topology uses the native relation,
+    fact, and episode edge types; no source-specific association edge exists.
     """
     _drop_wiki_projection(graph)
     items = list(enumerate(sections))
     if not items:
         return []
+    self_node = graph.ensure_self()
+    emotion_axes = tuple(getattr(self_node, "baseline", {}) or _WIKI_EMOTION_DEFAULT_AXES)
     extractions: dict[int, dict[str, Any]] = {}
     batches = _batch_by_limits(
         items,
@@ -1101,6 +1274,7 @@ def ingest_wiki_llm(
             [(i, sec.get("text", "")) for i, sec in sub],
             graph=graph,
             character=character,
+            emotion_axes=emotion_axes,
             _on_llm_request_done=_on_llm_request_done,
         )
         extractions.update(batch_extractions)
@@ -1126,6 +1300,7 @@ def ingest_wiki_llm(
                     existing_id=person_data.get("existing_id", ""),
                 )
                 graph.mark_character_scope(person)
+                graph.bind_external_ref(person, f"wiki:person:{person_data['key']}")
             for entity_data in ext.get("entities", []):
                 entity = graph.ensure_entity(
                     entity_data["name"],
@@ -1133,6 +1308,9 @@ def ingest_wiki_llm(
                     existing_id=entity_data.get("existing_id", ""),
                 )
                 graph.mark_character_scope(entity)
+                graph.bind_external_ref(
+                    entity, f"wiki:entity:{entity_data.get('key') or slugify(entity_data['name'])}"
+                )
 
     created_fact_ids: list[str] = []
     now = _now()
@@ -1142,6 +1320,8 @@ def ingest_wiki_llm(
             continue
         header = str(sec.get("header") or "").strip()
         source = str(sec.get("source") or "wiki")
+        section_source = f"wiki:{source}:{header}"
+        section_importance = _clip(ext.get("section_importance", 0.6))
         fid = graph.next_id("fact")
         fact = FactNode(
             id=fid,
@@ -1150,33 +1330,25 @@ def ingest_wiki_llm(
             content=text,
             type="wiki",
             confidence=0.9,
-            importance=0.6,
+            importance=section_importance,
             created_at=now,
-            source=f"wiki:{source}:{header}",
+            source=section_source,
             practice_times=[now],
             internal=True,
         )
         graph.add_node(fact)
         graph.mark_character_scope(fact)
         created_fact_ids.append(fid)
-        graph.upsert_edge(
-            FactEdge(
-                id="",
-                kind="fact",
-                src=graph.SELF_ID,
-                dst=fid,
-                weight=0.5,
-                confidence=0.9,
-                importance=0.6,
-                timestamp=now,
-            )
-        )
         ext = extractions.get(i, {})
         person_ids: list[str] = []
-        entity_ids: list[str] = []
+        person_by_key: dict[str, str] = {}
+        relation_data: dict[str, dict[str, Any]] = {}
         # Relevant people -> PersonNode (canonical key, aliases merged). The
         # SelfNode's own character is represented by `self`, not a person node.
         for p in ext.get("persons", []):
+            person_by_key[p["key"]] = graph.SELF_ID if _looks_like_self(
+                graph, p["name"], p.get("aliases") or [], character
+            ) else ""
             if p.get("relevance") not in _WIKI_KEEP_RELEVANCE:
                 continue
             key = p["key"]
@@ -1185,6 +1357,7 @@ def ingest_wiki_llm(
             # Avoid minting a person node for the character themselves: they
             # are already the SelfNode.
             if _looks_like_self(graph, name, aliases, character):
+                person_by_key[key] = graph.SELF_ID
                 continue
             person = graph.ensure_person_by_key(
                 key,
@@ -1193,19 +1366,42 @@ def ingest_wiki_llm(
                 existing_id=p.get("existing_id", ""),
             )
             graph.mark_character_scope(person)
-            graph.upsert_edge(
-                FactEdge(
-                    id="",
-                    kind="fact",
-                    src=person.id,
-                    dst=fid,
-                    weight=0.5,
-                    confidence=0.9,
-                    importance=0.6,
-                    timestamp=now,
-                )
-            )
+            person_by_key[key] = person.id
             person_ids.append(person.id)
+            relation_data[person.id] = p.get("relation") or {}
+            graph.bind_external_ref(person, f"wiki:person:{key}")
+        # Establish or refresh a native relationship to every relevant person.
+        for pid, rel in relation_data.items():
+            existing = graph.get_edge_between("relation", graph.SELF_ID, pid)
+            if isinstance(existing, RelationEdge) and existing.provenance != "wiki":
+                # Emotion memory is authoritative for user-owned relations;
+                # it already supplies the direct Self -> Person link.
+                continue
+            valence = _clip(rel.get("valence", 0.0), -1.0, 1.0, 0.0)
+            trust = _clip(rel.get("trust", 0.0), -1.0, 1.0, 0.0)
+            affection = _clip(rel.get("affection", 0.0), -1.0, 1.0, 0.0)
+            magnitude = (abs(valence) + abs(trust) + abs(affection)) / 3.0
+            relation = RelationEdge(
+                id="",
+                kind="relation",
+                src=graph.SELF_ID,
+                dst=pid,
+                weight=max(0.2, min(1.0, 0.3 + 0.7 * magnitude)),
+                valence=valence,
+                trust=trust,
+                affection=affection,
+                comment=str(rel.get("comment") or "").strip(),
+                provenance="wiki",
+            )
+            stored = graph.upsert_edge(relation)
+            if isinstance(stored, RelationEdge):
+                stored.weight = relation.weight
+                stored.valence = relation.valence
+                stored.trust = relation.trust
+                stored.affection = relation.affection
+                stored.comment = relation.comment
+                stored.provenance = "wiki"
+        entity_by_key: dict[str, str] = {}
         # Named entities -> EntityNode.
         for e in ext.get("entities", []):
             ent = graph.ensure_entity(
@@ -1214,82 +1410,142 @@ def ingest_wiki_llm(
                 existing_id=e.get("existing_id", ""),
             )
             graph.mark_character_scope(ent)
+            ekey = str(e.get("key") or slugify(e["name"])).strip().lower()
+            entity_by_key[ekey] = ent.id
+            graph.bind_external_ref(ent, f"wiki:entity:{ekey}")
+
+        def person_id_for_key(key: str) -> str:
+            """Resolve an extracted person reference, including Self aliases."""
+            normalized = str(key or "").strip().lower()
+            if normalized == "self" or _is_self_name(normalized, [], character):
+                return graph.SELF_ID
+            return person_by_key.get(normalized, "")
+
+        # The hidden anchor is wired only to endpoints actually present in its
+        # section.  These native FactEdges preserve activation/provenance while
+        # keeping the full chunk out of normal results.
+        anchor_endpoints: list[str] = []
+        if ext.get("self_present"):
+            anchor_endpoints.append(graph.SELF_ID)
+        anchor_endpoints.extend(person_ids)
+        anchor_endpoints.extend(entity_by_key.values())
+        for endpoint in dict.fromkeys(anchor_endpoints):
             graph.upsert_edge(
                 FactEdge(
                     id="",
                     kind="fact",
-                    src=ent.id,
+                    src=endpoint,
                     dst=fid,
-                    weight=0.45,
+                    weight=max(0.3, min(1.0, 0.3 + 0.7 * section_importance)),
                     confidence=0.9,
-                    importance=0.5,
+                    importance=section_importance,
                     timestamp=now,
                 )
             )
-            entity_ids.append(ent.id)
-        semantic_ids: list[str] = list(dict.fromkeys([*person_ids, *entity_ids]))
+
+        # Atomic semantic facts are visible and carry their own calculated
+        # importance.  Only explicitly referenced endpoints receive a FactEdge.
+        for fact_data in ext.get("facts", []):
+            content = str(fact_data.get("content") or "").strip()
+            if not content:
+                continue
+            importance = _clip(fact_data.get("importance", 0.6))
+            fact_id = graph.next_id("fact")
+            semantic_fact = FactNode(
+                id=fact_id,
+                kind="fact",
+                text=content,
+                content=content,
+                type="wiki",
+                confidence=0.9,
+                importance=importance,
+                created_at=now,
+                source=f"{section_source}:fact",
+                practice_times=[now],
+            )
+            graph.add_node(semantic_fact)
+            graph.mark_character_scope(semantic_fact)
+            created_fact_ids.append(fact_id)
+            endpoints: list[str] = []
+            if fact_data.get("self_included"):
+                endpoints.append(graph.SELF_ID)
+            endpoints.extend(
+                person_id_for_key(key)
+                for key in fact_data.get("person_keys", [])
+                if person_id_for_key(key)
+            )
+            endpoints.extend(
+                entity_by_key[key]
+                for key in fact_data.get("entity_keys", [])
+                if entity_by_key.get(key)
+            )
+            for endpoint in dict.fromkeys(endpoints):
+                graph.upsert_edge(
+                    FactEdge(
+                        id="",
+                        kind="fact",
+                        src=endpoint,
+                        dst=fact_id,
+                        weight=max(0.3, min(1.0, 0.3 + 0.7 * importance)),
+                        confidence=0.9,
+                        importance=importance,
+                        timestamp=now,
+                    )
+                )
+
         if ext.get("is_event") and ext.get("event_summary"):
             summary = str(ext["event_summary"]).strip()
+            participant_ids: list[str] = []
+            if ext.get("event_self_participates"):
+                participant_ids.append(graph.SELF_ID)
+            participant_ids.extend(
+                person_id_for_key(key)
+                for key in ext.get("event_participant_keys", [])
+                if person_id_for_key(key)
+            )
+            participant_ids = list(dict.fromkeys(participant_ids))
+            if not participant_ids:
+                continue
+            event_importance = _clip(ext.get("event_importance", 0.6))
+            event_shift = dict(ext.get("emotional_shift") or {}) if ext.get(
+                "event_self_participates"
+            ) else {}
             eid = graph.next_id("episode")
             ep = EpisodeNode(
                 id=eid,
                 kind="episode",
                 text=summary,
                 summary=summary,
-                emotional_shift={},
-                importance=0.6,
+                emotional_shift=event_shift,
+                importance=event_importance,
                 timestamp=now,
                 created_at=now,
-                source=f"wiki:{source}:{header}",
+                source=f"{section_source}:episode",
                 practice_times=[now],
+                participants=participant_ids,
             )
             graph.add_node(ep)
             graph.mark_character_scope(ep)
-            for pid in person_ids:
+            for pid in participant_ids:
                 graph.upsert_edge(
                     EpisodeEdge(
                         id="",
                         kind="episode",
                         src=pid,
                         dst=eid,
-                        weight=0.5,
+                        weight=max(
+                            0.3,
+                            min(
+                                1.0,
+                                0.3
+                                + (0.7 * emotional_impact(event_shift) if pid == graph.SELF_ID else 0.0)
+                                + 0.3 * event_importance,
+                            ),
+                        ),
                         timestamp=now,
-                        emotional_shift={},
-                        importance=0.6,
+                        emotional_shift=event_shift if pid == graph.SELF_ID else {},
+                        importance=event_importance,
                         recall=False,
-                    )
-                )
-            semantic_ids.append(eid)
-
-        # Keep the source anchor in the graph for provenance and activation,
-        # but connect it symmetrically so hidden anchors can still bridge the
-        # character seed to the visible semantic nodes.
-        section_source = f"wiki:{source}:{header}"
-        for target in [graph.SELF_ID, *dict.fromkeys(semantic_ids)]:
-            graph.upsert_edge(
-                WikiAssociationEdge(
-                    id="",
-                    kind="wiki_association",
-                    src=fid,
-                    dst=target,
-                    weight=0.15,
-                    sources=[section_source],
-                )
-            )
-
-        # Direct visible topology keeps the graph useful after anchors are
-        # filtered out of normal retrieval and visualization.
-        visible_ids = list(dict.fromkeys(semantic_ids))
-        for i, left in enumerate(visible_ids):
-            for right in visible_ids[i + 1 :]:
-                graph.upsert_edge(
-                    WikiAssociationEdge(
-                        id="",
-                        kind="wiki_association",
-                        src=left,
-                        dst=right,
-                        weight=0.15,
-                        sources=[section_source],
                     )
                 )
     return created_fact_ids

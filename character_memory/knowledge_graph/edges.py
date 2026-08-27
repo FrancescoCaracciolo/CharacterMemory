@@ -58,7 +58,8 @@ class RelationEdge(Edge):
 
     Carries the same per-user dims as `EmotionStatus` (`valence`, `trust`,
     `affection`, all signed in [-1, 1]) plus a free-form relationship
-    `comment` (colleague / friend / …).
+    `comment` (colleague / friend / …).  ``provenance`` identifies the
+    projection that supplied the relation and is empty for legacy edges.
     """
 
     kind: str = "relation"
@@ -66,6 +67,9 @@ class RelationEdge(Edge):
     trust: float = 0.0
     affection: float = 0.0
     comment: str = ""
+    #: Origin of the relationship projection (for example ``emotion`` or
+    #: ``wiki``).  Empty preserves compatibility with older graphs.
+    provenance: str = ""
 
     def _extra_fields(self) -> dict[str, Any]:
         return {
@@ -73,6 +77,7 @@ class RelationEdge(Edge):
             "trust": self.trust,
             "affection": self.affection,
             "comment": self.comment,
+            "provenance": self.provenance,
         }
 
 
@@ -200,25 +205,6 @@ class ChatEdge(Edge):
     kind: str = "chat"
 
 
-@dataclass
-class WikiAssociationEdge(Edge):
-    """Symmetric semantic association derived from one wiki section.
-
-    The source list makes associations refreshable without confusing them
-    with learned co-occurrence edges. Multiple sections may contribute the
-    same pair; all their provenance tags are retained.
-    """
-
-    kind: str = "wiki_association"
-    sources: list[str] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        self.sources = list(dict.fromkeys(str(s) for s in self.sources if s))
-
-    def _extra_fields(self) -> dict[str, Any]:
-        return {"sources": list(self.sources)}
-
-
 EDGE_CLASSES: dict[str, type[Edge]] = {
     "relation": RelationEdge,
     "fact": FactEdge,
@@ -226,7 +212,6 @@ EDGE_CLASSES: dict[str, type[Edge]] = {
     "episode": EpisodeEdge,
     "co_occurrence": CoOccurrenceEdge,
     "chat": ChatEdge,
-    "wiki_association": WikiAssociationEdge,
 }
 
 #: Edge kinds the graph treats as undirected when walking neighbours. A
@@ -236,7 +221,6 @@ SYMMETRIC_KINDS: set[str] = {
     "transition",
     "co_occurrence",
     "chat",
-    "wiki_association",
 }
 
 
@@ -263,7 +247,6 @@ __all__ = [
     "EpisodeEdge",
     "CoOccurrenceEdge",
     "ChatEdge",
-    "WikiAssociationEdge",
     "EDGE_CLASSES",
     "SYMMETRIC_KINDS",
     "edge_from_dict",

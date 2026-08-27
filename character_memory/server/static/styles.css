@@ -1499,7 +1499,7 @@ select option { background: var(--input); color: var(--text); }
   --graph-node-self: #ff715e; --graph-node-person: #408adf; --graph-node-fact: #3eae7b;
   --graph-node-episode: #ffc857; --graph-node-entity: #625a78; --graph-node-default: #408adf;
   --graph-edge-relation: #408adf; --graph-edge-fact: #3eae7b; --graph-edge-episode: #e89521;
-  --graph-edge-transition: #ff715e; --graph-edge-cooccurrence: #81798f; --graph-edge-wiki-association: #a16bce; --graph-edge-default: #81798f;
+  --graph-edge-transition: #ff715e; --graph-edge-cooccurrence: #81798f; --graph-edge-default: #81798f;
   --graph-ink: #302947; --graph-label: #302947; --graph-label-shadow: #fff9e9;
   --graph-muted: #a69caf; --graph-muted-edge: #81798f;
 }
@@ -1507,7 +1507,7 @@ select option { background: var(--input); color: var(--text); }
   --graph-node-self: #ff8876; --graph-node-person: #74b6ff; --graph-node-fact: #65d19c;
   --graph-node-episode: #ffd166; --graph-node-entity: #e8d7b9; --graph-node-default: #74b6ff;
   --graph-edge-relation: #74b6ff; --graph-edge-fact: #65d19c; --graph-edge-episode: #ffd166;
-  --graph-edge-transition: #ff8876; --graph-edge-cooccurrence: #9d93b2; --graph-edge-wiki-association: #c49be8; --graph-edge-default: #9d93b2;
+  --graph-edge-transition: #ff8876; --graph-edge-cooccurrence: #9d93b2; --graph-edge-default: #9d93b2;
   --graph-ink: #fff8e9; --graph-label: #fff8e9; --graph-label-shadow: #171426;
   --graph-muted: #9d93b2; --graph-muted-edge: #706883;
 }

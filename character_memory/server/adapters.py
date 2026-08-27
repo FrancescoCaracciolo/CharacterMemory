@@ -1162,6 +1162,9 @@ def read_graph(
         sources = getattr(edge, "sources", None)
         if sources:
             record["sources"] = list(sources)
+        provenance = getattr(edge, "provenance", None)
+        if provenance:
+            record["provenance"] = str(provenance)
         edges.append(record)
     self_node = retriever.graph.SELF_ID if retriever.graph.SELF_ID in visible_ids else None
     visible_edge_count = sum(

@@ -26,7 +26,6 @@ from .edges import (
     CoOccurrenceEdge,
     Edge,
     EpisodeEdge,
-    WikiAssociationEdge,
     edge_from_dict,
 )
 from .nodes import (
@@ -791,12 +790,12 @@ class KnowledgeGraph:
             # The vector is source-of-truth data, not a monotonic strength.
             # Re-ingestion must refresh it when an episodic row is edited.
             existing.emotional_shift = dict(new.emotional_shift)
-        if isinstance(existing, WikiAssociationEdge) and isinstance(
-            new, WikiAssociationEdge
-        ):
-            existing.sources = list(dict.fromkeys([
-                *(existing.sources or []), *(new.sources or [])
-            ]))
+        if hasattr(existing, "provenance") and getattr(new, "provenance", ""):
+            # Relation provenance is an additive compatibility hint. Source
+            # memories explicitly overwrite their own projection after
+            # upsert when mutable values need to decrease.
+            if not getattr(existing, "provenance", ""):
+                existing.provenance = new.provenance  # type: ignore[attr-defined]
 
     def get_edge_between(self, kind: str, src: str, dst: str) -> Optional[Edge]:
         return self.edges.get(self.edge_id(kind, src, dst))
@@ -805,7 +804,7 @@ class KnowledgeGraph:
     def neighbors(self, node_id: str) -> list[tuple[Edge, Node]]:
         """Return `[(edge, neighbour_node)]` for every edge touching `node_id`.
 
-        Symmetric kinds (transition / co_occurrence / wiki_association) are
+        Symmetric kinds (transition / co_occurrence) are
         walked from either endpoint; directed kinds are walked from `src`
         only, so activation
         spreads along the semantic direction (Person -> Fact, etc.) while
@@ -879,6 +878,15 @@ class KnowledgeGraph:
         for n in data.get("nodes", []):
             g.add_node(node_from_dict(n))
         for e in data.get("edges", []):
+            # ``wiki_association`` was an experimental source-specific edge
+            # family.  Retired graphs remain readable, but the edge is not
+            # reintroduced into the native topology; remember its id so the
+            # next persistence pass can delete the legacy row.
+            if str(e.get("kind") or "") == "wiki_association":
+                legacy_id = str(e.get("id") or "")
+                if legacy_id:
+                    g._removed_edge_ids.add(legacy_id)
+                continue
             g.add_edge(edge_from_dict(e))
         for k, v in (data.get("counters") or {}).items():
             if k in g._counters:
