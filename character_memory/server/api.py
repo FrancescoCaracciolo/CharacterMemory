@@ -652,7 +652,10 @@ def cancel_calendar_event(character: str, event_id: int) -> dict:
 def read_graph(
     character: str,
     q: Optional[str] = Query(None, description="Query (drives activation; empty = whole graph)."),
-    user: Optional[str] = Query(None, description="Bias the user's own PersonNode."),
+    user: Optional[str] = Query(
+        None,
+        description="Bias this user's PersonNode and apply KG privacy; omit for unrestricted administration.",
+    ),
     limit: int = Query(50, ge=1, le=6000, description="Max nodes to return by activation."),
     hops: int = Query(1, ge=0, le=2, description="Subgraph expansion hops around top nodes."),
     max_edges: int = Query(400, ge=0, le=12000, description="Max edges to return."),

@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..chunking import Chunk
+from ..config import KnowledgeGraphPrivacy
 from ..knowledge_graph import (
     KnowledgeGraphConfig,
     KnowledgeGraphRetriever,
@@ -102,7 +103,12 @@ class KnowledgeGraphMemory(Memory):
             timestamp_style=self.timestamp_style,
         )
 
-    def _activation_snapshot(self, items: list[MemoryItem]) -> dict[str, Any]:
+    def _activation_snapshot(
+        self,
+        items: list[MemoryItem],
+        *,
+        visible_ids: Optional[set[str] | frozenset[str]] = None,
+    ) -> dict[str, Any]:
         """Copy the activation state produced by the just-finished recall.
 
         The copy is request-local: the graph's transient node fields may be
@@ -112,9 +118,12 @@ class KnowledgeGraphMemory(Memory):
         activation = {
             str(nid): float(getattr(node, "activation", 0.0))
             for nid, node in self.retriever.graph.nodes.items()
+            if visible_ids is None or str(nid) in visible_ids
         }
         breakdowns = {}
         for nid, node in self.retriever.graph.nodes.items():
+            if visible_ids is not None and str(nid) not in visible_ids:
+                continue
             comp = getattr(node, "score_breakdown", None)
             if isinstance(comp, dict) and comp:
                 breakdowns[str(nid)] = dict(comp)
@@ -140,7 +149,10 @@ class KnowledgeGraphMemory(Memory):
             query, user_id, limit, state_changing=state_changing
         )
         if result.items:
-            result.diagnostics = self._activation_snapshot(result.items)
+            result.diagnostics = self._activation_snapshot(
+                result.items,
+                visible_ids=self.retriever.visible_node_ids(user_id=user_id),
+            )
         return result
 
     def build_section_participants_result(
@@ -158,6 +170,30 @@ class KnowledgeGraphMemory(Memory):
             )
         if not self.enabled:
             return RecallResult()
+
+        if self.retriever._privacy_mode() is not KnowledgeGraphPrivacy.NONE:
+            items = self.retriever.retrieve(
+                query,
+                user_ids=participants,
+                token_budget=limit,
+                state_changing=state_changing,
+                timestamp_style=self.timestamp_style,
+            )
+            if not items:
+                return RecallResult()
+            diagnostic = self._activation_snapshot(
+                items,
+                visible_ids=self.retriever.visible_node_ids(user_ids=participants),
+            )
+            return RecallResult(
+                items=items,
+                body=self.format(items),
+                diagnostics={
+                    "participants": {
+                        uid: dict(diagnostic) for uid in participants
+                    }
+                },
+            )
 
         # Participant-specific activation is computed read-only, then shared
         # graph nodes are merged and recorded once. This prevents a global

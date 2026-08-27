@@ -627,14 +627,19 @@ class KnowledgeGraphAdapter(MemoryAdapter):
     def m(self) -> KnowledgeGraphMemory:
         return self.memory  # type: ignore[return-type]
 
-    def _nodes(self):
+    def _nodes(self, user_id: Optional[str] = None):
         try:
-            return list(self.m.retriever.graph.nodes.values())
+            visible = self.m.retriever.visible_node_ids(user_id=user_id)
+            return [
+                node
+                for node in self.m.retriever.graph.nodes.values()
+                if node.id in visible
+            ]
         except Exception:
             return []
 
     def count(self, user_id: Optional[str] = None) -> int:
-        return len(self._nodes())
+        return len(self._nodes(user_id))
 
     def users(self) -> list[str]:
         try:
@@ -679,7 +684,7 @@ class KnowledgeGraphAdapter(MemoryAdapter):
     def page(
         self, page: int, size: int, user_id: Optional[str] = None
     ) -> tuple[list[MemoryRecord], int]:
-        nodes = self._nodes()
+        nodes = self._nodes(user_id)
         total = len(nodes)
         start = (page - 1) * size
         # Default browse order: by kind then activation-descending.
@@ -943,6 +948,7 @@ def read_graph(
     if not isinstance(mem, KnowledgeGraphMemory):
         raise KeyError("knowledge_graph")
     retriever = mem.retriever
+    visible_ids = set(retriever.visible_node_ids(user_id=user))
     full = bool(full)
     if full:
         node_budget = max(1, min(6000, int(limit or 6000)))
@@ -968,6 +974,15 @@ def read_graph(
     elif trace is None:
         trace = retriever.test_activation("", user_id=user)
     trace = {str(nid): float(score) for nid, score in trace.items()}
+    if trace_is_precomputed:
+        # A captured context trace already represents the active participant
+        # union. Trust that exact visible set instead of narrowing it again to
+        # the chat owner's singular id.
+        visible_ids = set(trace)
+    else:
+        trace = {
+            nid: score for nid, score in trace.items() if nid in visible_ids
+        }
 
     if full:
         # Keep the whole graph (capped); the top-`retrieve_k` by activation are
@@ -975,7 +990,11 @@ def read_graph(
         ranked = sorted(trace.items(), key=lambda kv: kv[1], reverse=True)
         k = max(1, min(len(ranked), int(retrieve_k or 30)))
         retrieved_ids = set(precomputed_retrieved or {nid for nid, _ in ranked[:k]})
-        keep_ids = [nid for nid in retriever.graph.nodes if nid in trace][:node_budget]
+        keep_ids = [
+            nid
+            for nid in retriever.graph.nodes
+            if nid in trace and nid in visible_ids
+        ][:node_budget]
         keep_set = set(keep_ids)
     else:
         # Sort all nodes by activation desc; take the top slice as the seed set.
@@ -993,7 +1012,7 @@ def read_graph(
                 candidates: dict[str, tuple[float, float]] = {}
                 for nid in surfaced:
                     for edge, neighbour in retriever.graph.neighbors(nid):
-                        if neighbour.id in keep_set:
+                        if neighbour.id in keep_set or neighbour.id not in visible_ids:
                             continue
                         edge_strength = abs(float(edge.weight or 0.0))
                         prior = candidates.get(neighbour.id)
@@ -1029,7 +1048,10 @@ def read_graph(
                     cand: dict[str, float] = {}
                     for nid in list(keep_set):
                         for _edge, neighbour in retriever.graph.neighbors(nid):
-                            if neighbour.id not in keep_set:
+                            if (
+                                neighbour.id not in keep_set
+                                and neighbour.id in visible_ids
+                            ):
                                 cand[neighbour.id] = trace.get(neighbour.id, 0.0)
                     if not cand:
                         break
@@ -1115,7 +1137,12 @@ def read_graph(
         {"id": e.id, "kind": e.kind, "src": e.src, "dst": e.dst, "weight": float(e.weight)}
         for e in edge_objs
     ]
-    self_node = retriever.graph.SELF_ID if retriever.graph.SELF_ID in retriever.graph.nodes else None
+    self_node = retriever.graph.SELF_ID if retriever.graph.SELF_ID in visible_ids else None
+    visible_edge_count = sum(
+        1
+        for edge in retriever.graph.edges.values()
+        if edge.src in visible_ids and edge.dst in visible_ids
+    )
     return {
         "character": agent.character_name,
         "query": q or "",
@@ -1125,6 +1152,9 @@ def read_graph(
         "nodes": nodes,
         "edges": edges,
         "activation_range": {"min": a_min, "max": a_max},
-        "truncated": len(retriever.graph.nodes) > len(nodes) or len(retriever.graph.edges) > len(edges),
-        "overview": retriever.overview(),
+        "truncated": len(visible_ids) > len(nodes) or visible_edge_count > len(edges),
+        "overview": retriever.overview(
+            user_id=user,
+            allowed_node_ids=visible_ids if trace_is_precomputed else None,
+        ),
     }

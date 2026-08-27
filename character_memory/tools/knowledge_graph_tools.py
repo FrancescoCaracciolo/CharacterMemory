@@ -94,8 +94,7 @@ class SearchKnowledgeGraph(Tool):
         memory = _kg_memory(self.agent)
         cap = max(1, min(30, int(limit)))
         max_chars = max(300, min(6000, int(max_chars_each)))
-        uid = user_id or "default"
-        activation = memory.retriever.test_activation(query, user_id=uid)
+        activation = memory.retriever.test_activation(query, user_id=user_id)
         ranked = sorted(activation.items(), key=lambda item: item[1], reverse=True)
         records = [
             _node_record(node, activation=score, max_chars=max_chars)
@@ -105,7 +104,7 @@ class SearchKnowledgeGraph(Tool):
         ][:cap]
         return {
             "query": query,
-            "user_id": uid,
+            "user_id": user_id,
             "count": len(records),
             "nodes": records,
         }
@@ -132,6 +131,10 @@ class GetKnowledgeGraphNodes(Tool):
                 "maximum": 12000,
                 "default": 6000,
             },
+            "user_id": {
+                "type": "string",
+                "description": "Apply the configured privacy scope for this user; omit for unrestricted administration.",
+            },
         },
         "required": ["node_ids"],
     }
@@ -140,12 +143,21 @@ class GetKnowledgeGraphNodes(Tool):
         self.agent = agent
 
     def run(
-        self, node_ids: list[str], max_chars_each: int = 6000
+        self,
+        node_ids: list[str],
+        max_chars_each: int = 6000,
+        user_id: Optional[str] = None,
     ) -> dict[str, Any]:
         memory = _kg_memory(self.agent)
         ids = [str(node_id) for node_id in node_ids[:20]]
         max_chars = max(500, min(12000, int(max_chars_each)))
-        nodes = [memory.retriever.graph.get_node(node_id) for node_id in ids]
+        visible = memory.retriever.visible_node_ids(user_id=user_id)
+        nodes = [
+            memory.retriever.graph.get_node(node_id)
+            if node_id in visible
+            else None
+            for node_id in ids
+        ]
         return {
             "requested_node_ids": ids,
             "count": sum(node is not None for node in nodes),
@@ -180,6 +192,10 @@ class GetKnowledgeGraphNeighbors(Tool):
                 "maximum": 5000,
                 "default": 1800,
             },
+            "user_id": {
+                "type": "string",
+                "description": "Apply the configured privacy scope for this user; omit for unrestricted administration.",
+            },
         },
         "required": ["node_id"],
     }
@@ -188,12 +204,17 @@ class GetKnowledgeGraphNeighbors(Tool):
         self.agent = agent
 
     def run(
-        self, node_id: str, limit: int = 12, max_chars_each: int = 1800
+        self,
+        node_id: str,
+        limit: int = 12,
+        max_chars_each: int = 1800,
+        user_id: Optional[str] = None,
     ) -> dict[str, Any]:
         memory = _kg_memory(self.agent)
         graph = memory.retriever.graph
+        visible = memory.retriever.visible_node_ids(user_id=user_id)
         anchor = graph.get_node(str(node_id))
-        if anchor is None:
+        if anchor is None or anchor.id not in visible:
             return {"node_id": str(node_id), "count": 0, "neighbors": []}
         cap = max(1, min(50, int(limit)))
         max_chars = max(300, min(5000, int(max_chars_each)))
@@ -206,7 +227,7 @@ class GetKnowledgeGraphNeighbors(Tool):
             else:
                 continue
             other = graph.get_node(other_id)
-            if other is None:
+            if other is None or other.id not in visible:
                 continue
             neighbors.append(
                 {

@@ -2,6 +2,7 @@
 """Configuration objects for the whole character-memory library."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 import os
 
@@ -133,6 +134,35 @@ class ContradictionPolicy:
     show_timestamps: bool = True
 
 
+class KnowledgeGraphPrivacy(str, Enum):
+    """How user-scoped nodes participate in knowledge-graph retrieval."""
+
+    NONE = "none"
+    EXCLUDE = "exclude"
+    PRIVATE = "private"
+
+    @classmethod
+    def coerce(cls, value: object) -> "KnowledgeGraphPrivacy":
+        """Normalize config/API inputs while keeping ``None`` unrestricted."""
+        if value is None:
+            return cls.NONE
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("", "none", "null"):
+                return cls.NONE
+            try:
+                return cls(normalized)
+            except ValueError as exc:
+                raise ValueError(
+                    "knowledge-graph privacy must be one of: none, exclude, private"
+                ) from exc
+        raise ValueError(
+            "knowledge-graph privacy must be one of: none, exclude, private"
+        )
+
+
 @dataclass
 class KnowledgeGraphConfig:
     """Tunables for the optional knowledge-graph retriever.
@@ -142,6 +172,9 @@ class KnowledgeGraphConfig:
 
     - `decay`: ACT-R base-level learning decay parameter (d). Higher -> faster
       forgetting.
+    - `privacy`: `none` keeps the shared graph unrestricted, `exclude` lets
+      hidden user nodes propagate but filters them from results, and `private`
+      calculates only over the active users' induced subgraph.
     - `decay_half_life`: when > 0, an extra exponential recency factor
       layered on top of the BLL (seconds).
     - `gain` / `hops` / `hop_decay`: spreading-activation gain, max hops
@@ -160,6 +193,7 @@ class KnowledgeGraphConfig:
       current location; it does not persist current state as a graph fact.
     """
 
+    privacy: KnowledgeGraphPrivacy = KnowledgeGraphPrivacy.NONE
     decay: float = 0.5
     decay_half_life: float = 60 * 60 * 24 * 7  # one week
     gain: float = 0.35
@@ -189,6 +223,9 @@ class KnowledgeGraphConfig:
     # Runtime-only activation boost for the observer's current location.
     # The snapshot itself is never persisted into the graph.
     world_location_seed: float = 0.6
+
+    def __post_init__(self) -> None:
+        self.privacy = KnowledgeGraphPrivacy.coerce(self.privacy)
 
 
 @dataclass

@@ -38,7 +38,7 @@ default, unknown keys are ignored so the format is forward-compatible)::
       enabled_knowledge_graph: false
       dedup:          { enabled, exact, similarity_threshold, llm_judge,
                         consolidate, per_user, candidate_pool }
-      knowledge_graph: { decay, decay_half_life, gain, hops, hop_decay,
+      knowledge_graph: { privacy, decay, decay_half_life, gain, hops, hop_decay,
                          base_weight, spread_weight, min_activation,
                          hebbian_threshold, hebbian_lr, self_seed,
                          match_base, match_gain, fact_batch_size,
@@ -63,6 +63,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
 from typing import Any, Optional, Union
 
 import yaml
@@ -178,6 +179,9 @@ def _coerce_scalar(typ: Any, value: Any) -> Any:
     """Best-effort coerce a YAML scalar to the dataclass field's annotation."""
     if value is None:
         return None
+    if isinstance(typ, type) and issubclass(typ, Enum):
+        coerce = getattr(typ, "coerce", None)
+        return coerce(value) if callable(coerce) else typ(value)
     # PEP 604 unions (e.g. ``int | None``) — accept the value as-is when it is
     # already the right shape, otherwise try the first non-None type.
     typename = getattr(typ, "__name__", str(typ))
@@ -427,12 +431,25 @@ def _config_to_dict(config: CharacterMemoryConfig) -> dict[str, Any]:
     """Serialise a full config to the YAML schema dict shape."""
     from dataclasses import asdict
 
-    return {
-        "llm": asdict(config.llm),
-        "embedding": asdict(config.embedding),
-        "chunking": asdict(config.chunking),
-        "memory": asdict(config.memory),
-    }
+    def yaml_value(value: Any) -> Any:
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, dict):
+            return {key: yaml_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [yaml_value(item) for item in value]
+        if isinstance(value, tuple):
+            return [yaml_value(item) for item in value]
+        return value
+
+    return yaml_value(
+        {
+            "llm": asdict(config.llm),
+            "embedding": asdict(config.embedding),
+            "chunking": asdict(config.chunking),
+            "memory": asdict(config.memory),
+        }
+    )
 
 
 def _prompts_to_dict(prompts: PromptConfig) -> dict[str, Any]:

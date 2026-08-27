@@ -123,8 +123,9 @@ class _SearchMemory(Tool):
                     if name == "knowledge_graph" and hasattr(mem, "token_budget")
                     else limit
                 )
+                effective_uid = "" if name == "knowledge_graph" and user_id is None else uid
                 items = mem.recall(
-                    query, uid, recall_bound, state_changing=False
+                    query, effective_uid, recall_bound, state_changing=False
                 )[:limit]
             except Exception as e:  # noqa: BLE001 - one bad memory shouldn't fail the tool
                 lines.append(f"[{name}] error: {e!r}")

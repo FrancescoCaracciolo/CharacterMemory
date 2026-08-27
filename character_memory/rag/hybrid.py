@@ -13,6 +13,7 @@ import json
 import hashlib
 import os
 import warnings
+from collections import OrderedDict
 from collections.abc import Hashable, Iterable
 from typing import Any, Optional
 
@@ -75,6 +76,14 @@ class HybridSearch(RAGSystem):
         self._nodes: list[TextNode] = []
         self._bm25: Optional[BM25Retriever] = None
         self._index: Optional[faiss.Index] = None
+        self._index_revision = 0
+        self._scoped_bm25_cache: OrderedDict[
+            tuple[int, frozenset[int]], Optional[BM25Retriever]
+        ] = OrderedDict()
+
+    def _invalidate_scoped_search(self) -> None:
+        self._index_revision += 1
+        self._scoped_bm25_cache.clear()
 
     # ------------------------------------------------------------------ build
     def _chunk_to_node(self, chunk: Chunk, idx: int) -> TextNode:
@@ -88,6 +97,7 @@ class HybridSearch(RAGSystem):
         self._nodes = [self._chunk_to_node(c, i) for i, c in enumerate(chunks)]
         self._build_bm25()
         self._build_faiss()
+        self._invalidate_scoped_search()
 
     @staticmethod
     def _normalize_vectors(vecs: "np.ndarray") -> "np.ndarray":
@@ -138,6 +148,7 @@ class HybridSearch(RAGSystem):
         else:
             self._index.add(np.ascontiguousarray(vecs))
         self._build_bm25()
+        self._invalidate_scoped_search()
 
     @staticmethod
     def _is_deleted(node: TextNode) -> bool:
@@ -171,6 +182,7 @@ class HybridSearch(RAGSystem):
             and tombstones / max(1, total) >= self.cleanup_deleted_ratio
         ):
             self.cleanup()
+        self._invalidate_scoped_search()
         return deleted
 
     def cleanup(self) -> int:
@@ -185,6 +197,7 @@ class HybridSearch(RAGSystem):
             self._nodes = []
             self._bm25 = None
             self._index = None
+            self._invalidate_scoped_search()
             return deleted
 
         old_nodes = self._nodes
@@ -220,6 +233,7 @@ class HybridSearch(RAGSystem):
                 stacklevel=2,
             )
             self._build_faiss()
+        self._invalidate_scoped_search()
         return deleted
 
     def _build_bm25(self) -> None:
@@ -235,6 +249,36 @@ class HybridSearch(RAGSystem):
             verbose=False,
         )
 
+    def _scoped_bm25(
+        self, allowed_positions: frozenset[int]
+    ) -> Optional[BM25Retriever]:
+        """Return a bounded cached lexical retriever for an allowed subset."""
+        key = (self._index_revision, allowed_positions)
+        cached = self._scoped_bm25_cache.get(key)
+        if key in self._scoped_bm25_cache:
+            self._scoped_bm25_cache.move_to_end(key)
+            return cached
+        nodes = [
+            self._nodes[pos]
+            for pos in sorted(allowed_positions)
+            if 0 <= pos < len(self._nodes)
+            and not self._is_deleted(self._nodes[pos])
+        ]
+        retriever = (
+            BM25Retriever.from_defaults(
+                nodes=nodes,
+                similarity_top_k=min(self.candidate_pool, len(nodes)),
+                verbose=False,
+            )
+            if nodes
+            else None
+        )
+        self._scoped_bm25_cache[key] = retriever
+        self._scoped_bm25_cache.move_to_end(key)
+        while len(self._scoped_bm25_cache) > 16:
+            self._scoped_bm25_cache.popitem(last=False)
+        return retriever
+
     def _build_faiss(self) -> None:
         if not self._nodes:
             self._index = None
@@ -248,7 +292,13 @@ class HybridSearch(RAGSystem):
         self._index = index
 
     # SEARCH
-    def search(self, query: Query, k: int = 5, where: dict | None = None) -> list[Hit]:
+    def search(
+        self,
+        query: Query,
+        k: int = 5,
+        where: dict | None = None,
+        allowed_ids: Optional[Iterable[Any]] = None,
+    ) -> list[Hit]:
         """Return up to `k` hits for `query`, fusing across weighted queries.
 
         ``query`` may be a plain string or a list of ``(text, weight)`` pairs.
@@ -256,8 +306,29 @@ class HybridSearch(RAGSystem):
         are fused with reciprocal rank fusion where a query of weight ``w``
         contributes ``w / (rrf_k + rank + 1)`` per hit. A single (or unweighted)
         query is the legacy path and ranks identically to before.
+        ``allowed_ids`` optionally restricts both BM25 and FAISS to documents
+        whose application-level ``metadata['id']`` is allowed. The lexical
+        subset is cached and FAISS uses an ID selector, so disallowed entries
+        are not merely removed after consuming the candidate pool.
         """
-        active_count = self.count
+        allowed_positions: Optional[frozenset[int]] = None
+        if allowed_ids is not None:
+            wanted = (
+                {allowed_ids}
+                if isinstance(allowed_ids, (str, bytes))
+                else set(allowed_ids)
+            )
+            allowed_positions = frozenset(
+                pos
+                for pos, node in enumerate(self._nodes)
+                if not self._is_deleted(node)
+                and node.metadata.get("id") in wanted
+            )
+        active_count = (
+            len(allowed_positions)
+            if allowed_positions is not None
+            else self.count
+        )
         if active_count == 0 or self._index is None:
             return []
         queries = [(text, weight) for text, weight in as_queries(query) if weight > 0.0]
@@ -293,7 +364,9 @@ class HybridSearch(RAGSystem):
             )
 
         for (qtext, weight), qv in zip(queries, q_vecs):
-            bm25_hits, dense_hits = self._query_candidates(qtext, qv, pool, where)
+            bm25_hits, dense_hits = self._query_candidates(
+                qtext, qv, pool, where, allowed_positions
+            )
             best_lexical = max((lexical for _, _, lexical in bm25_hits), default=0.0)
             for pos, rank, lexical in bm25_hits:
                 key = self._result_key(pos)
@@ -361,7 +434,12 @@ class HybridSearch(RAGSystem):
         return ("result", result_id) if result_id is not None else ("_pos", pos)
 
     def _query_candidates(
-        self, qtext: str, qv: "np.ndarray", pool: int, where: dict | None
+        self,
+        qtext: str,
+        qv: "np.ndarray",
+        pool: int,
+        where: dict | None,
+        allowed_positions: Optional[frozenset[int]] = None,
     ) -> tuple[list[tuple[int, int, float]], list[tuple[int, int, float]]]:
         """Run one query's BM25 + dense passes, returning ranked positional hits.
 
@@ -372,8 +450,13 @@ class HybridSearch(RAGSystem):
         """
         # Lexical candidates, keyed by internal positional index.
         bm25_hits: list[tuple[int, int, float]] = []
-        if self._bm25 is not None:
-            nodes = self._bm25.retrieve(qtext)
+        bm25 = (
+            self._scoped_bm25(allowed_positions)
+            if allowed_positions is not None
+            else self._bm25
+        )
+        if bm25 is not None:
+            nodes = bm25.retrieve(qtext)
             rank = 0
             seen_results: set[Hashable] = set()
             for n in nodes:
@@ -399,10 +482,21 @@ class HybridSearch(RAGSystem):
         # Tombstones can occupy the dense top-k even though they are filtered
         # below. Asking for ``pool + deleted_count`` guarantees enough room for
         # ``pool`` active candidates when that many active nodes exist.
-        dense_pool = min(len(self._nodes), pool + self.deleted_count)
-        sims, idxs = self._index.search(
-            np.ascontiguousarray(qv.reshape(1, -1)), dense_pool
-        )
+        if allowed_positions is not None:
+            dense_pool = min(len(allowed_positions), pool)
+            selected = np.asarray(sorted(allowed_positions), dtype="int64")
+            params = faiss.SearchParameters()
+            params.sel = faiss.IDSelectorBatch(selected)
+            sims, idxs = self._index.search(
+                np.ascontiguousarray(qv.reshape(1, -1)),
+                dense_pool,
+                params=params,
+            )
+        else:
+            dense_pool = min(len(self._nodes), pool + self.deleted_count)
+            sims, idxs = self._index.search(
+                np.ascontiguousarray(qv.reshape(1, -1)), dense_pool
+            )
         dense_hits: list[tuple[int, int, float]] = []
         n_nodes = len(self._nodes)
         rank = 0
@@ -634,3 +728,4 @@ class HybridSearch(RAGSystem):
             self.persist(path)
         else:
             self._build_bm25()
+        self._invalidate_scoped_search()

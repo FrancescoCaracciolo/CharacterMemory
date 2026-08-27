@@ -305,7 +305,9 @@ def _tool_search_knowledge_graph(agent: CharacterAgent, mem: Any, args: dict) ->
     Returns the top nodes by activation as records, plus the activation
     subgraph (nodes + edges) so an MCP client can render a visualization.
     `query` drives the spreading-activation search; omit it to get the
-    whole graph (capped by `limit`). `user_id` biases the user's PersonNode.
+    whole graph (capped by `limit`). `user_id` biases the user's PersonNode
+    and applies the configured privacy scope; omit it for unrestricted
+    administrative inspection.
     """
     kg = agent.memories.get("knowledge_graph")
     if not isinstance(kg, KnowledgeGraphMemory):
@@ -1148,7 +1150,8 @@ _register(
     "nodes by activation (records) plus the activation-weighted subgraph "
     "(nodes + edges) so a client can render it. `query` drives spreading "
     "activation; omit it for the whole graph. `user_id` biases that user's "
-    "PersonNode. `limit` caps nodes (1..300, default 50); `hops` (0..2) "
+    "PersonNode and applies KG privacy (omit for unrestricted administration). "
+    "`limit` caps nodes (1..300, default 50); `hops` (0..2) "
     "expands the returned subgraph around the top nodes.",
     {
         "type": "object",
