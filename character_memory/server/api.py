@@ -58,6 +58,7 @@ from character_memory import (
     MemoryConfig,
 )
 from character_memory.memory.calendar import CalendarMemory, SELF_OWNER, _parse_iso
+from character_memory.memory.base import MemoryItem
 
 # Read-side memory browser: normalises each memory backend into paged,
 # searchable records and powers the GUI served at /gui.
@@ -242,6 +243,13 @@ class ContextRequest(BaseModel):
 class ContextResponse(BaseModel):
     chat_id: str
     context: dict[str, str]
+    memories: dict[str, list[MemoryItem]] = Field(
+        default_factory=dict,
+        description=(
+            "The exact retrieved memory items used for each rendered memory "
+            "section, grouped by memory name."
+        ),
+    )
     context_order: list[str] = Field(
         ...,
         description="Context item ids in their exact prompt order.",
@@ -376,6 +384,10 @@ def context(req: ContextRequest) -> ContextResponse:
     return ContextResponse(
         chat_id=chat.id,
         context=snapshot.sections,
+        memories={
+            name: list(recall.items)
+            for name, recall in snapshot.recalls.items()
+        },
         context_order=list(snapshot.sections),
         context_text="\n\n".join(snapshot.sections.values()),
     )
