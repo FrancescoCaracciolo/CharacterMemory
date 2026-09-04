@@ -68,6 +68,7 @@ const state = {
     events: new Map(), selectedId: null, follow: true, source: null,
     connection: "closed", graph: {}, graphUser: "", openMemory: new Set(), openInitialized: false,
     embedOpenMemory: new Set(), embedOpenInitialized: false,
+    full: false, _fullRequest: 0,
     _gv: null, _active: false,
   },
 };
@@ -1355,6 +1356,9 @@ function readEmbedOptions() {
     theme: ["system", "light", "dark"].includes(theme) ? theme : null,
     toolbar: embedBoolean(query, "toolbar"),
     recalls: embedBoolean(query, "recalls"),
+    // The control is available by default. Hosts embedding an intentionally
+    // minimal activation-only surface can opt out with full_graph=0.
+    fullGraph: embedBoolean(query, "full_graph") !== false,
     numeric,
     colors,
   };
@@ -1383,6 +1387,7 @@ function applyEmbedOptions() {
   }
   root.classList.toggle("live-embed-no-toolbar", EMBED_OPTIONS.toolbar === false);
   root.classList.toggle("live-embed-no-recalls", EMBED_OPTIONS.recalls === false);
+  root.classList.toggle("live-embed-no-full-graph", !EMBED_OPTIONS.fullGraph);
 }
 
 // Persist graph UI choices (settings + full mode + panel visibility) so they
@@ -2667,19 +2672,111 @@ function renderLiveGraphList(data) {
   }
 }
 
-function renderLiveGraph(event) {
+function liveEventGraphs(event) {
   let rawGraphs = event.graphs ?? event.graph ?? {};
   if (typeof rawGraphs === "string") {
     try { rawGraphs = JSON.parse(rawGraphs); } catch (error) { rawGraphs = {}; }
   }
-  const graphs = rawGraphs && !Array.isArray(rawGraphs) && Array.isArray(rawGraphs.nodes)
+  return rawGraphs && !Array.isArray(rawGraphs) && Array.isArray(rawGraphs.nodes)
     ? { [event.user || "default"]: rawGraphs }
     : Array.isArray(rawGraphs)
     ? Object.fromEntries(rawGraphs.map((graph, index) => [graph.user || graph.user_id || String(index), graph]))
     : rawGraphs && typeof rawGraphs === "object" ? rawGraphs : {};
+}
+
+function updateLiveFullGraphButton({ loading = false, available = true } = {}) {
+  const button = $("live-embed-full-btn");
+  if (!button) return;
+  const full = !!state.live.full;
+  button.disabled = loading || !available;
+  button.classList.toggle("loading", loading);
+  button.classList.toggle("graph-freeze-on", full);
+  button.setAttribute("aria-pressed", full ? "true" : "false");
+  setButtonContent(
+    button,
+    loading ? "loader-circle" : full ? "radar" : "share-2",
+    loading ? "Loading…" : full ? "Activation" : "Full graph",
+  );
+  button.title = full
+    ? "Return to the privacy-scoped activation graph for this request"
+    : "Show the privacy-scoped full graph (nodes need at least two visible edges)";
+}
+
+function showLiveGraphData(data, user) {
+  const shell = $("live-graph-shell"), empty = $("live-graph-empty");
+  shell.classList.remove("hidden"); empty.classList.add("hidden");
+  const sparse = Number(data.min_degree) >= 2 ? " · degree ≥ 2" : "";
+  const mode = data.mode === "full" ? " · full" : "";
+  const truncated = data.truncated ? " · truncated" : "";
+  $("live-graph-meta").textContent = `${(data.nodes || []).length} nodes · ${(data.edges || []).length} edges · ${user}${mode}${sparse}${truncated}`;
+  if (!state.live._gv) {
+    state.live._gv = createGraphViz($("live-cy"), {
+      onSelect: renderLiveNodeDetail,
+      settings: GRAPH_SETTINGS,
+      overlay: $("live-graph-overlay"),
+      visibility: shell,
+    });
+  }
+  state.live._gv.setData(data);
+  renderLiveGraphList(data);
+  requestAnimationFrame(() => state.live._gv && state.live._gv.resize());
+}
+
+function liveFullGraphUrl(event, user) {
+  const params = new URLSearchParams({
+    user,
+    full: "1",
+    limit: "6000",
+    max_edges: "12000",
+    include_co_occurrence: "1",
+    retrieve_k: "30",
+    min_degree: "2",
+  });
+  const queryText = (Array.isArray(event.query) ? event.query : [])
+    .map((part) => part && part.text ? String(part.text).trim() : "")
+    .filter(Boolean)
+    .join(" ");
+  if (queryText) params.set("q", queryText);
+  return `${API}/api/graph/${encodeURIComponent(state.character)}?${params}`;
+}
+
+async function loadLiveFullGraph(event, user, fallback) {
+  // Never make an identity-less full-graph request from the public iframe.
+  // The API deliberately reserves missing identity for administrative use.
+  if (!user) {
+    state.live.full = false;
+    updateLiveFullGraphButton({ available: false });
+    showLiveGraphData(fallback, "unknown");
+    return;
+  }
+  const request = ++state.live._fullRequest;
+  let failure = null;
+  updateLiveFullGraphButton({ loading: true });
+  try {
+    const data = await getJSON(liveFullGraphUrl(event, user));
+    if (request !== state.live._fullRequest || !state.live.full) return;
+    showLiveGraphData(data, user);
+  } catch (error) {
+    if (request !== state.live._fullRequest) return;
+    // Keep the captured activation useful if the optional full view fails.
+    state.live.full = false;
+    showLiveGraphData(fallback, user);
+    failure = error;
+  } finally {
+    if (request === state.live._fullRequest) {
+      updateLiveFullGraphButton();
+      const button = $("live-embed-full-btn");
+      if (button && failure) button.title = `Full graph unavailable: ${failure.message}`;
+    }
+  }
+}
+
+function renderLiveGraph(event) {
+  const graphs = liveEventGraphs(event);
   const users = Object.keys(graphs);
   const shell = $("live-graph-shell"), empty = $("live-graph-empty"), select = $("live-graph-user");
   if (!users.length) {
+    state.live._fullRequest++;
     shell.classList.add("hidden"); empty.classList.remove("hidden");
     select.classList.add("hidden"); $("live-graph-meta").textContent = "No graph in this request";
     clear($("live-graph-list")); clear($("live-graph-detail")); $("live-graph-detail").classList.add("hidden");
@@ -2687,6 +2784,7 @@ function renderLiveGraph(event) {
       try { state.live._gv.destroy(); } catch (error) { /* best effort */ }
       state.live._gv = null;
     }
+    updateLiveFullGraphButton({ available: false });
     return;
   }
   const preferred = state.live.graphUser && users.includes(state.live.graphUser)
@@ -2698,21 +2796,14 @@ function renderLiveGraph(event) {
   select.value = state.live.graphUser;
   select.classList.toggle("hidden", users.length < 2);
   const data = graphs[state.live.graphUser];
-  shell.classList.remove("hidden"); empty.classList.add("hidden");
-  $("live-graph-meta").textContent = `${(data.nodes || []).length} nodes · ${(data.edges || []).length} edges · ${state.live.graphUser}`;
-  if (!state.live._gv) {
-    state.live._gv = createGraphViz($("live-cy"), {
-      onSelect: renderLiveNodeDetail,
-      settings: GRAPH_SETTINGS,
-      overlay: $("live-graph-overlay"),
-      visibility: shell,
-    });
+  updateLiveFullGraphButton();
+  if (LIVE_GRAPH_EMBED && EMBED_OPTIONS.fullGraph && state.live.full) {
+    void loadLiveFullGraph(event, state.live.graphUser, data);
+    return;
   }
   // The live monitor explains the exact captured activation. Browse-view
   // filters such as "hide all facts/episodes" must not erase that trace.
-  state.live._gv.setData(data);
-  renderLiveGraphList(data);
-  requestAnimationFrame(() => state.live._gv && state.live._gv.resize());
+  showLiveGraphData(data, state.live.graphUser);
 }
 
 function updateLiveEmbedSummary(event) {
@@ -2831,7 +2922,19 @@ function wireLiveEmbedControls() {
   const toolbar = $("live-embed-toolbar");
   const participant = $("live-graph-user");
   const recallsButton = $("live-embed-recalls-btn");
+  const fullGraphButton = $("live-embed-full-btn");
   if (toolbar && participant && recallsButton) toolbar.insertBefore(participant, recallsButton);
+  updateLiveFullGraphButton({ available: false });
+  fullGraphButton.addEventListener("click", () => {
+    if (!EMBED_OPTIONS.fullGraph) return;
+    const selected = state.live.events.get(state.live.selectedId);
+    if (!selected || !Object.keys(liveEventGraphs(selected)).length) return;
+    state.live.full = !state.live.full;
+    // Invalidate an in-flight full fetch before restoring the captured trace.
+    if (!state.live.full) state.live._fullRequest++;
+    updateLiveFullGraphButton();
+    renderLiveGraph(selected);
+  });
   recallsButton.addEventListener("click", () => {
     setLiveEmbedDrawer(recallsButton.getAttribute("aria-expanded") !== "true");
   });
@@ -2883,9 +2986,11 @@ function resetCharacterView() {
   // do not keep Full mode while silently resetting its limits.
   state.graph = { data: null, q: "", user: "", full: state.graph.full, _gv: null, _wired: graphControlsWired };
   state.live.events.clear(); state.live.selectedId = null; state.live.graphUser = "";
+  state.live.full = false; state.live._fullRequest++;
   state.live.openMemory.clear(); state.live.openInitialized = false;
   state.live.embedOpenMemory.clear(); state.live.embedOpenInitialized = false;
   if (state.live._gv) { try { state.live._gv.destroy(); } catch (error) {} state.live._gv = null; }
+  updateLiveFullGraphButton({ available: false });
   $("q").value = "";
   $("graph-q").value = "";
 }

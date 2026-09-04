@@ -29,7 +29,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=live-graph-embed-3">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=live-graph-embed-4">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -215,6 +215,10 @@
           <span id="live-embed-status">Connecting…</span>
         </div>
         <span id="live-embed-identity" class="live-embed-identity">Waiting for /context</span>
+        <button id="live-embed-full-btn" class="btn live-embed-full-btn" type="button" aria-pressed="false" title="Show the privacy-scoped full graph (nodes need at least two visible edges)">
+          <i data-lucide="share-2" class="icon"></i>
+          <span class="btn-label">Full graph</span>
+        </button>
         <button id="live-embed-recalls-btn" class="btn live-embed-recalls-btn" type="button" aria-controls="live-embed-drawer" aria-expanded="false">
           <i data-lucide="layers-3" class="icon"></i>
           <span id="live-embed-recalls-label">Recalled memories</span>
@@ -615,7 +619,7 @@
   </div>
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[Mnemosyne] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
-  <script src="/gui/static/app.js?v=live-graph-embed-3"></script>
+  <script src="/gui/static/app.js?v=live-graph-embed-4"></script>
   <script src="/gui/static/config.js?v=intermediate-prompts-2"></script>
 </body>
 </html>

@@ -921,6 +921,7 @@ def read_graph(
     include_co_occurrence: bool = False,
     full: bool = False,
     retrieve_k: int = 30,
+    min_degree: int = 0,
     include_internal: bool = False,
     precomputed_trace: Optional[dict[str, float]] = None,
     precomputed_retrieved: Optional[set[str]] = None,
@@ -941,6 +942,11 @@ def read_graph(
       activation for the query. The GUI uses this to light up the retrieved
       nodes and gray out the rest while still drawing all the links.
 
+    ``min_degree`` optionally removes nodes with fewer than that many incident
+    edges. Degree is calculated only over privacy-visible nodes, so a hidden
+    neighbour can neither keep a visible node in the response nor reveal its
+    existence through the filter.
+
     Each node carries both the raw ``activation`` (signed, ACT-R + spreading)
     and a ``activation_norm`` in ``[0, 1]`` mapped from the returned graph's
     min/max so the GUI can size/opacity nodes without assuming a positive
@@ -957,6 +963,23 @@ def read_graph(
             include_internal=include_internal,
         )
     )
+    min_degree = max(0, min(100, int(min_degree or 0)))
+
+    def minimum_degree_ids(node_ids: set[str]) -> set[str]:
+        if not min_degree:
+            return set(node_ids)
+        visible_degree: dict[str, int] = {node_id: 0 for node_id in node_ids}
+        for edge in retriever.graph.edges.values():
+            if edge.src in node_ids and edge.dst in node_ids:
+                visible_degree[edge.src] += 1
+                visible_degree[edge.dst] += 1
+        return {
+            node_id
+            for node_id, degree in visible_degree.items()
+            if degree >= min_degree
+        }
+
+    displayable_ids = minimum_degree_ids(visible_ids)
     full = bool(full)
     if full:
         node_budget = max(1, min(6000, int(limit or 6000)))
@@ -995,10 +1018,15 @@ def read_graph(
         # union. Trust that exact visible set instead of narrowing it again to
         # the chat owner's singular id.
         visible_ids = set(trace)
+        # Precomputed live traces can represent a multi-participant union
+        # wider than ``user``. Re-evaluate degree inside that exact union
+        # instead of the singular viewer partition resolved above.
+        displayable_ids = minimum_degree_ids(visible_ids)
     else:
         trace = {
             nid: score for nid, score in trace.items() if nid in visible_ids
         }
+    trace = {nid: score for nid, score in trace.items() if nid in displayable_ids}
 
     if full:
         # Keep the whole graph (capped); the top-`retrieve_k` by activation are
@@ -1009,7 +1037,7 @@ def read_graph(
         keep_ids = [
             nid
             for nid in retriever.graph.nodes
-            if nid in trace and nid in visible_ids
+            if nid in trace and nid in displayable_ids
         ][:node_budget]
         keep_set = set(keep_ids)
     else:
@@ -1028,7 +1056,7 @@ def read_graph(
                 candidates: dict[str, tuple[float, float]] = {}
                 for nid in surfaced:
                     for edge, neighbour in retriever.graph.neighbors(nid):
-                        if neighbour.id in keep_set or neighbour.id not in visible_ids:
+                        if neighbour.id in keep_set or neighbour.id not in displayable_ids:
                             continue
                         edge_strength = abs(float(edge.weight or 0.0))
                         prior = candidates.get(neighbour.id)
@@ -1066,7 +1094,7 @@ def read_graph(
                         for _edge, neighbour in retriever.graph.neighbors(nid):
                             if (
                                 neighbour.id not in keep_set
-                                and neighbour.id in visible_ids
+                                and neighbour.id in displayable_ids
                             ):
                                 cand[neighbour.id] = trace.get(neighbour.id, 0.0)
                     if not cand:
@@ -1166,23 +1194,28 @@ def read_graph(
         if provenance:
             record["provenance"] = str(provenance)
         edges.append(record)
-    self_node = retriever.graph.SELF_ID if retriever.graph.SELF_ID in visible_ids else None
+    self_node = (
+        retriever.graph.SELF_ID
+        if retriever.graph.SELF_ID in displayable_ids
+        else None
+    )
     visible_edge_count = sum(
         1
         for edge in retriever.graph.edges.values()
-        if edge.src in visible_ids and edge.dst in visible_ids
+        if edge.src in displayable_ids and edge.dst in displayable_ids
     )
     return {
         "character": agent.character_name,
         "query": q or "",
         "user": user,
         "include_internal": bool(include_internal),
+        "min_degree": min_degree,
         "mode": "trace" if trace_is_precomputed else ("full" if full else "subgraph"),
         "self_node": self_node,
         "nodes": nodes,
         "edges": edges,
         "activation_range": {"min": a_min, "max": a_max},
-        "truncated": len(visible_ids) > len(nodes) or visible_edge_count > len(edges),
+        "truncated": len(displayable_ids) > len(nodes) or visible_edge_count > len(edges),
         "overview": retriever.overview(
             user_id=user,
             allowed_node_ids=visible_ids if trace_is_precomputed else None,
