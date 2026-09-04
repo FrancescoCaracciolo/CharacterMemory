@@ -58,6 +58,12 @@ the rest of the library uses):
 | `OPENAI_MODEL`     | `gpt-5.4-mini`     | Model used for extraction.                               |
 | `OPENAI_EMBEDDINGS_BASE_URL` | OpenAI API | Embeddings endpoint.                             |
 | `OPENAI_EMBEDDINGS_MODEL`    | `text-embedding-ada-002` | Embeddings model.                         |
+| `CM_TEMPORAL_RESOLUTION_ENABLED` | `true` | Enable automatic temporal recall.                 |
+| `CM_TEMPORAL_RESOLUTION_ENGINE` | `dateparser` | Local fast engine; set `llm` to opt into one model call. |
+| `CM_TEMPORAL_RESOLUTION_TIMEZONE` | `UTC` | IANA timezone for “yesterday”/calendar boundaries. |
+| `CM_TEMPORAL_RESOLUTION_WEIGHT` | `1.0` | Temporal recall-score contribution (`0..1`).       |
+| `CM_TEMPORAL_RESOLUTION_LANGUAGES` | _empty_ | Comma-separated ISO language codes.            |
+| `CM_TEMPORAL_LLM_BASE_URL` / `API_KEY` / `MODEL` | main LLM settings | Dedicated endpoint for `engine=llm`. |
 | `CM_ASSETS_DIR`    | `./assets`         | Root folder scanned for character subdirectories.        |
 | `CM_SAVE_DIR`      | `./.cm_servers`    | Where each character's SQLite store + indexes live.      |
 | `CM_REBUILD_KG`    | _empty_            | Comma-separated character names to rebuild at startup, or `all`. |
@@ -65,6 +71,11 @@ the rest of the library uses):
 
 Both `CM_ASSETS_DIR` and `CM_SAVE_DIR` are relative to the **current working
 directory** (the server has no notion of a repo root once installed).
+
+Per-character `config.yaml` can override the same feature under
+`temporal_resolution:`. The server enables the local `dateparser` engine by
+default; the LLM engine remains inactive unless explicitly selected. See
+[the temporal-resolution guide](../../docs/temporal_resolution.md).
 
 ### API key authentication
 
@@ -207,6 +218,16 @@ user.
   "chat_id": "9b3f1c2a4d5e6f708192...",
   "context_order": ["character_info", "prompt:style", "dialogue_style"],
   "context_text": "## Character Information\n...\n\nUse these examples only for style.\n\n## Example Exchanges...",
+  "memories": {
+    "character_info": [
+      {
+        "text": "Kurisu is a gifted neuroscientist.",
+        "score": 0.82,
+        "kind": "character_info",
+        "metadata": {"source": "Information/profile.md"}
+      }
+    ]
+  },
   "context": {
     "character_info": "## Character Information\n...",
     "prompt:style": "Use these examples only for style.",
@@ -222,7 +243,11 @@ disabled items are omitted. Typical memory keys:
 
 `context_order` is the authoritative item order, including intermediate
 prompts. `context_text` is the same content already joined with blank lines,
-ready to pass to an LLM without relying on JSON object key ordering.
+ready to pass to an LLM without relying on JSON object key ordering. `memories`
+contains the exact retrieved `MemoryItem`s used for each rendered memory
+section, grouped by memory name; each item includes its `text`, retrieval
+`score`, `kind`, and backend `metadata`. Intermediate `prompt:<id>` blocks do
+not appear in `memories` because they are authored prompt text, not retrievals.
 
 | Key                | Memory contents                                         |
 |--------------------|---------------------------------------------------------|
@@ -430,7 +455,7 @@ Minimal live knowledge-graph surface intended to be embedded directly:
 
 ```html
 <iframe
-  src="http://localhost:8000/gui/embed/knowledge-graph?character=Kurisu"
+  src="http://localhost:8000/gui/embed/knowledge-graph?character=Kurisu&user=alice&theme=dark&color_bg=101522"
   title="Live memory activations"
 ></iframe>
 ```
@@ -440,6 +465,25 @@ only the newest activation field, and explicitly allows framing. The top
 **Recalled memories** button opens a vertically scrolling drawer containing the
 items returned by the latest `/context` request. Group chats get a participant
 selector only when more than one graph is present.
+
+The optional `user=<id>` selector matches the current speaker exactly and
+case-sensitively. It filters replay and future SSE events and keeps only that
+speaker's graph entry from a group event. When omitted, the stream remains the
+unrestricted administrative monitor. The graph snapshot itself follows the
+character's configured `none`, `exclude`, or `private` knowledge-graph policy.
+
+Iframe-only appearance options are `theme=system|light|dark`,
+`repulsion=500..8000`, `link_distance=30..220`, `gravity=0..0.06`,
+`particle_speed=0..3`, `label_zoom=1.2..4`, `toolbar=0|1`, and `recalls=0|1`.
+The full graph palette is available through `color_bg`, `color_label`,
+`color_label_shadow`, `color_ink`, `color_muted`, `color_muted_edge`,
+`color_self`, `color_person`, `color_fact`, `color_episode`, `color_entity`,
+`color_node`, `color_relation_edge`, `color_fact_edge`, `color_episode_edge`,
+`color_transition_edge`, `color_cooccurrence_edge`, and `color_edge`. Colors
+must be six-digit hexadecimal values, with an optional leading `#`; URL-encode
+a literal `#`. Numeric values are clamped, invalid values are ignored, and
+URL values override local storage for that iframe without changing persisted
+GUI settings.
 
 With `CM_API_KEY` enabled, a same-origin browser session reuses the key already
 stored by the normal GUI. A host that cannot use that storage may append
@@ -455,7 +499,10 @@ current in-memory session history (up to 25 events), then emits one `context`
 event after each successful `POST /context`. Events include the request
 metadata, the weighted retrieval query, each recalled memory's rendered section
 and items, and a capped graph payload built from the activation trace captured
-during that same recall. `POST /context` itself remains unchanged.
+during that same recall. Pass optional `user=<id>` to receive only events whose
+current speaker matches exactly; omission preserves the unrestricted stream.
+The `/context` response remains backward-compatible and also exposes those
+retrieved items under its `memories` field.
 
 This broker is process-local and intended for the documented single-worker
 server. It is not a durable or multi-worker event transport.

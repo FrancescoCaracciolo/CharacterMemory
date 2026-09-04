@@ -5,6 +5,8 @@ Every memory system subclasses `Memory`. The agent iterates the
 them. 
 """
 
+from __future__ import annotations
+
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -15,6 +17,7 @@ from ..rag.base import Query
 
 if TYPE_CHECKING:  # avoid a circular import at runtime (extract.py imports base)
     from .extract import ExtractionContext
+    from ..temporal import TemporalResolution, TemporalResolutionEngine
 
 
 def _relative_age(seconds: float) -> str:
@@ -177,11 +180,67 @@ class Memory(ABC):
     #: :attr:`MemoryConfig.timestamp_style`; direct ``Character(memories=...)``
     #: callers keep this default or set it themselves.
     timestamp_style: str = "both"
+    # The orchestrator only forwards temporal kwargs to opt-in memories. This
+    # preserves source compatibility with third-party Memory subclasses.
+    supports_temporal_resolution: bool = False
 
     def __init__(self, *, enabled: bool = True, name: Optional[str] = None) -> None:
         self.enabled = enabled
+        self.temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None
+        self.temporal_resolution_timezone: str = "UTC"
+        self.temporal_resolution_weight: float = 1.0
         if name is not None:
             self.name = name
+
+    def resolve_temporal(
+        self,
+        query: Query,
+        temporal_resolution: bool | "TemporalResolution" | None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+    ) -> Optional["TemporalResolution"]:
+        """Normalize recall's public temporal arguments, failing open."""
+        if not temporal_resolution:
+            return None
+        from ..temporal import TemporalResolution
+
+        if isinstance(temporal_resolution, TemporalResolution):
+            return temporal_resolution
+        engine = temporal_resolution_engine or self.temporal_resolution_engine
+        if engine is None:
+            return None
+        try:
+            return engine.resolve(query, timezone=self.temporal_resolution_timezone)
+        except Exception:
+            # Temporal matching is ranking enrichment: parser/backend failures
+            # must retain the legacy semantic results.
+            return None
+
+    def _recall_with_temporal(
+        self,
+        query: Query,
+        user_id: str,
+        limit: int,
+        *,
+        state_changing: bool,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: Optional[float] = None,
+    ) -> list[MemoryItem]:
+        if self.supports_temporal_resolution:
+            return self.recall(
+                query,
+                user_id,
+                limit,
+                state_changing=state_changing,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=(
+                    self.temporal_resolution_weight
+                    if temporal_weight is None
+                    else temporal_weight
+                ),
+            )
+        return self.recall(query, user_id, limit, state_changing=state_changing)
 
     @abstractmethod
     def recall(
@@ -226,22 +285,52 @@ class Memory(ABC):
         return "\n".join(item_bullet(it, self.timestamp_style) for it in items)
 
     def build_section(
-        self, query: Query, user_id: str, limit: int, state_changing: bool = True
+        self,
+        query: Query,
+        user_id: str,
+        limit: int,
+        state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: Optional[float] = None,
     ) -> Optional[str]:
         """Recall (if enabled) and format; `None` when there is nothing to show.
 
         `state_changing` is forwarded to :meth:`recall`.
         """
         return self.build_section_result(
-            query, user_id, limit, state_changing=state_changing
+            query,
+            user_id,
+            limit,
+            state_changing=state_changing,
+            temporal_resolution=temporal_resolution,
+            temporal_resolution_engine=temporal_resolution_engine,
+            temporal_weight=temporal_weight,
         ).body
 
     def build_section_result(
-        self, query: Query, user_id: str, limit: int, state_changing: bool = True
+        self,
+        query: Query,
+        user_id: str,
+        limit: int,
+        state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: Optional[float] = None,
     ) -> RecallResult:
         """Recall and render once, retaining the actual items for inspection."""
         items = (
-            self.recall(query, user_id, limit, state_changing=state_changing)
+            self._recall_with_temporal(
+                query,
+                user_id,
+                limit,
+                state_changing=state_changing,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=temporal_weight,
+            )
             if self.enabled
             else []
         )
@@ -259,6 +348,10 @@ class Memory(ABC):
         participants: list[str],
         limit: int,
         state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: Optional[float] = None,
     ) -> list[MemoryItem]:
         """Recall items for the conversation's participants.
 
@@ -273,17 +366,37 @@ class Memory(ABC):
         if not participants:
             return []
         if len(participants) == 1:
-            return self.recall(
-                query, participants[0], limit, state_changing=state_changing
+            return self._recall_with_temporal(
+                query,
+                participants[0],
+                limit,
+                state_changing=state_changing,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=temporal_weight,
             )
         if self.scope is MemoryScope.CHARACTER:
-            return self.recall(
-                query, participants[0], limit, state_changing=state_changing
+            return self._recall_with_temporal(
+                query,
+                participants[0],
+                limit,
+                state_changing=state_changing,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=temporal_weight,
             )
         items: list[MemoryItem] = []
         for uid in participants:
             items.extend(
-                self.recall(query, uid, limit, state_changing=state_changing)
+                self._recall_with_temporal(
+                    query,
+                    uid,
+                    limit,
+                    state_changing=state_changing,
+                    temporal_resolution=temporal_resolution,
+                    temporal_resolution_engine=temporal_resolution_engine,
+                    temporal_weight=temporal_weight,
+                )
             )
         return items
 
@@ -325,6 +438,10 @@ class Memory(ABC):
         participants: list[str],
         limit: int,
         state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: Optional[float] = None,
     ) -> Optional[str]:
         """Recall + format for a multi-participant conversation.
 
@@ -336,7 +453,13 @@ class Memory(ABC):
         :meth:`format_grouped`.
         """
         return self.build_section_participants_result(
-            query, participants, limit, state_changing=state_changing
+            query,
+            participants,
+            limit,
+            state_changing=state_changing,
+            temporal_resolution=temporal_resolution,
+            temporal_resolution_engine=temporal_resolution_engine,
+            temporal_weight=temporal_weight,
         ).body
 
     def build_section_participants_result(
@@ -345,18 +468,34 @@ class Memory(ABC):
         participants: list[str],
         limit: int,
         state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: Optional[float] = None,
     ) -> RecallResult:
         """Group-aware equivalent of :meth:`build_section_result`."""
         if not participants:
             return RecallResult()
         if len(participants) == 1:
             return self.build_section_result(
-                query, participants[0], limit, state_changing=state_changing
+                query,
+                participants[0],
+                limit,
+                state_changing=state_changing,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=temporal_weight,
             )
         if not self.enabled:
             return RecallResult()
         items = self.recall_participants(
-            query, participants, limit, state_changing=state_changing
+            query,
+            participants,
+            limit,
+            state_changing=state_changing,
+            temporal_resolution=temporal_resolution,
+            temporal_resolution_engine=temporal_resolution_engine,
+            temporal_weight=temporal_weight,
         )
         if not items:
             return RecallResult(items=[])

@@ -20,7 +20,7 @@ thin orchestrator over :mod:`ingest`, :mod:`activation`, and
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from ..config import KnowledgeGraphConfig, KnowledgeGraphPrivacy
 from ..llm.base import LLMClient
@@ -73,6 +73,9 @@ from .persistence import (
     sync_hybrid_index,
 )
 from .projectors import ProjectionResult, graph_source_projectors
+
+if TYPE_CHECKING:
+    from ..temporal import TemporalMatch, TemporalResolution
 
 
 _NodeAddedCallback = Callable[[Node], None]
@@ -143,6 +146,7 @@ class KnowledgeGraphRetriever:
         self.sources_wired = False
         self._pending_projection_meta: dict[str, tuple[int, str]] = {}
         self._last_projection_report: dict[str, dict[str, int]] = {}
+        self._last_temporal_matches: dict[str, "TemporalMatch"] = {}
 
     # --------------------------------------------------------------- backends
     def load(
@@ -890,6 +894,8 @@ class KnowledgeGraphRetriever:
         query: str,
         *,
         allowed_node_ids: Optional[frozenset[str]] = None,
+        temporal_resolution: Optional["TemporalResolution"] = None,
+        temporal_weight: float = 1.0,
     ) -> dict[str, float]:
         """RRF-score the query against the node-text index + seed the SelfNode.
 
@@ -900,6 +906,7 @@ class KnowledgeGraphRetriever:
         (~0.02-0.05) are drowned by the BLL term.
         """
         seeds: dict[str, float] = {}
+        self._last_temporal_matches = {}
         if (
             self.graph.SELF_ID in self.graph.nodes
             and (
@@ -941,22 +948,22 @@ class KnowledgeGraphRetriever:
         # `query` may be a bare string or a list of (text, weight) pairs
         # (history-aware retrieval). Skip only when there is no usable text at
         # all; hybrid.search already fuses the weighted list itself.
-        if self.hybrid is None or not as_queries(query):
-            return seeds
-        try:
-            if allowed_node_ids is None:
-                # Keep the unrestricted/custom-backend call shape unchanged.
-                hits = self.hybrid.search(
-                    query, k=max(10, self.config.hops * 8)
-                )
-            else:
-                hits = self.hybrid.search(
-                    query,
-                    k=max(10, self.config.hops * 8),
-                    allowed_ids=allowed_node_ids,
-                )
-        except Exception:
-            hits = []
+        hits = []
+        if self.hybrid is not None and as_queries(query):
+            try:
+                if allowed_node_ids is None:
+                    # Keep the unrestricted/custom-backend call shape unchanged.
+                    hits = self.hybrid.search(
+                        query, k=max(10, self.config.hops * 8)
+                    )
+                else:
+                    hits = self.hybrid.search(
+                        query,
+                        k=max(10, self.config.hops * 8),
+                        allowed_ids=allowed_node_ids,
+                    )
+            except Exception:
+                hits = []
         # Per-hit base scaled by both rank and qualified retrieval relevance.
         n_hits = max(1, len(hits))
         for rank, h in enumerate(hits):
@@ -977,7 +984,44 @@ class KnowledgeGraphRetriever:
             seeds[nid] = seeds.get(nid, 0.0) + (
                 rank_base * relevance + float(h.score) * self.config.match_gain
             )
+        if temporal_resolution is not None and not temporal_resolution.is_empty:
+            scale = max(0.0, min(1.0, float(temporal_weight)))
+            for node_id, node in self.graph.nodes.items():
+                if allowed_node_ids is not None and node_id not in allowed_node_ids:
+                    continue
+                interval = self._node_temporal_interval(node)
+                if interval is None:
+                    continue
+                match = temporal_resolution.match(interval[0], interval[1])
+                if match.score <= 0.0:
+                    continue
+                self._last_temporal_matches[node_id] = match
+                # Full temporal overlap uses the same base magnitude as a
+                # strong semantic seed, then normal graph spreading applies.
+                seeds[node_id] = seeds.get(node_id, 0.0) + (
+                    self.config.match_base * scale * match.score
+                )
         return seeds
+
+    def _node_temporal_interval(
+        self, node: Node
+    ) -> tuple[float, Optional[float]] | None:
+        if isinstance(node, EpisodeNode) and float(node.timestamp or 0.0) > 0.0:
+            return (float(node.timestamp), None)
+        source = str(getattr(node, "source", "") or "")
+        if ":" not in source or not self.sources_wired:
+            return None
+        memory_name, raw_id = source.split(":", 1)
+        memory = self._source_memory_for(memory_name)
+        if memory is None and memory_name == "world_records":
+            world = self._source_memory_for("world")
+            memory = getattr(world, "records", None)
+        try:
+            row = memory.get_row(int(raw_id)) if memory is not None else None
+            interval_fn = getattr(memory, "temporal_interval", None)
+            return interval_fn(row) if row is not None and callable(interval_fn) else None
+        except (TypeError, ValueError, KeyError):
+            return None
 
     def test_activation(
         self,
@@ -986,6 +1030,8 @@ class KnowledgeGraphRetriever:
         user_id: Optional[str] = None,
         user_ids: Optional[Iterable[str]] = None,
         include_internal: bool = False,
+        temporal_resolution: Optional["TemporalResolution"] = None,
+        temporal_weight: float = 1.0,
     ) -> dict[str, float]:
         """Return the public `{node_id: activation}` trace for `query`.
 
@@ -1038,7 +1084,10 @@ class KnowledgeGraphRetriever:
             else frozenset(queryable_ids)
         )
         seeds = self._seed_activations(
-            query, allowed_node_ids=search_filter
+            query,
+            allowed_node_ids=search_filter,
+            temporal_resolution=temporal_resolution,
+            temporal_weight=temporal_weight,
         )
         # Bias every active participant's PersonNode so "about me/us" wins ties.
         for viewer in viewers:
@@ -1063,6 +1112,16 @@ class KnowledgeGraphRetriever:
         # Stash on the nodes for the GUI / debugging.
         for nid, node in self.graph.nodes.items():
             comp = breakdown.get(nid, {})
+            temporal_match = self._last_temporal_matches.get(nid)
+            if temporal_match is not None and temporal_match.range is not None:
+                comp = dict(comp)
+                comp.update({
+                    "temporal_relevance": temporal_match.score,
+                    "temporal_expression": temporal_match.range.expression,
+                    "temporal_range_start": temporal_match.range.start_timestamp,
+                    "temporal_range_end": temporal_match.range.end_timestamp,
+                    "temporal_grain": temporal_match.range.grain,
+                })
             node.activation = float(comp.get("score", 0.0))
             node.score_breakdown = dict(comp)
         trace = {nid: comp["score"] for nid, comp in breakdown.items()}
@@ -1076,6 +1135,8 @@ class KnowledgeGraphRetriever:
         user_id: Optional[str] = None,
         user_ids: Optional[Iterable[str]] = None,
         include_internal: bool = False,
+        temporal_resolution: Optional["TemporalResolution"] = None,
+        temporal_weight: float = 1.0,
     ) -> dict[str, dict[str, float]]:
         """Read-only activation trace with episode emotion components."""
         activation = self.test_activation(
@@ -1083,6 +1144,8 @@ class KnowledgeGraphRetriever:
             user_id=user_id,
             user_ids=user_ids,
             include_internal=include_internal,
+            temporal_resolution=temporal_resolution,
+            temporal_weight=temporal_weight,
         )
         self_node = self.graph.nodes.get(self.graph.SELF_ID)
         current_mood = getattr(self_node, "current_mood", {}) or {}
@@ -1121,6 +1184,8 @@ class KnowledgeGraphRetriever:
         token_budget: int = 1_000,
         state_changing: bool = True,
         timestamp_style: str = "both",
+        temporal_resolution: Optional["TemporalResolution"] = None,
+        temporal_weight: float = 1.0,
     ) -> list[MemoryItem]:
         """Return activation-ranked nodes that fit within ``token_budget``.
 
@@ -1147,6 +1212,8 @@ class KnowledgeGraphRetriever:
             user_id=user_id,
             user_ids=user_ids,
             include_internal=include_internal,
+            temporal_resolution=temporal_resolution,
+            temporal_weight=temporal_weight,
         )
         ranked = sorted(
             ((a, nid) for nid, a in act.items() if a >= self.config.min_activation),
@@ -1276,6 +1343,16 @@ class KnowledgeGraphRetriever:
         created_at = getattr(node, "created_at", None)
         if created_at is not None:
             metadata["created_at"] = float(created_at)
+        if isinstance(node, EpisodeNode) and float(node.timestamp or 0.0) > 0.0:
+            metadata["occurred_at"] = float(node.timestamp)
+        breakdown = getattr(node, "score_breakdown", None)
+        if isinstance(breakdown, dict):
+            for key in (
+                "temporal_relevance", "temporal_expression",
+                "temporal_range_start", "temporal_range_end", "temporal_grain",
+            ):
+                if key in breakdown:
+                    metadata[key] = breakdown[key]
         shift = getattr(node, "emotional_shift", None)
         if isinstance(shift, dict):
             self_node = self.graph.nodes.get(self.graph.SELF_ID)

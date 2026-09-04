@@ -28,6 +28,12 @@ class HeartbeatJournal(StructuredMemory):
     text_column = "summary"
     kinds = frozenset({"discovery", "action"})
 
+    def temporal_interval(
+        self, row: dict[str, Any]
+    ) -> tuple[float, None] | None:
+        created_at = row.get("created_at")
+        return (float(created_at), None) if created_at is not None else None
+
     @classmethod
     def validate_kind(cls, kind: str) -> str:
         value = str(kind or "").strip().lower()

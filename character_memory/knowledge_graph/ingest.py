@@ -686,7 +686,8 @@ def ingest_episodes(
             if not summary:
                 continue
             owner = str(r.get("user_id") or "")
-            ts = float(r.get("created_at") or 0.0) or _now()
+            created_at = float(r.get("created_at") or 0.0) or _now()
+            occurred_at = float(r.get("occurred_at") or 0.0) or created_at
             eid = graph.next_id("episode")
             ep_node = EpisodeNode(
                 id=eid,
@@ -698,10 +699,10 @@ def ingest_episodes(
                     allowed_axes=episodic.emotion_baseline,
                 ),
                 importance=_clip(r.get("importance", 0.5)),
-                timestamp=ts,
-                created_at=ts,
+                timestamp=occurred_at,
+                created_at=created_at,
                 source=f"episodic:{r.get('id')}",
-                practice_times=[ts],
+                practice_times=[created_at],
                 chat_id=r.get("chat_id"),
             )
             graph.add_node(ep_node)
@@ -733,7 +734,7 @@ def ingest_episodes(
                             + 0.3 * ep_node.importance,
                         ),
                     ),
-                    timestamp=ts,
+                    timestamp=occurred_at,
                     emotional_shift=ep_node.emotional_shift,
                     importance=ep_node.importance,
                     recall=False,

@@ -1,6 +1,7 @@
 """Episodic memory: events weighted by emotional impact and mood congruence."""
 
 import json
+import sqlite3
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Optional
 from ..config import ContradictionPolicy
@@ -34,6 +35,8 @@ class EpisodicMemory(StructuredMemory):
         # Used by the knowledge graph to link facts and episodes of the same chat.
         "chat_id": "TEXT",
         "source_message_ids": "TEXT NOT NULL DEFAULT '[]'",
+        # Semantic event time, distinct from when extraction stored the row.
+        "occurred_at": "REAL",
     }
     text_column = "summary"
 
@@ -50,6 +53,54 @@ class EpisodicMemory(StructuredMemory):
         )
         self._current_mood_provider = current_mood
         super().__init__(*args, **kwargs)
+        if "occurred_at" not in self.store.columns(self.table):
+            try:
+                self.store.execute(
+                    f"ALTER TABLE {self.table} ADD COLUMN occurred_at REAL"
+                )
+            except sqlite3.OperationalError:
+                if "occurred_at" not in self.store.columns(self.table):
+                    raise
+        self._backfill_occurrence_times()
+
+    def temporal_interval(
+        self, row: dict[str, Any]
+    ) -> tuple[float, Optional[float]] | None:
+        occurred_at = row.get("occurred_at")
+        return (float(occurred_at), None) if occurred_at is not None else None
+
+    def _source_timestamp(self, message_ids: list[int]) -> Optional[float]:
+        if not message_ids:
+            return None
+        placeholders = ",".join("?" for _ in message_ids)
+        try:
+            rows = self.store.execute(
+                f"SELECT occurred_at, created_at FROM messages WHERE id IN ({placeholders}) ORDER BY id ASC",
+                [int(value) for value in message_ids],
+            )
+        except sqlite3.OperationalError:
+            return None
+        for row in rows:
+            value = row.get("occurred_at")
+            if value is None:
+                value = row.get("created_at")
+            if value is not None:
+                return float(value)
+        return None
+
+    def _backfill_occurrence_times(self) -> None:
+        for row in self.store.select(self.table):
+            if row.get("occurred_at") is not None:
+                continue
+            try:
+                ids = [int(value) for value in json.loads(row.get("source_message_ids") or "[]")]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                ids = []
+            value = self._source_timestamp(ids)
+            if value is None:
+                continue
+            row["occurred_at"] = value
+            self.update_row(row)
 
     def _current_mood(self) -> dict[str, float]:
         if self._current_mood_provider is None:
@@ -72,6 +123,7 @@ class EpisodicMemory(StructuredMemory):
         emotional_shift: Mapping[str, float] | None = None,
         chat_id: Optional[str] = None,
         source_message_ids: Optional[list[int]] = None,
+        occurred_at: Optional[float] = None,
     ) -> int:
         return self.add(
             user_id,
@@ -83,6 +135,11 @@ class EpisodicMemory(StructuredMemory):
             ),
             chat_id=chat_id,
             source_message_ids=json.dumps(source_message_ids or []),
+            occurred_at=(
+                float(occurred_at)
+                if occurred_at is not None
+                else self._source_timestamp(source_message_ids or [])
+            ),
         )
 
     def _effective(self, row: dict[str, Any]) -> float:
@@ -93,7 +150,7 @@ class EpisodicMemory(StructuredMemory):
             base_importance=float(row["importance"]),
             recall_count=int(row.get("recall_count", 0)),
             age_seconds=age_seconds(
-                float(row["created_at"]), row.get("last_recalled"), self._now()
+                self._age_anchor(row), row.get("last_recalled"), self._now()
             ),
             half_life=self.half_life,
             emotion_impact=impact,
@@ -200,6 +257,7 @@ class EpisodicMemory(StructuredMemory):
                 emotional_shift=emotional_shift,
                 chat_id=chat_id,
                 source_message_ids=source_message_ids,
+                occurred_at=self._source_timestamp(source_message_ids),
             )
             row = self.get_row(row_id)
             if row is not None:

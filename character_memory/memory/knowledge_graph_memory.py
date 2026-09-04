@@ -23,10 +23,12 @@ from ..knowledge_graph import (
 )
 from ..memory.store import SQLiteStore
 from ..rag.hybrid import HybridSearch
+from ..rag.base import Query
 from .base import Memory, MemoryItem, MemoryScope, RecallResult
 
 if TYPE_CHECKING:  # avoid a circular import at runtime
     from ..memory.dedup import DedupReport
+    from ..temporal import TemporalResolution, TemporalResolutionEngine
 
 
 class KnowledgeGraphMemory(Memory):
@@ -38,6 +40,7 @@ class KnowledgeGraphMemory(Memory):
 
     name = "knowledge_graph"
     scope = MemoryScope.PER_USER
+    supports_temporal_resolution = True
 
     def __init__(
         self,
@@ -82,10 +85,14 @@ class KnowledgeGraphMemory(Memory):
     # ---------------------------------------------------------------- Memory API
     def recall(
         self,
-        query: str,
+        query: Query,
         user_id: str,
         limit: int,
         state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: float = 1.0,
     ) -> list[MemoryItem]:
         """Recall nodes within ``limit`` prompt tokens.
 
@@ -95,12 +102,17 @@ class KnowledgeGraphMemory(Memory):
         """
         if not self.enabled:
             return []
+        resolution = self.resolve_temporal(
+            query, temporal_resolution, temporal_resolution_engine
+        )
         return self.retriever.retrieve(
             query,
             user_id=user_id,
             token_budget=limit,
             state_changing=state_changing,
             timestamp_style=self.timestamp_style,
+            temporal_resolution=resolution,
+            temporal_weight=temporal_weight,
         )
 
     def _activation_snapshot(
@@ -140,13 +152,23 @@ class KnowledgeGraphMemory(Memory):
 
     def build_section_result(
         self,
-        query: str,
+        query: Query,
         user_id: str,
         limit: int,
         state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: Optional[float] = None,
     ) -> RecallResult:
         result = super().build_section_result(
-            query, user_id, limit, state_changing=state_changing
+            query,
+            user_id,
+            limit,
+            state_changing=state_changing,
+            temporal_resolution=temporal_resolution,
+            temporal_resolution_engine=temporal_resolution_engine,
+            temporal_weight=temporal_weight,
         )
         if result.items:
             result.diagnostics = self._activation_snapshot(
@@ -157,27 +179,46 @@ class KnowledgeGraphMemory(Memory):
 
     def build_section_participants_result(
         self,
-        query: str,
+        query: Query,
         participants: list[str],
         limit: int,
         state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: Optional[float] = None,
     ) -> RecallResult:
         if not participants:
             return RecallResult()
         if len(participants) == 1:
             return self.build_section_result(
-                query, participants[0], limit, state_changing=state_changing
+                query,
+                participants[0],
+                limit,
+                state_changing=state_changing,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=temporal_weight,
             )
         if not self.enabled:
             return RecallResult()
 
         if self.retriever._privacy_mode() is not KnowledgeGraphPrivacy.NONE:
+            resolution = self.resolve_temporal(
+                query, temporal_resolution, temporal_resolution_engine
+            )
             items = self.retriever.retrieve(
                 query,
                 user_ids=participants,
                 token_budget=limit,
                 state_changing=state_changing,
                 timestamp_style=self.timestamp_style,
+                temporal_resolution=resolution,
+                temporal_weight=(
+                    self.temporal_resolution_weight
+                    if temporal_weight is None
+                    else temporal_weight
+                ),
             )
             if not items:
                 return RecallResult()
@@ -203,7 +244,13 @@ class KnowledgeGraphMemory(Memory):
         by_participant: dict[str, dict[str, Any]] = {}
         for uid in participants:
             result = self.build_section_result(
-                query, uid, limit, state_changing=False
+                query,
+                uid,
+                limit,
+                state_changing=False,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=temporal_weight,
             )
             for item in result.items:
                 node_id = str(item.metadata.get("node_id") or "")

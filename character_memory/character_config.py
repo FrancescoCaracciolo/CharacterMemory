@@ -28,6 +28,9 @@ default, unknown keys are ignored so the format is forward-compatible)::
     chunking:   { info_chunker, dialogue_chunker, header_max_tokens,
                   header_min_tokens, dialogue_turns_per_chunk,
                   dialogue_context_width }
+    temporal_resolution:
+      { enabled, engine, timezone, weight, languages,
+        llm: { base_url, api_key, model, timeout, max_tokens } }
     memory:
       enabled_character_info: true     # and every other enabled_* toggle
       character_info_k: 4              # top-k sizes for non-KG memories
@@ -77,6 +80,8 @@ from .config import (
     KnowledgeGraphConfig,
     LLMConfig,
     MemoryConfig,
+    TemporalLLMConfig,
+    TemporalResolutionConfig,
     WorldConfig,
 )
 from .prompts import PromptConfig
@@ -172,6 +177,8 @@ _SUBCONFIG_TYPES = {
     KnowledgeGraphConfig: "knowledge_graph",
     WorldConfig: "world",
     CalendarConfig: "calendar",
+    TemporalLLMConfig: "llm",
+    TemporalResolutionConfig: "temporal_resolution",
 }
 
 
@@ -285,11 +292,19 @@ def _build_prompt_config(data: Optional[dict[str, Any]]) -> PromptConfig:
 
 def build_full_config(data: dict[str, Any]) -> tuple[CharacterMemoryConfig, PromptConfig]:
     """Build the full config pair (``CharacterMemoryConfig``, ``PromptConfig``)."""
+    temporal = _build_subconfig(
+        TemporalResolutionConfig, data.get("temporal_resolution")
+    )
+    if isinstance(data.get("temporal_resolution"), dict):
+        raw_llm = data["temporal_resolution"].get("llm")
+        if isinstance(raw_llm, dict):
+            temporal.llm = _build_subconfig(TemporalLLMConfig, raw_llm)
     full = CharacterMemoryConfig(
         llm=_build_subconfig(LLMConfig, data.get("llm")),
         embedding=_build_subconfig(EmbeddingConfig, data.get("embedding")),
         chunking=_build_subconfig(ChunkingConfig, data.get("chunking")),
         memory=_build_memory_config(data.get("memory")),
+        temporal_resolution=temporal,
     )
     prompts = _build_prompt_config(data.get("prompts"))
     return full, prompts
@@ -448,6 +463,7 @@ def _config_to_dict(config: CharacterMemoryConfig) -> dict[str, Any]:
             "embedding": asdict(config.embedding),
             "chunking": asdict(config.chunking),
             "memory": asdict(config.memory),
+            "temporal_resolution": asdict(config.temporal_resolution),
         }
     )
 

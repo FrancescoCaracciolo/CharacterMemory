@@ -1,5 +1,7 @@
 """A character bundles an identity with the memory systems it can recall from and write to."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from character_memory.llm.base import LLMClient
@@ -8,6 +10,7 @@ from .memory.extract import Extractor, ExtractionContext, build_extraction
 from .memory.base import Memory, MemoryItem, RecallResult
 from .memory.structured import StructuredMemory
 from .rag.base import Query
+from .temporal import TemporalResolution
 
 
 @dataclass
@@ -32,6 +35,7 @@ class ContextSnapshot:
     query: Query
     user_id: str
     participants: list[str]
+    temporal_resolution: Optional[TemporalResolution] = None
 
 
 class Character:
@@ -154,6 +158,8 @@ class Character:
         user_id: str = "default",
         limits: dict[str, int] = {},
         participants: Optional[list[str]] = None,
+        temporal_resolution: Optional[TemporalResolution] = None,
+        temporal_weight: float = 1.0,
     ) -> ContextSnapshot:
         """Build the context and retain the exact items recalled by each memory.
 
@@ -186,10 +192,20 @@ class Character:
                 continue
             if multi:
                 result: RecallResult = mem.build_section_participants_result(
-                    query, participants, limits.get(name, 0)
+                    query,
+                    participants,
+                    limits.get(name, 0),
+                    temporal_resolution=temporal_resolution,
+                    temporal_weight=temporal_weight,
                 )
             else:
-                result = mem.build_section_result(query, user_id, limits.get(name, 0))
+                result = mem.build_section_result(
+                    query,
+                    user_id,
+                    limits.get(name, 0),
+                    temporal_resolution=temporal_resolution,
+                    temporal_weight=temporal_weight,
+                )
             if not result.body:
                 continue
             title = self._header_for_multi(name) if multi else self._header_for(name)
@@ -248,6 +264,7 @@ class Character:
             query=query,
             user_id=user_id,
             participants=list(participants or [user_id]),
+            temporal_resolution=temporal_resolution,
         )
 
     def build_context(
@@ -256,10 +273,17 @@ class Character:
         user_id: str = "default",
         limits: dict[str, int] = {},
         participants: Optional[list[str]] = None,
+        temporal_resolution: Optional[TemporalResolution] = None,
+        temporal_weight: float = 1.0,
     ) -> dict[str, str]:
         """Return ordered rendered memory sections and intermediate prompts."""
         return self.build_context_snapshot(
-            query, user_id, limits=limits, participants=participants
+            query,
+            user_id,
+            limits=limits,
+            participants=participants,
+            temporal_resolution=temporal_resolution,
+            temporal_weight=temporal_weight,
         ).sections
 
     def _header_for_multi(self, name: str) -> str:
@@ -277,9 +301,18 @@ class Character:
         user_id: str = "default",
         limits: dict[str, int] = {},
         participants: Optional[list[str]] = None,
+        temporal_resolution: Optional[TemporalResolution] = None,
+        temporal_weight: float = 1.0,
     ) -> str:
         """Full system-style context block (system line + all sections)."""
-        sections = self.build_context(query, user_id, limits=limits, participants=participants)
+        sections = self.build_context(
+            query,
+            user_id,
+            limits=limits,
+            participants=participants,
+            temporal_resolution=temporal_resolution,
+            temporal_weight=temporal_weight,
+        )
         if self.prompts is None:
             parts = []
             if self.base_instruction:

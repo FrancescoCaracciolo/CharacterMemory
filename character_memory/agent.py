@@ -38,6 +38,7 @@ from .config import (
     EmbeddingConfig,
     LLMConfig,
     MemoryConfig,
+    TemporalResolutionConfig,
 )
 from .llm.base import LLMClient
 from .llm.embedding_base import EmbeddingProvider
@@ -74,6 +75,13 @@ from .tools.memory_tools import memory_tools as _build_memory_tools
 from .tools.world_tools import world_tools as _build_world_tools
 from .tools.calendar_tools import calendar_tools as _build_calendar_tools
 from .tools.registry import ToolRegistry
+from .temporal import (
+    DateParserTemporalResolutionEngine,
+    LLMTemporalResolutionEngine,
+    TemporalResolution,
+    TemporalResolutionEngine,
+    get_temporal_resolution_engine,
+)
 
 _INFO_GLOB = "Information"
 _DIALOGUE_GLOB = "Dialogues"
@@ -138,6 +146,7 @@ class CharacterAgent:
         save_directory: Optional[str] = None,
         prompt_config: Optional[PromptConfig] = None,
         persona: str = "",
+        temporal_resolution_engine: Optional[TemporalResolutionEngine] = None,
     ) -> None:
         self.character_dir = directory
         self.character_name = name or os.path.basename(os.path.normpath(directory))
@@ -161,6 +170,8 @@ class CharacterAgent:
         # Path of the config.yaml last loaded, when `load_from_config(path)`
         # was used. None until then.
         self.config_path: Optional[str] = None
+        self.temporal_resolution_engine = temporal_resolution_engine
+        self._temporal_resolution_engine_explicit = temporal_resolution_engine is not None
 
         # Not wired until load_* is called.
         self.config: Optional[CharacterMemoryConfig] = None
@@ -174,6 +185,38 @@ class CharacterAgent:
         self._limits: dict[str, int] = {}
         self._chats: Optional[_ChatBackend] = None
         self._built = False
+
+    def _configure_temporal_resolution(
+        self, config: Optional[TemporalResolutionConfig]
+    ) -> None:
+        """Build the configured engine once; memories share this instance."""
+        if config is not None and not config.enabled:
+            self.temporal_resolution_engine = None
+            return
+        if self._temporal_resolution_engine_explicit:
+            return
+        cfg = config or TemporalResolutionConfig()
+        if cfg.engine in {"dateparser", "fast"}:
+            self.temporal_resolution_engine = DateParserTemporalResolutionEngine(
+                cfg.languages
+            )
+            return
+        if cfg.engine == "llm":
+            from .llm.openai_client import OpenAICompatibleLLM
+
+            llm_config = LLMConfig(
+                base_url=cfg.llm.base_url,
+                api_key=cfg.llm.api_key,
+                model=cfg.llm.model,
+                temperature=0.0,
+                max_tokens=cfg.llm.max_tokens,
+                timeout=cfg.llm.timeout,
+            )
+            self.temporal_resolution_engine = LLMTemporalResolutionEngine(
+                OpenAICompatibleLLM(llm_config), max_tokens=cfg.llm.max_tokens
+            )
+            return
+        self.temporal_resolution_engine = get_temporal_resolution_engine(cfg.engine)
 
     # Require loaded state before executing some actions
     def _require_loaded(self) -> None:
@@ -252,6 +295,7 @@ class CharacterAgent:
 
         self.llm = llm or OpenAICompatibleLLM(full.llm)
         self.embedder = embedder or OpenAICompatibleEmbeddings(full.embedding)
+        self._configure_temporal_resolution(full.temporal_resolution)
 
         self._open_store()
         self._build_memories(full.memory)
@@ -275,6 +319,7 @@ class CharacterAgent:
         self.config = None
         self.llm = llm
         self.embedder = embedder
+        self._configure_temporal_resolution(None)
         self._open_store()
         self.memories = {m.name: m for m in memories}
         self._wire_character()
@@ -396,6 +441,19 @@ class CharacterAgent:
             mem.timestamp_style = m.timestamp_style
 
     def _wire_character(self) -> None:
+        temporal_config = (
+            self.config.temporal_resolution
+            if self.config is not None
+            else TemporalResolutionConfig()
+        )
+        for memory in self.memories.values():
+            memory.temporal_resolution_engine = self.temporal_resolution_engine
+            memory.temporal_resolution_timezone = temporal_config.timezone
+            memory.temporal_resolution_weight = temporal_config.weight
+            if isinstance(memory, WorldMemory):
+                memory.records.temporal_resolution_engine = self.temporal_resolution_engine
+                memory.records.temporal_resolution_timezone = temporal_config.timezone
+                memory.records.temporal_resolution_weight = temporal_config.weight
         self._limits = {
             name: (
                 self.config.memory.retrieval_limit_for(name)
@@ -701,8 +759,8 @@ class CharacterAgent:
 
     def _resolve_target(
         self, target: Target, user_id: str
-    ) -> tuple[str, str, list[dict[str, str]], list[str]]:
-        """Return (query, user_id, prior_messages, participants) for a target.
+    ) -> tuple[str, str, list[dict[str, str]], list[str], float]:
+        """Return query, owner, history, participants, and reference timestamp.
 
         - `Chat`                 -> (last user msg or "", chat.user_id, history, chat.participants())
         - chat id `str`          -> same, after load_chat
@@ -715,31 +773,62 @@ class CharacterAgent:
         """
         if isinstance(target, Chat):
             chat = target
+            rows = chat.store.select(
+                "messages",
+                where={"chat_id": chat.id, "role": "user"},
+                order_by="id DESC",
+                limit=1,
+            )
+            reference = (
+                float(rows[0].get("occurred_at") or rows[0]["created_at"])
+                if rows
+                else time.time()
+            )
             return (
                 chat.last_user_message() or "",
                 chat.user_id,
                 chat.messages(),
                 chat.participants(),
+                reference,
             )
         if isinstance(target, str):
             chat = self._as_chat(target)
             if chat is not None:
+                rows = chat.store.select(
+                    "messages",
+                    where={"chat_id": chat.id, "role": "user"},
+                    order_by="id DESC",
+                    limit=1,
+                )
+                reference = (
+                    float(rows[0].get("occurred_at") or rows[0]["created_at"])
+                    if rows
+                    else time.time()
+                )
                 return (
                     chat.last_user_message() or "",
                     chat.user_id,
                     chat.messages(),
                     chat.participants(),
+                    reference,
                 )
             # Bare query string, not a known chat id.
-            return (target, user_id, [], [user_id])
+            return (target, user_id, [], [user_id], time.time())
         # Message list.
         msgs = list(target)
         last_user = ""
+        reference = time.time()
         for m in reversed(msgs):
             if m.get("role") == "user" and m.get("content"):
                 last_user = m["content"]
+                raw_reference = m.get("occurred_at") or m.get("created_at")
+                if raw_reference is not None:
+                    try:
+                        reference = float(raw_reference)
+                    except (TypeError, ValueError):
+                        pass
                 break
-        return (last_user, user_id, msgs, [user_id])
+        return (last_user, user_id, msgs, [user_id], reference)
 
     def _weighted_query(
         self, last_user_msg: str, prior: list[dict[str, str]]
@@ -782,6 +871,32 @@ class CharacterAgent:
             queries.append((text, decay ** (i + 1)))
         return queries
 
+    def _resolve_temporal(
+        self, query: Query, reference_time: float
+    ) -> Optional[TemporalResolution]:
+        engine = self.temporal_resolution_engine
+        if engine is None:
+            return None
+        timezone = (
+            self.config.temporal_resolution.timezone
+            if self.config is not None
+            else "UTC"
+        )
+        try:
+            return engine.resolve(
+                query, reference_time=reference_time, timezone=timezone
+            )
+        except Exception:
+            # Temporal enrichment is deliberately fail-open.
+            return None
+
+    def _temporal_weight(self) -> float:
+        return (
+            self.config.temporal_resolution.weight
+            if self.config is not None
+            else 1.0
+        )
+
     # Prompt
     def build_context(
         self, target: Target, *, user_id: str = "default"
@@ -795,20 +910,32 @@ class CharacterAgent:
         """Build context once and expose the exact recalls used to build it."""
         self._require_loaded()
         assert self.character is not None
-        last_user_msg, uid, prior, participants = self._resolve_target(target, user_id)
+        last_user_msg, uid, prior, participants, reference = self._resolve_target(target, user_id)
         query = self._weighted_query(last_user_msg, prior)
+        temporal = self._resolve_temporal(query, reference)
         return self.character.build_context_snapshot(
-            query, uid, limits=self._limits, participants=participants
+            query,
+            uid,
+            limits=self._limits,
+            participants=participants,
+            temporal_resolution=temporal,
+            temporal_weight=self._temporal_weight(),
         )
 
     def render_prompt(self, target: Target, *, user_id: str = "default") -> str:
         """Full system-style context block (system line + all sections)."""
         self._require_loaded()
         assert self.character is not None
-        last_user_msg, uid, prior, participants = self._resolve_target(target, user_id)
+        last_user_msg, uid, prior, participants, reference = self._resolve_target(target, user_id)
         query = self._weighted_query(last_user_msg, prior)
+        temporal = self._resolve_temporal(query, reference)
         return self.character.render_prompt(
-            query, uid, limits=self._limits, participants=participants
+            query,
+            uid,
+            limits=self._limits,
+            participants=participants,
+            temporal_resolution=temporal,
+            temporal_weight=self._temporal_weight(),
         )
 
     # Chat management
@@ -837,10 +964,16 @@ class CharacterAgent:
         user_id: str,
         prior: list[dict[str, str]],
         participants: Optional[list[str]] = None,
+        temporal_resolution: Optional[TemporalResolution] = None,
     ) -> list[dict[str, str]]:
         assert self.character is not None
         system = self.character.render_prompt(
-            query, user_id, limits=self._limits, participants=participants
+            query,
+            user_id,
+            limits=self._limits,
+            participants=participants,
+            temporal_resolution=temporal_resolution,
+            temporal_weight=self._temporal_weight(),
         )
         return [{"role": "system", "content": system}, *prior]
 
@@ -911,9 +1044,16 @@ class CharacterAgent:
         """
         self._require_loaded()
         assert self.llm is not None
-        last_user_msg, uid, prior, participants = self._resolve_target(target, user_id)
+        last_user_msg, uid, prior, participants, reference = self._resolve_target(target, user_id)
         query = self._weighted_query(last_user_msg, prior)
-        messages = self._build_messages(query, uid, prior, participants=participants)
+        temporal = self._resolve_temporal(query, reference)
+        messages = self._build_messages(
+            query,
+            uid,
+            prior,
+            participants=participants,
+            temporal_resolution=temporal,
+        )
 
         chat: Optional[Chat] = None
         if isinstance(target, Chat):

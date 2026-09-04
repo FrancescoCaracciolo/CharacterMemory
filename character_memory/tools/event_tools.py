@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import calendar
-import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 from .base import Tool
+from ..temporal import (
+    DateParserTemporalResolutionEngine,
+    TemporalResolutionEngine,
+)
 
 if TYPE_CHECKING:
     from ..agent import CharacterAgent
@@ -74,8 +77,8 @@ class ResolveTimeRange(Tool):
     name = "resolve_time_range"
     description = (
         "Resolve a relative time expression against a reference timestamp into "
-        "a half-open occurrence range. Use it for phrases such as 'last month', "
-        "'three weeks ago', or 'yesterday', then pass the returned ISO bounds "
+        "a half-open occurrence range in many languages. Use it for phrases "
+        "such as 'last month', 'tre settimane fa', or '昨日', then pass the returned ISO bounds "
         "to search_conversation_events."
     )
     parameters = {
@@ -90,55 +93,41 @@ class ResolveTimeRange(Tool):
         "required": ["expression", "reference_time"],
     }
 
+    def __init__(
+        self,
+        engine: Optional[TemporalResolutionEngine] = None,
+        *,
+        timezone: str = "UTC",
+    ) -> None:
+        self.engine = engine or DateParserTemporalResolutionEngine()
+        self.timezone = timezone
+
     def run(self, expression: str, reference_time: str) -> dict:
         reference = parse_time(reference_time)
-        phrase = expression.strip().lower()
-        day = reference.replace(hour=0, minute=0, second=0, microsecond=0)
-        if phrase == "today":
-            return _range_payload(expression, reference, day, day + timedelta(days=1))
-        if phrase == "yesterday":
-            return _range_payload(expression, reference, day - timedelta(days=1), day)
-        if phrase in {"last week", "previous week"}:
-            this_week = day - timedelta(days=day.weekday())
-            return _range_payload(
-                expression, reference, this_week - timedelta(days=7), this_week
-            )
-        if phrase in {"last month", "previous month"}:
-            this_month = day.replace(day=1)
-            return _range_payload(
-                expression, reference, _shift_months(this_month, -1), this_month
-            )
-        if phrase in {"last year", "previous year"}:
-            this_year = day.replace(month=1, day=1)
-            return _range_payload(
-                expression, reference, this_year.replace(year=this_year.year - 1), this_year
-            )
-        match = re.fullmatch(
-            r"(?:about\s+)?(\d+)\s+(day|week|month|year)s?\s+ago", phrase
+        resolution = self.engine.resolve(
+            expression,
+            reference_time=reference,
+            timezone=self.timezone,
         )
-        if not match:
-            raise ValueError(
-                "unsupported relative expression; use today, yesterday, last "
-                "week/month/year, or '<number> <unit> ago'"
-            )
-        amount = int(match.group(1))
-        unit = match.group(2)
-        if unit == "day":
-            start = day - timedelta(days=amount)
-            end = start + timedelta(days=1)
-        elif unit == "week":
-            this_week = day - timedelta(days=day.weekday())
-            start = this_week - timedelta(weeks=amount)
-            end = start + timedelta(weeks=1)
-        elif unit == "month":
-            this_month = day.replace(day=1)
-            start = _shift_months(this_month, -amount)
-            end = _shift_months(start, 1)
-        else:
-            this_year = day.replace(month=1, day=1)
-            start = this_year.replace(year=this_year.year - amount)
-            end = start.replace(year=start.year + 1)
-        return _range_payload(expression, reference, start, end)
+        if not resolution.ranges:
+            raise ValueError(f"no temporal range found in {expression!r}")
+        resolved = max(
+            resolution.ranges,
+            key=lambda value: value.confidence * value.query_weight,
+        )
+        payload = _range_payload(
+            resolved.expression or expression,
+            reference,
+            resolved.start,
+            resolved.end,
+        )
+        payload.update({
+            "grain": resolved.grain,
+            "confidence": resolved.confidence,
+            "engine": resolution.engine,
+            "timezone": resolution.timezone,
+        })
+        return payload
 
 
 class CalculateTimeDifference(Tool):
@@ -354,7 +343,14 @@ class GetEventNeighbors(Tool):
 def conversation_event_tools(agent: "CharacterAgent") -> list[Tool]:
     """Return the standard read-only event/temporal tools bound to an agent."""
     return [
-        ResolveTimeRange(),
+        ResolveTimeRange(
+            getattr(agent, "temporal_resolution_engine", None),
+            timezone=(
+                agent.config.temporal_resolution.timezone
+                if getattr(agent, "config", None) is not None
+                else "UTC"
+            ),
+        ),
         CalculateTimeDifference(),
         SearchConversationEvents(agent),
         GetConversationEvents(agent),

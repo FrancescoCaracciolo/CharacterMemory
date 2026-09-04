@@ -7,9 +7,11 @@ Subclasses only declare their columns and how a row renders to text; all the
 recall/persist/index plumbing lives here.
 """
 
+from __future__ import annotations
+
 import time
 from collections.abc import Iterable
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..chunking.base import Chunk
 from ..config import ContradictionPolicy
@@ -23,6 +25,9 @@ from .decay import (
     relevance_repaired_score,
 )
 from .store import SQLiteStore
+
+if TYPE_CHECKING:
+    from ..temporal import TemporalMatch, TemporalResolution, TemporalResolutionEngine
 
 # Columns every structured memory gets for free (decay + multi-user bookkeeping).
 COMMON_COLUMNS: dict[str, str] = {
@@ -44,6 +49,7 @@ class StructuredMemory(Memory):
     # Retained for source compatibility with older subclasses. Relevance is
     # now part of every candidate's bounded score instead of an alternate sort.
     rank_by_relevance: bool = False
+    supports_temporal_resolution: bool = True
 
     def __init__(
         self,
@@ -250,6 +256,34 @@ class StructuredMemory(Memory):
         """Subclass hook for non-RAG triggers such as directive keywords."""
         return {}
 
+    def temporal_interval(
+        self, row: dict[str, Any]
+    ) -> tuple[float, Optional[float]] | None:
+        """Semantic event interval for temporal matching.
+
+        The default intentionally returns ``None``: ``created_at`` records
+        when a fact/profile was learned, not when that fact happened. Event
+        memories override this with their real occurrence timestamp.
+        """
+        return None
+
+    def _temporal_relevance(
+        self,
+        rows_by_id: dict[int, dict[str, Any]],
+        resolution: Optional["TemporalResolution"],
+    ) -> dict[int, "TemporalMatch"]:
+        if resolution is None or resolution.is_empty:
+            return {}
+        matches: dict[int, "TemporalMatch"] = {}
+        for row_id, row in rows_by_id.items():
+            interval = self.temporal_interval(row)
+            if interval is None:
+                continue
+            match = resolution.match(interval[0], interval[1])
+            if match.score > 0.0:
+                matches[row_id] = match
+        return matches
+
     @staticmethod
     def _hit_relevance(hits: list[Any]) -> dict[int, float]:
         """Map row ids to normalized relevance, with a generic-RAG fallback."""
@@ -284,15 +318,28 @@ class StructuredMemory(Memory):
         row: dict[str, Any],
         *,
         score: float,
-        relevance: float,
+        semantic_relevance: float,
+        temporal_relevance: float,
+        combined_relevance: float,
+        temporal_match: Optional["TemporalMatch"] = None,
     ) -> MemoryItem:
         item = self.row_item(row, score)
         item.metadata.update({
             "intrinsic_score": self._intrinsic(row),
             "familiar_score": self._effective(row),
-            "retrieval_relevance": relevance,
+            "retrieval_relevance": combined_relevance,
+            "semantic_relevance": semantic_relevance,
+            "temporal_relevance": temporal_relevance,
+            "combined_relevance": combined_relevance,
             "ranking_score": score,
         })
+        if temporal_match is not None and temporal_match.range is not None:
+            item.metadata.update({
+                "temporal_expression": temporal_match.range.expression,
+                "temporal_range_start": temporal_match.range.start_timestamp,
+                "temporal_range_end": temporal_match.range.end_timestamp,
+                "temporal_grain": temporal_match.range.grain,
+            })
         return item
 
     def recall(
@@ -302,6 +349,10 @@ class StructuredMemory(Memory):
         limit: int,
         sticky_limit: int = 10,
         state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: float = 1.0,
     ) -> list[MemoryItem]:
         if limit <= 0:
             return []
@@ -333,19 +384,37 @@ class StructuredMemory(Memory):
                     max(0.0, min(1.0, float(relevance))),
                 )
 
+        resolution = self.resolve_temporal(
+            query, temporal_resolution, temporal_resolution_engine
+        )
+        temporal_by_id = self._temporal_relevance(rows_by_id, resolution)
+        weight = max(0.0, min(1.0, float(temporal_weight)))
+
         sticky = self._sticky_rows(rows)
         sticky_ids = {int(row["id"]) for row in sticky}
         reserve_sticky = limit > 1 and sticky_limit > 0 and bool(sticky_ids)
         candidate_ids = set(relevance_by_id)
+        candidate_ids.update(temporal_by_id)
         if reserve_sticky:
             candidate_ids.update(sticky_ids)
 
-        scored: list[tuple[float, int, dict[str, Any], float]] = []
+        scored: list[
+            tuple[float, int, dict[str, Any], float, float, float, Optional["TemporalMatch"]]
+        ] = []
         for rid in candidate_ids:
             row = rows_by_id[rid]
-            relevance = relevance_by_id.get(rid, 0.0)
-            scored.append((self._rank_score(row, relevance), rid, row, relevance))
-        scored.sort(key=lambda entry: (entry[0], entry[3], -entry[1]), reverse=True)
+            semantic = relevance_by_id.get(rid, 0.0)
+            temporal_match = temporal_by_id.get(rid)
+            temporal = temporal_match.score if temporal_match is not None else 0.0
+            weighted_temporal = weight * temporal
+            # Probabilistic OR: an exact temporal hit is as useful as a strong
+            # semantic hit, while two partial signals reinforce one another.
+            combined = 1.0 - (1.0 - semantic) * (1.0 - weighted_temporal)
+            scored.append((
+                self._rank_score(row, combined), rid, row, semantic,
+                temporal, combined, temporal_match,
+            ))
+        scored.sort(key=lambda entry: (entry[0], entry[5], entry[4], entry[3], -entry[1]), reverse=True)
         if reserve_sticky:
             # A single partitioned slot prevents a collection of fresh,
             # high-importance but irrelevant sticky rows from consuming the
@@ -361,6 +430,8 @@ class StructuredMemory(Memory):
                     sticky_entries,
                     key=lambda entry: (
                         entry[0],
+                        entry[5],
+                        entry[4],
                         entry[3],
                         self._effective(entry[2]),
                         -entry[1],
@@ -368,7 +439,7 @@ class StructuredMemory(Memory):
                 ),
             ]
             chosen.sort(
-                key=lambda entry: (entry[0], entry[3], -entry[1]),
+                key=lambda entry: (entry[0], entry[5], entry[4], entry[3], -entry[1]),
                 reverse=True,
             )
         else:
@@ -376,11 +447,18 @@ class StructuredMemory(Memory):
 
         # Bump recall counters for what we surfaced (skipped when read-only).
         if state_changing:
-            self._bump_recall([row["id"] for _, _, row, _ in chosen])
+            self._bump_recall([entry[2]["id"] for entry in chosen])
 
         return [
-            self._scored_item(row, score=score, relevance=relevance)
-            for score, _, row, relevance in chosen
+            self._scored_item(
+                row,
+                score=score,
+                semantic_relevance=semantic,
+                temporal_relevance=temporal,
+                combined_relevance=combined,
+                temporal_match=temporal_match,
+            )
+            for score, _, row, semantic, temporal, combined, temporal_match in chosen
         ]
 
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:

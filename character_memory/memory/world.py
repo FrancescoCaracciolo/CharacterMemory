@@ -34,6 +34,7 @@ from .structured import StructuredMemory
 if TYPE_CHECKING:
     from .extract import ExtractionContext
     from ..tools.base import TurnEffect
+    from ..temporal import TemporalResolution, TemporalResolutionEngine
 
 
 FEATURE_DEFAULTS: dict[str, bool] = {
@@ -178,6 +179,16 @@ class WorldRecordMemory(StructuredMemory):
         "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
     }
     text_column = "content"
+
+    def temporal_interval(
+        self, row: dict[str, Any]
+    ) -> tuple[float, Optional[float]] | None:
+        # Only immutable events have a semantic occurrence time. Durable and
+        # temporary facts must not match merely because they were stored then.
+        occurred_at = row.get("occurred_at")
+        if row.get("record_type") != "event" or occurred_at is None:
+            return None
+        return (float(occurred_at), None)
 
     def row_text(self, row: dict[str, Any]) -> str:
         return str(row.get("content") or "")
@@ -985,6 +996,7 @@ class WorldMemory(Memory):
 
     name = "world"
     scope = MemoryScope.CHARACTER
+    supports_temporal_resolution = True
 
     def __init__(
         self, store: SQLiteStore, hybrid: HybridSearch, *, character_name: str,
@@ -1438,7 +1450,14 @@ class WorldMemory(Memory):
 
     def recall(
         self, query: Query, user_id: str, limit: int, state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: float = 1.0,
     ) -> list[MemoryItem]:
+        resolution = self.resolve_temporal(
+            query, temporal_resolution, temporal_resolution_engine
+        )
         snap = self.snapshot(commit=state_changing and self.config.auto_advance)
         items = [MemoryItem(
             self._snapshot_text(snap), 1.0, self.name,
@@ -1446,7 +1465,12 @@ class WorldMemory(Memory):
         )]
         if limit > 0:
             items.extend(self._visible_record_items(
-                query, limit=limit, state_changing=state_changing
+                query,
+                limit=limit,
+                state_changing=state_changing,
+                temporal_resolution=resolution,
+                temporal_resolution_engine=None,
+                temporal_weight=temporal_weight,
             ))
         return items
 
@@ -1526,13 +1550,26 @@ class WorldMemory(Memory):
         return revision
 
     def _visible_record_items(
-        self, query: Query, *, limit: int, state_changing: bool = False
+        self,
+        query: Query,
+        *,
+        limit: int,
+        state_changing: bool = False,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: float = 1.0,
     ) -> list[MemoryItem]:
         snapshot = self.snapshot(commit=False)
         location_id = snapshot.observer.get("location_id")
         # Retrieve a wider candidate pool before applying stable visibility.
         items = self.records.recall(
-            query, WORLD_RECORD_USER_ID, max(limit * 4, limit), state_changing=False
+            query,
+            WORLD_RECORD_USER_ID,
+            max(limit * 4, limit),
+            state_changing=False,
+            temporal_resolution=temporal_resolution,
+            temporal_resolution_engine=temporal_resolution_engine,
+            temporal_weight=temporal_weight,
         )
         visible: list[MemoryItem] = []
         now = self._now()

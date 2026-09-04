@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from .extract import ExtractionContext
     from .store import SQLiteStore
     from .world import WorldMemory
+    from ..temporal import TemporalResolution, TemporalResolutionEngine
 
 
 SELF_OWNER = "_self"
@@ -779,10 +780,21 @@ class CalendarMemory(StructuredMemory):
         include_cancelled: bool = False,
         limit: int = 8,
         state_changing: bool = False,
+        temporal_resolution: Optional["TemporalResolution"] = None,
+        temporal_weight: float = 1.0,
     ) -> list[CalendarOccurrence]:
         now = self._now()
-        lo = now - self.near_past_hours * 3600 if start is None else float(start)
-        hi = now + self.near_future_days * 86_400 if before is None else float(before)
+        default_lo = now - self.near_past_hours * 3600
+        default_hi = now + self.near_future_days * 86_400
+        lo = default_lo if start is None else float(start)
+        hi = default_hi if before is None else float(before)
+        if temporal_resolution is not None and temporal_resolution.ranges:
+            # Widen rather than replace the normal candidate window: temporal
+            # relevance is an additional signal, never a hard filter.
+            if start is None:
+                lo = min(lo, *(value.start_timestamp for value in temporal_resolution.ranges))
+            if before is None:
+                hi = max(hi, *(value.end_timestamp for value in temporal_resolution.ranges))
         if hi <= lo:
             raise ValueError("calendar range must end after it starts")
         limit = int(limit)
@@ -811,17 +823,39 @@ class CalendarMemory(StructuredMemory):
         has_query = bool(query_terms)
         semantic = self._semantic_scores(query)
         matched: list[tuple[float, CalendarOccurrence]] = []
+        temporal_scale = max(0.0, min(1.0, float(temporal_weight)))
         for occurrence in occurrences:
             hay = " ".join((occurrence.title, occurrence.description, occurrence.location)).lower()
             lexical = sum(hay.count(term) * weight for term, weight in query_terms)
             row_id = int(occurrence.metadata.get("event_id", -1)) if not occurrence.virtual else -1
-            score = lexical + semantic.get(row_id, 0.0)
+            semantic_score = semantic.get(row_id, 0.0)
+            temporal_match = (
+                temporal_resolution.match(occurrence.start_at, occurrence.end_at)
+                if temporal_resolution is not None
+                else None
+            )
+            temporal_score = temporal_match.score if temporal_match is not None else 0.0
+            score = lexical + semantic_score + temporal_scale * temporal_score
             if has_query and not score:
                 continue
+            occurrence.metadata.update({
+                "semantic_relevance": semantic_score,
+                "temporal_relevance": temporal_score,
+                "combined_relevance": score,
+            })
+            if temporal_match is not None and temporal_match.range is not None:
+                occurrence.metadata.update({
+                    "temporal_expression": temporal_match.range.expression,
+                    "temporal_range_start": temporal_match.range.start_timestamp,
+                    "temporal_range_end": temporal_match.range.end_timestamp,
+                    "temporal_grain": temporal_match.range.grain,
+                })
             # Ongoing and imminent occurrences are naturally more useful than
             # distant ones, while relevance remains the dominant signal.
             proximity = 2.0 if occurrence.start_at <= now <= occurrence.end_at else 1.0 / (1.0 + max(0.0, occurrence.start_at - now) / 86_400)
-            matched.append((score * 10.0 + proximity, occurrence))
+            ranking_score = score * 10.0 + proximity
+            occurrence.metadata["ranking_score"] = ranking_score
+            matched.append((ranking_score, occurrence))
         if has_query:
             matched.sort(key=lambda pair: (-pair[0], pair[1].start_at))
         else:
@@ -851,10 +885,30 @@ class CalendarMemory(StructuredMemory):
         )
 
     # Memory interface ---------------------------------------------------
-    def recall(self, query: Query, user_id: str, limit: int, state_changing: bool = True) -> list[MemoryItem]:
+    def recall(
+        self,
+        query: Query,
+        user_id: str,
+        limit: int,
+        state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: float = 1.0,
+    ) -> list[MemoryItem]:
         owners = {SELF_OWNER, str(user_id)}
-        events = self.search_events(query, owners=owners, limit=limit, state_changing=state_changing)
-        return [MemoryItem(self._display_event(item), 1.0, self.name, {
+        resolution = self.resolve_temporal(
+            query, temporal_resolution, temporal_resolution_engine
+        )
+        events = self.search_events(
+            query,
+            owners=owners,
+            limit=limit,
+            state_changing=state_changing,
+            temporal_resolution=resolution,
+            temporal_weight=temporal_weight,
+        )
+        return [MemoryItem(self._display_event(item), float(item.metadata.get("combined_relevance") or 1.0), self.name, {
             "id": item.id, "event_id": item.metadata.get("event_id", item.id),
             "owner_id": item.owner_id, "user_id": item.owner_id,
             "attendees": list(item.attendees), "occurred_at": item.start_at,
@@ -862,10 +916,30 @@ class CalendarMemory(StructuredMemory):
             "source": item.source, "virtual": item.virtual, **item.metadata,
         }) for item in events]
 
-    def recall_participants(self, query: Query, participants: list[str], limit: int, state_changing: bool = True) -> list[MemoryItem]:
+    def recall_participants(
+        self,
+        query: Query,
+        participants: list[str],
+        limit: int,
+        state_changing: bool = True,
+        *,
+        temporal_resolution: bool | "TemporalResolution" | None = None,
+        temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
+        temporal_weight: float = 1.0,
+    ) -> list[MemoryItem]:
         owners = {SELF_OWNER, *(str(v) for v in participants)}
-        events = self.search_events(query, owners=owners, limit=limit, state_changing=state_changing)
-        return [MemoryItem(self._display_event(item), 1.0, self.name, {
+        resolution = self.resolve_temporal(
+            query, temporal_resolution, temporal_resolution_engine
+        )
+        events = self.search_events(
+            query,
+            owners=owners,
+            limit=limit,
+            state_changing=state_changing,
+            temporal_resolution=resolution,
+            temporal_weight=temporal_weight,
+        )
+        return [MemoryItem(self._display_event(item), float(item.metadata.get("combined_relevance") or 1.0), self.name, {
             "id": item.id, "event_id": item.metadata.get("event_id", item.id),
             "owner_id": item.owner_id, "user_id": item.owner_id,
             "attendees": list(item.attendees), "occurred_at": item.start_at,

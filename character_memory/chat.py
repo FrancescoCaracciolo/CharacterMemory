@@ -143,8 +143,9 @@ class Chat:
         """All messages with the speaker of each turn.
 
         Each dict includes `role`, `content`, `user_id`, `message_id`, and the
-        optional `occurred_at` timestamp. Used by extraction to label the
-        transcript with real speakers and stable source-message provenance.
+        optional `occurred_at` timestamp, and storage `created_at`. Used by
+        extraction to label the transcript with real speakers and stable
+        source-message provenance.
         """
         rows = self.store.select(
             "messages",
@@ -158,6 +159,7 @@ class Chat:
                 "user_id": r.get("user_id"),
                 "message_id": r["id"],
                 "occurred_at": r.get("occurred_at"),
+                "created_at": r.get("created_at"),
             }
             for r in rows
         ]

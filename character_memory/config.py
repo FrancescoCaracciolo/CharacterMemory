@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 import os
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def _load_dotenv() -> None:
@@ -34,6 +35,17 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _env_csv(name: str) -> list[str]:
+    return [part.strip() for part in os.getenv(name, "").split(",") if part.strip()]
+
 @dataclass
 class LLMConfig:
     """Settings for a chat-completions client."""
@@ -44,6 +56,53 @@ class LLMConfig:
     temperature: float = 0.7
     max_tokens: int = 1024
     timeout: float = 120.0
+
+
+@dataclass
+class TemporalLLMConfig:
+    """Dedicated endpoint used only by the opt-in LLM temporal engine."""
+
+    base_url: str = os.getenv(
+        "CM_TEMPORAL_LLM_BASE_URL",
+        os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    )
+    api_key: str = os.getenv("CM_TEMPORAL_LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+    model: str = os.getenv("CM_TEMPORAL_LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.4-mini"))
+    timeout: float = float(os.getenv("CM_TEMPORAL_LLM_TIMEOUT", "30"))
+    max_tokens: int = int(os.getenv("CM_TEMPORAL_LLM_MAX_TOKENS", "768"))
+
+
+@dataclass
+class TemporalResolutionConfig:
+    """Automatic temporal resolution applied to memory recall.
+
+    The zero-network ``dateparser`` engine is enabled by default. Setting
+    ``engine: llm`` opts into exactly one LLM request per agent recall turn;
+    its endpoint is isolated under :attr:`llm`.
+    """
+
+    enabled: bool = _env_bool("CM_TEMPORAL_RESOLUTION_ENABLED", True)
+    engine: str = os.getenv("CM_TEMPORAL_RESOLUTION_ENGINE", "dateparser")
+    timezone: str = os.getenv("CM_TEMPORAL_RESOLUTION_TIMEZONE", "UTC")
+    weight: float = float(os.getenv("CM_TEMPORAL_RESOLUTION_WEIGHT", "1.0"))
+    # Empty uses the fast engine's broad built-in language set. Use ["*"] for
+    # every locale shipped by dateparser, trading a slower cold start for the
+    # widest coverage, or list specific ISO language codes.
+    languages: list[str] = field(
+        default_factory=lambda: _env_csv("CM_TEMPORAL_RESOLUTION_LANGUAGES")
+    )
+    llm: TemporalLLMConfig = field(default_factory=TemporalLLMConfig)
+
+    def __post_init__(self) -> None:
+        self.engine = str(self.engine).strip().lower()
+        if not self.engine:
+            raise ValueError("temporal_resolution.engine cannot be empty")
+        self.weight = max(0.0, min(1.0, float(self.weight)))
+        self.languages = [str(lang).strip() for lang in self.languages if str(lang).strip()]
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"Unknown temporal-resolution timezone: {self.timezone!r}") from exc
 
 
 @dataclass
@@ -370,6 +429,9 @@ class CharacterMemoryConfig:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    temporal_resolution: TemporalResolutionConfig = field(
+        default_factory=TemporalResolutionConfig
+    )
 
     # Directory used for the SQLite store + persisted RAG indexes.
     data_dir: str = ".cm_data"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from datetime import UTC, datetime
 from typing import Any, Optional
@@ -49,6 +50,42 @@ class ConversationEventMemory(StructuredMemory):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.store.create_table(self._KEY_TABLE, self._KEY_COLUMNS)
+        self._backfill_occurrence_times()
+
+    def temporal_interval(
+        self, row: dict[str, Any]
+    ) -> tuple[float, Optional[float]] | None:
+        occurred_at = row.get("occurred_at")
+        return (float(occurred_at), None) if occurred_at is not None else None
+
+    def _source_timestamp(self, message_ids: list[int]) -> Optional[float]:
+        if not message_ids:
+            return None
+        placeholders = ",".join("?" for _ in message_ids)
+        try:
+            rows = self.store.execute(
+                f"SELECT occurred_at, created_at FROM messages WHERE id IN ({placeholders}) ORDER BY id ASC",
+                message_ids,
+            )
+        except sqlite3.OperationalError:
+            return None
+        for row in rows:
+            value = row.get("occurred_at")
+            if value is None:
+                value = row.get("created_at")
+            if value is not None:
+                return float(value)
+        return None
+
+    def _backfill_occurrence_times(self) -> None:
+        for row in self.store.select(self.table):
+            if row.get("occurred_at") is not None:
+                continue
+            value = self._source_timestamp(self._decode_ids(row.get("source_message_ids")))
+            if value is None:
+                continue
+            row["occurred_at"] = value
+            self.update_row(row)
 
     @staticmethod
     def _decode_ids(value: Any) -> list[int]:
@@ -69,6 +106,8 @@ class ConversationEventMemory(StructuredMemory):
         else:
             speaker = character_name
         timestamp = row.get("occurred_at")
+        if timestamp is None:
+            timestamp = row.get("created_at")
         prefix = f"[{cls._timestamp(timestamp)}] " if timestamp is not None else ""
         return f"{prefix}{speaker}: {row['content']}"
 
@@ -300,9 +339,14 @@ class ConversationEventMemory(StructuredMemory):
             )
             occurred_at = next(
                 (
-                    float(row["occurred_at"])
+                    float(
+                        row["occurred_at"]
+                        if row.get("occurred_at") is not None
+                        else row["created_at"]
+                    )
                     for row in group
                     if row.get("occurred_at") is not None
+                    or row.get("created_at") is not None
                 ),
                 None,
             )
