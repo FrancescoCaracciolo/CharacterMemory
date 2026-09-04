@@ -1875,7 +1875,20 @@ html.live-graph-embed .live-embed-toolbar {
   border: 2px solid var(--outline); border-radius: 14px; box-shadow: var(--shadow-sm);
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
-html.live-embed-no-toolbar .live-embed-toolbar { display: none !important; }
+/* ``toolbar=0`` removes the status/identity/recall chrome but deliberately
+   keeps Full graph as a compact floating control. Hosts can remove that too
+   with ``full_graph=0``. */
+html.live-graph-embed.live-embed-no-toolbar .live-embed-toolbar {
+  left: auto; width: auto; padding: 0; gap: 0;
+  background: transparent; border: 0; border-radius: 0; box-shadow: none;
+  backdrop-filter: none; -webkit-backdrop-filter: none;
+}
+html.live-graph-embed.live-embed-no-toolbar .live-embed-toolbar > :not(#live-embed-full-btn) {
+  display: none !important;
+}
+html.live-graph-embed.live-embed-no-toolbar.live-embed-no-full-graph .live-embed-toolbar {
+  display: none !important;
+}
 html.live-embed-no-recalls #live-embed-recalls-btn,
 html.live-embed-no-recalls #live-embed-drawer,
 html.live-embed-no-recalls #live-embed-backdrop { display: none !important; }

@@ -11,6 +11,18 @@ Public surface:
 from .agent import CharacterAgent
 from .character import Character, ContextSnapshot, MemoryRecallSnapshot
 from .chat import Chat
+from .client import (
+    CalendarEventsResponse,
+    CharacterMemoryClient,
+    CharacterMemoryClientError,
+    CharacterMemoryHTTPError,
+    ContextResponse,
+    GraphResponse,
+    MemoryOverview,
+    MemoryPage,
+    MemoryRecord,
+    SaveResponse,
+)
 from .chunking import (
     Chunk,
     Chunker,
@@ -145,6 +157,16 @@ __all__ = [
     "ContextSnapshot",
     "MemoryRecallSnapshot",
     "Chat",
+    "CharacterMemoryClient",
+    "CharacterMemoryClientError",
+    "CharacterMemoryHTTPError",
+    "ContextResponse",
+    "SaveResponse",
+    "MemoryOverview",
+    "MemoryRecord",
+    "MemoryPage",
+    "GraphResponse",
+    "CalendarEventsResponse",
     "CharacterMemoryConfig",
     "LLMConfig",
     "EmbeddingConfig",
