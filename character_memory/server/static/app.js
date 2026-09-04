@@ -68,7 +68,7 @@ const state = {
     events: new Map(), selectedId: null, follow: true, source: null,
     connection: "closed", graph: {}, graphUser: "", openMemory: new Set(), openInitialized: false,
     embedOpenMemory: new Set(), embedOpenInitialized: false,
-    full: false, _fullRequest: 0,
+    full: false, fullNodeCount: null, _fullRequest: 0,
     _gv: null, _active: false,
   },
 };
@@ -1474,6 +1474,7 @@ function createGraphViz(canvas, opts) {
   let alpha = 1;                        // simulation temperature
   let frozen = false;
   let dimMode = false;                  // gray non-retrieved nodes (full-graph query)
+  let fullMode = false;                 // keep dense full-graph nodes visible after fit
   let hoveredId = null;
   let selectedId = null;                // clicked node (persistent highlight)
   let draggingId = null;
@@ -1546,6 +1547,7 @@ function createGraphViz(canvas, opts) {
     selectedId = null;
     if (onSelect) onSelect(null);
     const present = new Set(data.nodes.map(n => n.id));
+    fullMode = data.mode === "full";
     dimMode = (data.mode === "full" || data.mode === "trace") && !!data.query;
     const golden = Math.PI * (3 - Math.sqrt(5));
     const next = [];
@@ -1816,21 +1818,26 @@ function createGraphViz(canvas, opts) {
       const isGray = dimMode && !a.retrieved;
       let baseA = 0.55 + 0.45 * a.act;
       let col = a.color;
-      if (isGray) { baseA = 0.32; col = GRAYC; }
+      if (isGray) { baseA = fullMode ? 0.52 : 0.32; col = GRAYC; }
       const na = (activeId && !a._hot) ? baseA * 0.5 : baseA;
+      // Hundreds of full-graph nodes can otherwise shrink below one physical
+      // pixel after fit-to-view and appear absent despite being in the data.
+      const coreRadius = fullMode
+        ? Math.max(a.r, 1.35 / Math.max(view.scale, MIN_SCALE))
+        : a.r;
       ctx.fillStyle = hexA(col, na);
-      ctx.beginPath(); ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(a.x, a.y, coreRadius, 0, Math.PI * 2); ctx.fill();
       if (a.kind === "self") {
         ctx.lineWidth = 2.5; ctx.strokeStyle = hexA(palette.ink, na);
-        ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 2.5, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(a.x, a.y, coreRadius + 2.5, 0, Math.PI * 2); ctx.stroke();
       } else if ((a._hot || (dimMode && a.retrieved)) && a._e > 0.05) {
         ctx.lineWidth = 2; ctx.strokeStyle = hexA(palette.ink, 0.4 + 0.5 * a._e);
-        ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 2, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(a.x, a.y, coreRadius + 2, 0, Math.PI * 2); ctx.stroke();
       }
       // Persistent ring on the clicked (selected) node so the click is obvious.
       if (selectedId === a.id) {
         ctx.lineWidth = 3; ctx.strokeStyle = hexA(palette.ink, 0.95);
-        ctx.beginPath(); ctx.arc(a.x, a.y, a.r + 4, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(a.x, a.y, coreRadius + 4, 0, Math.PI * 2); ctx.stroke();
       }
     }
 
@@ -2694,8 +2701,11 @@ function updateLiveFullGraphButton({ loading = false, available = true } = {}) {
   button.setAttribute("aria-pressed", full ? "true" : "false");
   setButtonContent(
     button,
-    loading ? "loader-circle" : full ? "radar" : "share-2",
-    loading ? "Loading…" : full ? "Activation" : "Full graph",
+    loading ? "loader-circle" : full ? "circle-dot" : "share-2",
+    loading ? "Loading…"
+      : full && state.live.fullNodeCount != null
+      ? `Full · ${state.live.fullNodeCount}`
+      : "Full graph",
   );
   button.title = full
     ? "Return to the privacy-scoped activation graph for this request"
@@ -2745,21 +2755,41 @@ async function loadLiveFullGraph(event, user, fallback) {
   // The API deliberately reserves missing identity for administrative use.
   if (!user) {
     state.live.full = false;
+    state.live.fullNodeCount = null;
     updateLiveFullGraphButton({ available: false });
     showLiveGraphData(fallback, "unknown");
     return;
   }
   const request = ++state.live._fullRequest;
   let failure = null;
+  state.live.fullNodeCount = null;
   updateLiveFullGraphButton({ loading: true });
   try {
     const data = await getJSON(liveFullGraphUrl(event, user));
     if (request !== state.live._fullRequest || !state.live.full) return;
-    showLiveGraphData(data, user);
+    // Preserve the exact recall boundary captured by /context. Everything
+    // else in the full payload remains visible, but is explicitly marked as
+    // non-recalled instead of inheriting a separately recomputed top-k.
+    const recalled = new Set(
+      (fallback.nodes || [])
+        .filter((node) => node.retrieved === true)
+        .map((node) => node.id),
+    );
+    const contextual = recalled.size ? {
+      ...data,
+      query: fallback.query || data.query,
+      nodes: (data.nodes || []).map((node) => ({
+        ...node,
+        retrieved: recalled.has(node.id),
+      })),
+    } : data;
+    state.live.fullNodeCount = (contextual.nodes || []).length;
+    showLiveGraphData(contextual, user);
   } catch (error) {
     if (request !== state.live._fullRequest) return;
     // Keep the captured activation useful if the optional full view fails.
     state.live.full = false;
+    state.live.fullNodeCount = null;
     showLiveGraphData(fallback, user);
     failure = error;
   } finally {
@@ -2777,6 +2807,8 @@ function renderLiveGraph(event) {
   const shell = $("live-graph-shell"), empty = $("live-graph-empty"), select = $("live-graph-user");
   if (!users.length) {
     state.live._fullRequest++;
+    state.live.full = false;
+    state.live.fullNodeCount = null;
     shell.classList.add("hidden"); empty.classList.remove("hidden");
     select.classList.add("hidden"); $("live-graph-meta").textContent = "No graph in this request";
     clear($("live-graph-list")); clear($("live-graph-detail")); $("live-graph-detail").classList.add("hidden");
@@ -2931,7 +2963,10 @@ function wireLiveEmbedControls() {
     if (!selected || !Object.keys(liveEventGraphs(selected)).length) return;
     state.live.full = !state.live.full;
     // Invalidate an in-flight full fetch before restoring the captured trace.
-    if (!state.live.full) state.live._fullRequest++;
+    if (!state.live.full) {
+      state.live.fullNodeCount = null;
+      state.live._fullRequest++;
+    }
     updateLiveFullGraphButton();
     renderLiveGraph(selected);
   });
@@ -2986,7 +3021,7 @@ function resetCharacterView() {
   // do not keep Full mode while silently resetting its limits.
   state.graph = { data: null, q: "", user: "", full: state.graph.full, _gv: null, _wired: graphControlsWired };
   state.live.events.clear(); state.live.selectedId = null; state.live.graphUser = "";
-  state.live.full = false; state.live._fullRequest++;
+  state.live.full = false; state.live.fullNodeCount = null; state.live._fullRequest++;
   state.live.openMemory.clear(); state.live.openInitialized = false;
   state.live.embedOpenMemory.clear(); state.live.embedOpenInitialized = false;
   if (state.live._gv) { try { state.live._gv.destroy(); } catch (error) {} state.live._gv = null; }

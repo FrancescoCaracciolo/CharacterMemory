@@ -1029,6 +1029,11 @@ def read_graph(
     trace = {nid: score for nid, score in trace.items() if nid in displayable_ids}
 
     if full:
+        # Full means the complete privacy-visible, degree-filtered graph—not
+        # merely every node that happened to receive an activation entry.
+        # Missing trace entries are non-recalled context and render at zero.
+        for nid in displayable_ids:
+            trace.setdefault(nid, 0.0)
         # Keep the whole graph (capped); the top-`retrieve_k` by activation are
         # flagged "retrieved" so the GUI can highlight them.
         ranked = sorted(trace.items(), key=lambda kv: kv[1], reverse=True)
@@ -1037,7 +1042,7 @@ def read_graph(
         keep_ids = [
             nid
             for nid in retriever.graph.nodes
-            if nid in trace and nid in displayable_ids
+            if nid in displayable_ids
         ][:node_budget]
         keep_set = set(keep_ids)
     else:
