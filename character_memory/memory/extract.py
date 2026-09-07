@@ -76,10 +76,13 @@ _PROVENANCE_NOTE = (
 _SNAPSHOT_NOTE = (
     "Snapshot fields ({fields}) are complete replacement values, not deltas. "
     "When returning an item for one of these fields, start from the current "
-    "stored snapshot supplied in that field's instructions, preserve every "
-    "non-contradicted detail, and incorporate genuinely durable new details "
-    "from the recent conversation. Return an empty array only when no profile "
-    "exists or the conversation adds nothing that changes it."
+    "stored snapshot supplied in that field's instructions and follow that "
+    "field's selection and length rules. Retain supported core information, "
+    "incorporate relevant new information, and remove details outside those rules. "
+    "A snapshot may need rewriting to meet those rules even without new facts. "
+    "Return an empty array when the existing snapshot already meets the rules "
+    "and nothing material changed, or when there is insufficient information "
+    "to create a new snapshot."
 )
 
 # Legacy header/footer kept for the no-context path (backward compatibility).

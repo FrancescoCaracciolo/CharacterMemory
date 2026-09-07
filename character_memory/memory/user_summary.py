@@ -179,7 +179,7 @@ class UserSummaryMemory(StructuredMemory):
         baseline_note = ""
         if baselines:
             baseline_note = (
-                "\nCurrent stored profile(s) to use as the preservation baseline:\n"
+                "\nCurrent stored profile(s) to selectively rewrite under these rules:\n"
                 + "\n".join(f"- {line}" for line in baselines)
             )
         return ExtractionSpec(
@@ -199,13 +199,23 @@ class UserSummaryMemory(StructuredMemory):
                 },
             },
             instruction=(
-                f"- user_summaries: for each distinct person, a single consolidated "
-                f"profile with their `name`, every `aliases` (nicknames / other names "
-                f"they go by), and a `summary`: a quick, self-contained description of "
-                f"who they are (interests, role, personality, key facts). Produce one "
-                f"item per person, written from {user}'s perspective using the real "
-                f"name. When a current stored profile is provided, return the complete "
-                f"merged profile and preserve all details that are not contradicted."
+                "- user_summaries: include `name`, established `aliases`, and a "
+                "third-person `summary` of each user. Aim for 100–150 words at most; "
+                "use fewer when little is known. Retain supported identity, enduring "
+                "interests and goals, communication preferences, explicit interpersonal "
+                "boundaries, and established relationship dynamics. Core context may "
+                "overlap with known facts or directives; leave detailed facts and "
+                "individual events to their respective memories. Exclude chronological "
+                "recaps, exam logistics, meals, temporary moods, isolated jokes, "
+                "lesson details, and narrated character reactions. Do not infer "
+                "personality from one incident or treat speculation, teasing, or "
+                "role-play as real-world identity, aliases, or evidence that users "
+                "are the same person. Rewrite stored profiles as complete compact "
+                "replacements: retain supported core information, apply corrections, "
+                "and remove irrelevant detail even if uncontradicted. Compact bloated "
+                "profiles even without new durable information. Return [] if the "
+                "profile already meets these rules and nothing material changed, "
+                "or there is insufficient information to create one."
                 f"{baseline_note}"
             ),
         )

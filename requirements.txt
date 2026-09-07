@@ -11,3 +11,6 @@ rank-bm25>=0.2.2
 
 # Tokenization for header-based chunking budgets
 tiktoken>=0.13
+
+# Multilingual, zero-network temporal expression resolution
+dateparser>=1.4.2,<2
