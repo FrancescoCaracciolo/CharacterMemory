@@ -1,4 +1,9 @@
 # Character Memory
+
+[![PyPI version](https://img.shields.io/pypi/v/charactermemory.svg)](https://pypi.org/project/charactermemory/)
+[![Python versions](https://img.shields.io/pypi/pyversions/charactermemory.svg)](https://pypi.org/project/charactermemory/)
+[![License](https://img.shields.io/pypi/l/charactermemory.svg)](https://pypi.org/project/charactermemory/)
+
 <img width="927" height="339" alt="Screenshot 2026-09-02 alle 23 19 44" src="https://github.com/user-attachments/assets/d825da4e-d747-4942-819c-7627ec180ebf" />
 
 
@@ -19,6 +24,47 @@ It provides a:
 - MCP server, to integrate tools to read and edit memory into Agents
 - API to query and save memory
 - A Web Interface to create characters, view memories and chat with them
+
+#### Installation
+```bash
+pip install charactermemory              # the library
+pip install 'charactermemory[server]'    # + FastAPI server, WebUI and MCP endpoint
+```
+
+The library talks to any OpenAI-compatible `/v1` endpoint for both the chat model and the embeddings server:
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:9999/v1"
+export OPENAI_API_KEY="anything"
+export OPENAI_MODEL="my-chat-model"
+export OPENAI_EMBEDDINGS_BASE_URL="http://127.0.0.1:9999/v1"
+export OPENAI_EMBEDDINGS_MODEL="my-embeddings-model"
+```
+
+#### Use it as a library
+A character is just a directory: `Information/` lore files, `Dialogues/` examples, and an optional `config.yaml` with persona, prompts and memory toggles.
+
+```python
+from character_memory import CharacterAgent, LLMConfig, EmbeddingConfig, MemoryConfig
+
+agent = CharacterAgent(directory="assets/Kurisu", name="Kurisu")
+agent.load_from_config(LLMConfig(), EmbeddingConfig(), MemoryConfig())
+agent.build()   # load or build the memory indexes (idempotent)
+
+chat = agent.create_chat(user="michael", title="phonewave intro")
+chat.add_message("user", "Hi, I'm Michael, a nuclear engineer called in by Daru.")
+
+for chunk in agent.generate_answer(chat, stream=True):   # persisted + auto-extracted
+    print(chunk, end="", flush=True)
+```
+
+#### Or run the server (WebUI + MCP)
+```bash
+charactermemory-server    # serves /context, /save, /gui and /mcp on :8000
+```
+
+Open <http://localhost:8000/gui> to create characters, browse and edit their memories and explore the knowledge graph, or point an MCP client (Claude Desktop, Cursor, …) at `http://localhost:8000/mcp?character=Kurisu`.
+
+The full walkthrough of all four usage modes (full library, context-only, MCP server, HTTP API + WebUI) is in [docs/getting_started.md](docs/getting_started.md).
 
 - - -
 
