@@ -1917,7 +1917,10 @@ class WorldMemory(Memory):
             schema={
                 "type": "object",
                 "properties": {
-                    "facts": {"type": "array", "items": {"type": "object", "properties": {
+                    "facts": {"type": "array", "description": (
+                        "Established shared-setting properties or explicitly time-bounded conditions. "
+                        "Exclude personal activities, exam logistics, and chat incidents; return [] when none qualify."
+                    ), "items": {"type": "object", "properties": {
                         "content": {"type": "string"}, "subject_id": {"type": "string"},
                         "location_id": {"type": "string"}, "visibility": {"type": "string"},
                         "importance": {"type": "number"},
@@ -1927,12 +1930,17 @@ class WorldMemory(Memory):
                         "valid_for_minutes": {"type": "number", "minimum": 1},
                         "source_message_ids": {"type": "array", "items": {"type": "integer"}},
                     }, "required": ["content", "temporal_kind", "source_message_ids"]}},
-                    "events": {"type": "array", "items": {"type": "object", "properties": {
+                    "events": {"type": "array", "description": (
+                        "Completed happenings that affect the shared setting, not personal or conversation recaps. "
+                        "Return [] when none qualify."
+                    ), "items": {"type": "object", "properties": {
                         "content": {"type": "string"}, "actor_id": {"type": "string"},
                         "location_id": {"type": "string"},
                         "source_message_ids": {"type": "array", "items": {"type": "integer"}},
                     }, "required": ["content", "source_message_ids"]}},
-                    "actions": {"type": "array", "items": {"type": "object", "properties": {
+                    "actions": {"type": "array", "description": (
+                        "The character's current actions supported by assistant messages, not users' activities or plans."
+                    ), "items": {"type": "object", "properties": {
                         "kind": {"type": "string", "enum": ["move", "start_activity", "eat", "sleep", "wake"]},
                         "location_id": {"type": "string"}, "activity_kind": {"type": "string"},
                         "activity": {"type": "string"},
@@ -1941,12 +1949,19 @@ class WorldMemory(Memory):
                 }, "additionalProperties": False,
             },
             instruction=(
-                f"- world_updates: explicit, non-hypothetical updates about {char}'s world. "
-                "Facts must be classified as durable or temporary; temporary facts require a positive "
-                "valid_for_minutes grounded in the conversation. Put what the character is currently doing "
-                "only in actions, completed behavior only in events, and omit vague future plans without a "
-                "time rather than turning them into current facts. Do not turn user claims about NPC "
-                "locations into authoritative actions. Include source_message_ids."
+                f"- world_updates: explicit updates to {char}'s shared setting only. "
+                "facts: durable setting properties or temporary conditions with a positive, "
+                "conversation-grounded valid_for_minutes. events: completed changes to the setting. "
+                "Examples: the library has a printing press (durable fact); the bridge is closed "
+                "for 20 minutes (temporary fact); a storm destroyed the pier (event). "
+                "Exclude personal activities, milestones, and chat incidents from both: e.g. "
+                "Mira baked cookies, Leo earned a certificate, or a voice call disconnected. "
+                "Dates and character mentions do not make these world knowledge. Extract any "
+                "actual setting change, not the personal recap. Use top-level facts/episodes "
+                "only if enabled and appropriate; otherwise omit, never spill into world_updates. "
+                "actions: only the character's current actions supported by assistant messages, "
+                "not user activities or user claims about NPC locations. Omit vague future plans. "
+                "Include source_message_ids; return empty arrays when nothing qualifies."
             ),
         )
 
