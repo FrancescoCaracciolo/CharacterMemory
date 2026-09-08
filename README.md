@@ -4,6 +4,9 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/charactermemory.svg)](https://pypi.org/project/charactermemory/)
 [![License](https://img.shields.io/pypi/l/charactermemory.svg)](https://pypi.org/project/charactermemory/)
 
+[!WARNING]
+This library is still in early release and under active documentation. APIs may change at any time prior to a stable release.
+
 <img width="927" height="339" alt="Screenshot 2026-09-02 alle 23 19 44" src="https://github.com/user-attachments/assets/d825da4e-d747-4942-819c-7627ec180ebf" />
 
 
