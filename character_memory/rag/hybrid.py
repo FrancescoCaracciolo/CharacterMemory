@@ -391,6 +391,8 @@ class HybridSearch(RAGSystem):
                 if not self._is_deleted(node)
                 and node.metadata.get("id") in wanted
             )
+        if k <= 0:
+            return []
         active_count = (
             len(allowed_positions)
             if allowed_positions is not None
@@ -439,92 +441,14 @@ class HybridSearch(RAGSystem):
                     f"{self._index.d})"
                 )
 
-        # Reciprocal Rank Fusion over result groups, weight-scaled. Normal
-        # documents form one group per positional node. A memory may stamp
-        # several index keys with the same `_result_id`; those keys then rank
-        # as one result and cannot consume several top-k slots.
-        scores: dict[Hashable, float] = {}
-        representative: dict[Hashable, int] = {}
-        sim_by_result: dict[Hashable, float] = {}
-        lexical_by_result: dict[Hashable, float] = {}
-        confidence_failure: dict[Hashable, float] = {}
-        max_query_weight = max((weight for _, weight in queries), default=0.0)
-
-        def add_confidence(key: Hashable, confidence: float, weight: float) -> None:
-            if max_query_weight <= 0.0:
-                return
-            weighted = max(
-                0.0,
-                min(1.0, float(confidence) * float(weight) / max_query_weight),
-            )
-            confidence_failure[key] = confidence_failure.get(key, 1.0) * (
-                1.0 - weighted
-            )
-
-        for (qtext, weight), qv in zip(queries, q_vecs):
-            bm25_hits, dense_hits = self._query_candidates(
-                qtext, qv, pool, where, allowed_positions
-            )
-            best_lexical = max((lexical for _, _, lexical in bm25_hits), default=0.0)
-            for pos, rank, lexical in bm25_hits:
-                key = self._result_key(pos)
-                scores[key] = scores.get(key, 0.0) + weight / (self.rrf_k + rank + 1)
-                representative.setdefault(key, pos)
-                lexical_by_result[key] = max(
-                    lexical_by_result.get(key, 0.0), lexical
-                )
-                if best_lexical > 0.0:
-                    add_confidence(key, lexical / best_lexical, weight)
-            for pos, rank, sim in dense_hits:
-                key = self._result_key(pos)
-                scores[key] = scores.get(key, 0.0) + weight / (self.rrf_k + rank + 1)
-                representative.setdefault(key, pos)
-                if sim > sim_by_result.get(key, -1.0):
-                    sim_by_result[key] = sim
-                if self.min_dense_similarity is None:
-                    dense_confidence = max(0.0, min(1.0, sim))
-                elif self.min_dense_similarity < 1.0:
-                    dense_confidence = max(
-                        0.0,
-                        min(
-                            1.0,
-                            (sim - self.min_dense_similarity)
-                            / (1.0 - self.min_dense_similarity),
-                        ),
-                    )
-                else:
-                    dense_confidence = 0.0
-                add_confidence(key, dense_confidence, weight)
-
-        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
-        # Preserve rank-only RRF as the ordering score and expose it separately
-        # from confidence-based relevance.  A positive lexical match can now
-        # carry full confidence even when the dense model misses it, while
-        # weak dense neighbors cannot masquerade as two-channel agreement.
-        max_rrf = sum(weight for _, weight in queries) * (
-            2.0 / (self.rrf_k + 1)
-        )
-        hits: list[Hit] = []
-        for key, score in ranked:
-            pos = representative[key]
-            node = self._nodes[pos]
-            meta = dict(node.metadata)
-            meta["similarity"] = sim_by_result.get(key, 0.0)
-            meta["dense_similarity"] = sim_by_result.get(key, 0.0)
-            meta["bm25_score"] = lexical_by_result.get(key, 0.0)
-            meta["rrf_relevance"] = (
-                max(0.0, min(1.0, float(score) / max_rrf))
-                if max_rrf > 0.0
-                else 0.0
-            )
-            meta["normalized_relevance"] = max(
-                0.0,
-                min(1.0, 1.0 - confidence_failure.get(key, 1.0)),
-            )
-            hits.append(
-                Hit(text=node.text, score=score, source=meta.get("source", ""), metadata=meta)
-            )
-        return hits
+        from .fusion import fuse
+        candidates = [self._query_candidates(text, vector, pool, where, allowed_positions)
+                      for (text, _), vector in zip(queries, q_vecs)]
+        return fuse(queries, candidates, k, self.rrf_k, self.min_dense_similarity,
+                    self._result_key,
+                    lambda pos: (self._nodes[pos].text,
+                                 self._nodes[pos].metadata.get("source", ""),
+                                 self._nodes[pos].metadata))
 
     def _result_key(self, pos: int) -> Hashable:
         """Return a retrieval-group key without changing positional IDs."""

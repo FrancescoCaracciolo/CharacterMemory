@@ -56,6 +56,17 @@ class RAGSystem(ABC):
     """Base class for retrieval-augmentation back-ends."""
 
     name: str = "base"
+    remote: bool = False
+
+    def exists(self, path: str) -> bool:
+        """Backward-compatible persisted-index probe for local backends."""
+        import os
+        return os.path.exists(os.path.join(path, "nodes.json"))
+
+    def refresh(self) -> bool:
+        """Repair/refresh durable backends; local backends use existing loaders."""
+        return False
+
 
     @abstractmethod
     def build(self, chunks: list[Chunk]) -> None:
