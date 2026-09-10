@@ -2098,3 +2098,179 @@ html.live-graph-embed #live-embed-recalls-empty { flex: 1 1 auto; min-height: 0;
   .calendar-range { align-items: flex-start; flex-direction: column; gap: 3px; }
   .calendar-range-detail { white-space: normal; }
 }
+
+/* Mobile workspace: compact chrome, reachable navigation, one scroll per view. */
+.app { height: 100dvh; }
+.memory-picker-toggle, .calendar-day-label { display: none; }
+.memory-picker-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+
+@media (max-width: 820px) {
+  html:not(.live-graph-embed) .app {
+    padding-bottom: calc(68px + env(safe-area-inset-bottom));
+  }
+  .topbar {
+    flex: 0 0 auto; min-height: 0; padding: max(10px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 10px max(12px, env(safe-area-inset-left));
+    gap: 10px; justify-content: space-between;
+    /* A backdrop filter would contain the fixed bottom navigation. */
+    backdrop-filter: none;
+  }
+  .brand { width: auto; justify-content: flex-start; gap: 9px; }
+  .brand-copy b { font-size: 19px; }
+  .brand-copy small { display: none; }
+  .logo { width: 32px; height: 32px; font-size: 19px; }
+  .topbar-actions { width: auto; flex: 1; justify-content: flex-end; gap: 6px; min-width: 0; }
+  .char-picker { min-width: 0; flex: 1; max-width: 210px; }
+  .char-picker select { width: 100%; min-width: 0; max-width: 100%; }
+  .char-picker > span, .theme-switch-label, .api-link { display: none; }
+  .tabbar {
+    position: fixed; z-index: 50; inset: auto 0 0; width: 100%; height: calc(68px + env(safe-area-inset-bottom));
+    padding: 7px max(8px, env(safe-area-inset-right)) calc(7px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+    gap: 5px; border: 0; border-top: 2px solid var(--outline); border-radius: 0;
+    background: var(--surface); box-shadow: 0 -4px 0 var(--shade);
+  }
+  .tab { flex: 1; min-width: 0; padding: 8px 4px; font-size: 11px; white-space: normal; text-align: center; }
+  .tab span { display: none; }
+  .tab.active { transform: none; box-shadow: 2px 2px 0 var(--shadow-color); }
+  .main { grid-template-rows: auto minmax(0, 1fr); }
+  .sidebar { display: flex; max-height: none; }
+  .memory-picker-toggle {
+    display: flex; align-items: center; gap: 10px; width: 100%; min-height: 48px; padding: 10px 15px;
+    border: 0; background: var(--surface-alt); color: var(--text); text-align: left; font: 800 14px var(--sans); cursor: pointer;
+  }
+  #memory-picker-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .picker-open .picker-chevron { transform: rotate(180deg); }
+  .memory-picker-body { display: none; }
+  .picker-open .memory-picker-body { display: flex; max-height: 42dvh; }
+  .sidebar .side-label { display: none; }
+  .sidebar .side-head { padding: 0 12px 8px; }
+  .sidebar .mem-list { display: block; overflow: auto; padding: 6px 12px 12px; }
+  .sidebar .mem-item { min-width: 0; margin-bottom: 6px; }
+  .content { overflow-y: auto; overscroll-behavior-y: contain; }
+  .content > * { flex-shrink: 0; }
+  .content-head { display: block; padding: 14px 12px; }
+  .ch-title { flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+  .ch-title h2 { font-size: 23px; overflow-wrap: anywhere; }
+  .tools { display: flex; gap: 8px; }
+  .tools .search { order: -2; flex: 1 1 100%; min-width: 0; }
+  .tools .search input { width: 100%; min-width: 0; padding-right: 48px; }
+  .tools .user-filter { width: auto; flex: 1; min-width: 0; }
+  .tools .add-memory { order: 0; }
+  .records { flex: 1 0 auto; overflow: visible; padding: 14px 12px 20px; }
+  .extra { padding: 0 12px; }
+  .paginator { flex-wrap: wrap; padding: 12px; }
+  .card { padding: 14px 12px; overflow-wrap: anywhere; }
+  .chip { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+  .card-actions { opacity: 1; transform: none; }
+  .btn, .pg-btn, .etab, .cfg-section-move, .calendar-event { min-height: 44px; }
+  .icon-btn, .modal-close, .wiz-close, .card-action, .graph-nav-btn, .gs-close { min-width: 44px; min-height: 44px; }
+  .q-clear { width: 40px; height: 40px; right: 3px; }
+  .theme-switch { min-height: 44px; }
+  /* Prevent automatic focus zoom on iOS while retaining user zoom. */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select, textarea { font-size: 16px; }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select { min-height: 44px; }
+  .cfg-pane { grid-template-rows: auto minmax(0, 1fr); }
+  .cfg-rail { min-height: 0; max-height: 145px; }
+  .cfg-rail-head { padding: 6px 12px; }
+  .cfg-char-list { display: flex; gap: 8px; flex: 0 0 auto; padding: 6px 12px 10px; overflow-x: auto; }
+  .cfg-char { flex: 0 0 auto; min-width: 130px; max-width: 220px; margin: 0; }
+  .cfg-head { padding: 10px 12px 0; gap: 10px; }
+  .cfg-head-title { min-width: 0; }
+  .cfg-head-title h2 { font-size: 22px; overflow-wrap: anywhere; }
+  .editor-tabs { max-width: 100%; overflow-x: auto; flex-shrink: 0; }
+  .etab { flex-shrink: 0; padding: 8px 10px; }
+  .edit-pane { padding: 12px; }
+  .cfg-block { padding: 14px 12px; }
+  .cfg-block-head { flex-wrap: wrap; gap: 10px; }
+  .cfg-block-head > div { min-width: 0; }
+  .cfg-memory-list > .mem-row { flex-wrap: wrap; }
+  .cfg-section-row, .cfg-section-row.is-prompt { grid-template-columns: 22px 20px minmax(0, 1fr); }
+  .cfg-section-status { display: none; }
+  .cfg-section-actions { grid-column: 3; }
+  .cfg-section-move { min-width: 44px; }
+  .cfg-section-title { white-space: normal; }
+  .cfg-file-editor-head { flex-wrap: wrap; }
+  .cfg-filename { min-width: 0; width: 100%; }
+  .chat-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .chat-user { grid-column: 1 / -1; width: 100%; }
+  .chat-input { min-width: 0; }
+  .chat-bubble { max-width: 94%; font-size: 15px; }
+  .graph-view { padding: 12px; height: auto; max-height: none; overflow: visible; }
+  .graph-controls { gap: 8px; }
+  .graph-controls .search { flex: 1 1 100%; }
+  .graph-controls .search input { width: 100%; min-width: 0; padding-right: 44px; }
+  .graph-split { height: auto; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; }
+  .graph-canvas-wrap, .graph-cy { height: 45dvh; min-height: 280px; }
+  .graph-side { display: block; border-left: 0; border-top: 2px solid var(--outline); max-height: 260px; overflow-y: auto; }
+  .graph-settings { max-width: calc(100% - 20px); max-height: calc(100% - 20px); overflow-y: auto; }
+  .live-head { padding: 14px 12px; }
+  .live-head-actions { flex-wrap: wrap; gap: 8px; }
+  .live-memory-body { padding-left: 12px; }
+  .memory-editor, .wiz-overlay, .api-key-overlay { padding: max(8px, env(safe-area-inset-top)) 8px max(8px, env(safe-area-inset-bottom)); }
+  .memory-editor-card, .wiz-card, .api-key-card { max-height: calc(100dvh - 32px); width: 100%; overflow-y: auto; }
+  .memory-editor-head, .memory-editor-foot, .wiz-head, .wiz-foot { padding: 14px; flex-shrink: 0; }
+  .memory-editor-foot, .wiz-foot { position: sticky; bottom: 0; z-index: 2; }
+  .memory-fields { padding: 14px; }
+  .toast { bottom: calc(82px + env(safe-area-inset-bottom)); max-width: calc(100vw - 24px); }
+}
+
+@media (max-width: 540px) {
+  .brand { width: 100%; }
+  .topbar-actions { width: 100%; justify-content: space-between; }
+  .char-picker { max-width: none; }
+  /* Turn the month grid into a readable agenda without duplicating events. */
+  .calendar-weekdays { display: none; }
+  .calendar-grid { display: flex; flex-direction: column; min-width: 0; gap: 0; }
+  .calendar-day { min-height: 0; padding: 12px; border-bottom: 1px solid var(--border); }
+  .calendar-day:not(.has-events):not(.is-today) { display: none; }
+  .calendar-day-head { justify-content: flex-start; }
+  .calendar-day-label { display: inline; font: 800 12px var(--sans); }
+  .calendar-day-today { margin-left: auto; }
+  .calendar-events { max-height: none; overflow: visible; gap: 7px; }
+  .calendar-event { padding: 10px 8px; align-items: flex-start; }
+  .calendar-event-title { white-space: normal; overflow-wrap: anywhere; font-size: 13px; }
+  .calendar-event-time { display: inline; font-size: 11px; }
+}
+
+/* Let navigation and controls scroll away instead of reserving stacked rows
+   above a tiny content viewport. Only the primary bottom tabs stay fixed. */
+.mobile-tools-toggle { display: none; }
+@media (max-width: 820px) {
+  html:not(.live-graph-embed) body { height: auto; overflow-y: auto; }
+  html:not(.live-graph-embed) .app {
+    height: auto; min-height: 100dvh; overflow: visible;
+    padding-bottom: calc(60px + env(safe-area-inset-bottom));
+  }
+  .topbar { flex-wrap: nowrap; padding-top: max(6px, env(safe-area-inset-top)); padding-bottom: 6px; }
+  .brand { display: none; }
+  .topbar-actions { width: 100%; }
+  .char-picker { max-width: none; }
+  .tabbar { height: calc(60px + env(safe-area-inset-bottom)); padding-top: 4px; padding-bottom: calc(4px + env(safe-area-inset-bottom)); }
+  .main, .cfg-pane { display: block; flex: none; overflow: visible; }
+  .content, .cfg-main, .edit-pane { overflow: visible; }
+  .content-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; }
+  .ch-title { flex: 1; margin: 0; }
+  .ch-title h2 { display: none; } /* The memory picker already names this view. */
+  .mobile-tools-toggle { display: inline-flex; justify-content: center; }
+  .mobile-toolbar:not(.toolbar-open) { display: none; }
+  .tools.toolbar-open { display: flex; flex-basis: 100%; }
+  .cfg-rail { flex-direction: row; max-height: none; align-items: center; }
+  .cfg-rail-head { flex: 0 0 auto; border: 0; padding-right: 0; }
+  .cfg-rail-title { display: none; }
+  .cfg-char-list { flex: 1; min-width: 0; padding: 8px 12px; }
+  .cfg-char { min-width: 100px; }
+  .cfg-char-tags { display: none; }
+  .cfg-head { padding-top: 8px; }
+  .cfg-head-title h2 { font-size: 18px; }
+  .edit-pane { flex: none; }
+  .chat-wrap { height: auto; min-height: 50dvh; }
+  .chat-log { flex: none; overflow: visible; }
+  html:not(.live-graph-embed) .live-pane { flex: none; overflow: visible; }
+  .live-head { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; }
+  .live-title-wrap { flex: 1; }
+  .live-title-wrap h2 { font-size: 22px; margin: 4px 0 0; }
+  .live-title-wrap p { display: none; }
+  .live-head-actions.toolbar-open { flex-basis: 100%; }
+  html:not(.live-graph-embed) .live-layout { display: flex; flex-direction: column; overflow: visible; }
+  html:not(.live-graph-embed) .live-main { overflow: visible; flex: none; }
+  .graph-view > .mobile-tools-toggle { align-self: flex-start; }
+}

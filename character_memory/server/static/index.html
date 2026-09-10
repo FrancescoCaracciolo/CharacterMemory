@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#fff8e8">
   <title>Mnemosyne — Character Memory</title>
   <script>
@@ -29,7 +29,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=live-graph-embed-7">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=mobile-2">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -68,11 +68,16 @@
 
     <div class="main">
       <aside class="sidebar">
+        <button id="memory-picker-toggle" class="memory-picker-toggle" type="button" aria-expanded="false" aria-controls="memory-picker-body">
+          <i data-lucide="layers-3" class="icon"></i><span id="memory-picker-label">Choose memory</span><i data-lucide="chevron-down" class="icon picker-chevron"></i>
+        </button>
+        <div id="memory-picker-body" class="memory-picker-body">
         <div class="side-label"><span><i data-lucide="sparkle" class="icon side-label-ico"></i>Memory drawers</span><span id="memory-total">—</span></div>
         <div class="side-head">
           <input id="memory-filter" class="filter-input" placeholder="Filter memories…" autocomplete="off">
         </div>
         <nav id="memories" class="mem-list" aria-label="Memories"></nav>
+        </div>
       </aside>
 
       <section class="content">
@@ -83,7 +88,8 @@
             <span id="mem-count" class="count"></span>
             <span id="mem-disabled" class="chip warn-chip hidden">disabled</span>
           </div>
-          <div class="tools">
+          <button class="btn mobile-tools-toggle" type="button" aria-expanded="false" aria-controls="memory-toolbar">Search &amp; filters</button>
+          <div id="memory-toolbar" class="tools mobile-toolbar">
             <button id="add-memory" class="btn primary add-memory hidden" type="button"><i data-lucide="plus" class="icon"></i><span class="btn-label">Add memory</span></button>
             <div class="search">
               <span class="search-ico"><i data-lucide="search" class="icon"></i></span>
@@ -96,7 +102,8 @@
 
         <div id="extra" class="extra"></div>
         <div id="graph-view" class="graph-view hidden">
-          <div class="graph-controls">
+          <button class="btn mobile-tools-toggle" type="button" aria-expanded="false" aria-controls="graph-toolbar">Graph controls</button>
+          <div id="graph-toolbar" class="graph-controls mobile-toolbar">
             <div class="search">
               <span class="search-ico"><i data-lucide="search" class="icon"></i></span>
               <input id="graph-q" placeholder="Activate the graph by query…" autocomplete="off" spellcheck="false">
@@ -198,7 +205,8 @@
           <h2>Live recall</h2>
           <p>Watch the memories that shape each incoming request.</p>
         </div>
-        <div class="live-head-actions">
+        <button class="btn mobile-tools-toggle" type="button" aria-expanded="false" aria-controls="live-toolbar">Recall controls</button>
+        <div id="live-toolbar" class="live-head-actions mobile-toolbar">
           <span id="live-follow-label" class="live-follow-label">Following latest</span>
           <a id="live-embed-link" class="btn ghost" href="/gui/embed/knowledge-graph" target="_blank" rel="noopener" title="Open the minimal knowledge-graph view made for iframes"><i data-lucide="panel-top-open" class="icon"></i><span class="btn-label">Iframe graph</span></a>
           <button id="live-follow" class="btn ghost" type="button"><i data-lucide="arrow-up-to-line" class="icon"></i><span class="btn-label">Follow latest</span></button>
@@ -361,7 +369,7 @@
 
       <section id="cfg-empty" class="cfg-empty">
         <div class="cfg-empty-big"><i data-lucide="sparkles" class="icon"></i></div>
-        <div class="cfg-empty-text">Select a character on the left — or click <b>+ New</b> to build one.</div>
+        <div class="cfg-empty-text">Select a character — or tap <b>+ New</b> to build one.</div>
       </section>
 
       <section id="cfg-pane-main" class="cfg-main hidden">
@@ -393,7 +401,7 @@
             <div class="cfg-block-head">
               <div>
                 <label class="cfg-label">Memories &amp; context order</label>
-                <div class="cfg-hint">Enable memory systems, then choose which sections reach <code>/context</code> and in what order.</div>
+                <div class="cfg-hint">Enable memory systems, then choose which sections reach <code>/context</code> and in what order. Set <code>k</code> to 0 to skip automatic retrieval; MCP and tools still work.</div>
               </div>
               <button id="cfg-save-memory" class="btn primary">Save memories &amp; order</button>
             </div>
@@ -619,7 +627,7 @@
   </div>
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[Mnemosyne] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
-  <script src="/gui/static/app.js?v=live-graph-embed-7"></script>
-  <script src="/gui/static/config.js?v=intermediate-prompts-2"></script>
+  <script src="/gui/static/app.js?v=mobile-2"></script>
+  <script src="/gui/static/config.js?v=k-zero-1"></script>
 </body>
 </html>

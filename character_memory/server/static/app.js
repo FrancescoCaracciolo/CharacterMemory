@@ -740,6 +740,7 @@ function renderSidebar() {
 function renderHeader() {
   const m = state.memories.find((x) => x.name === state.memory) || {};
   $("mem-title").textContent = m.title || state.memory || "—";
+  $("memory-picker-label").textContent = m.title || "Choose memory";
   const kind = $("mem-kind"); clear(kind); kind.appendChild(document.createTextNode(m.kind || ""));
   $("mem-count").textContent = m.count != null ? `${m.count} records` : "";
   $("mem-disabled").classList.toggle("hidden", m.enabled !== false);
@@ -881,12 +882,13 @@ function renderCalendarAgenda(data) {
     const today = key === todayKey;
     const events = (eventsByDay.get(key) || []).slice().sort(calendarEventSort);
     const cell = el("div", {
-      class: "calendar-day" + (outside ? " is-outside" : "") + (today ? " is-today" : ""),
+      class: "calendar-day" + (events.length ? " has-events" : "") + (outside ? " is-outside" : "") + (today ? " is-today" : ""),
       role: "gridcell",
       "aria-label": cursor.toLocaleDateString([], { dateStyle: "full" }),
     }, [
       el("div", { class: "calendar-day-head" }, [
         el("span", { class: "calendar-day-number" }, String(cursor.getDate())),
+        el("span", { class: "calendar-day-label" }, cursor.toLocaleDateString([], { weekday: "short", month: "short" })),
         today ? el("span", { class: "calendar-day-today" }, "Today") : null,
       ]),
       el("div", { class: "calendar-events" }, events.map(renderCalendarEvent)),
@@ -1208,8 +1210,19 @@ async function removeMemory(rec) {
   } catch (e) { toast(e.message, true); }
 }
 
+// The mobile picker is an inline disclosure, so it never covers content or
+// needs a modal focus trap. Desktop always exposes the full memory list.
+function setMemoryPickerOpen(open) {
+  $("memory-picker-toggle").setAttribute("aria-expanded", String(open));
+  document.querySelector(".sidebar").classList.toggle("picker-open", open);
+}
+
 // ---------------------------------------------------------------- actions
 function selectMemory(name) {
+  if (matchMedia("(max-width: 820px)").matches) {
+    setMemoryPickerOpen(false);
+    $("memory-picker-toggle").focus({ preventScroll: true });
+  }
   if (state.memory === name) return;
   state.memory = name;
   state.editor = { editable: false, fields: [], description: "" };
@@ -1222,10 +1235,11 @@ function selectMemory(name) {
   renderSidebar();
   loadPage();
 }
-function gotoPage(p) {
+async function gotoPage(p) {
   state.page = p;
-  loadPage();
-  $("records").scrollTo({ top: 0 });
+  await loadPage();
+  if (matchMedia("(max-width: 820px)").matches) $("records").scrollIntoView({ block: "start" });
+  else $("records").scrollTo({ top: 0 });
 }
 
 // debounced search
@@ -3103,6 +3117,25 @@ function wireApiKeyDialog() {
 
 // ---------------------------------------------------------------- wire up
 async function init() {
+  document.querySelectorAll(".mobile-tools-toggle").forEach((button) => {
+    button.addEventListener("click", () => {
+      const open = button.getAttribute("aria-expanded") !== "true";
+      button.setAttribute("aria-expanded", String(open));
+      document.getElementById(button.getAttribute("aria-controls")).classList.toggle("toolbar-open", open);
+    });
+  });
+  $("memory-picker-toggle").addEventListener("click", (event) => {
+    const open = $("memory-picker-toggle").getAttribute("aria-expanded") !== "true";
+    setMemoryPickerOpen(open);
+    if (open && event.detail === 0) $("memory-filter").focus({ preventScroll: true });
+  });
+  document.querySelector(".sidebar").addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && matchMedia("(max-width: 820px)").matches) {
+      setMemoryPickerOpen(false);
+      $("memory-picker-toggle").focus({ preventScroll: true });
+      event.stopPropagation();
+    }
+  });
   wireThemeToggle();
   // The markup starts closed; this selectively restores a saved graph panel
   // state and settings before the controls are first wired/rendered.
@@ -3200,6 +3233,7 @@ function setTab(name, { history = true } = {}) {
     window.cmConfig.activate();
   }
   if (history) updateViewUrl();
+  if (!LIVE_GRAPH_EMBED && matchMedia("(max-width: 820px)").matches) window.scrollTo({ top: 0 });
 }
 
 function wireTabs() {

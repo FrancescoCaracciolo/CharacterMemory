@@ -250,7 +250,7 @@ def build_admin_router(
         info_dir = os.path.join(_char_dir(name), BUCKETS["information"])
         dlg_dir = os.path.join(_char_dir(name), BUCKETS["dialogues"])
         marker = os.path.join(_char_dir(name), ".knowledge_graph")
-        has_built = os.path.isfile(os.path.join(_save_dir(name), "memory.db"))
+        has_built = name in agents or os.path.isfile(os.path.join(_save_dir(name), "memory.db"))
         return {
             "name": name,
             "has_info": bool(os.path.isdir(info_dir) and os.listdir(info_dir)),
@@ -274,6 +274,9 @@ def build_admin_router(
         char_dir = _char_dir(name)
         config_path = config_path_for(char_dir)
         old = agents.get(name)
+        monitor = sync_monitors.get(name)
+        if monitor is not None:
+            monitor.stop()
         if old is not None:
             try:
                 old.close()
@@ -376,6 +379,19 @@ def build_admin_router(
                 agent.close()
             except Exception:
                 pass
+        # Remote state is outside the character directory. Delete its schema
+        # before deleting configuration so a connection failure remains retryable.
+        from ..memory.postgres import PostgresStore
+        if agent is not None and isinstance(agent.store, PostgresStore):
+            agent.store.drop_namespace()
+        else:
+            storage = load_config(_char_dir(name)).config.storage
+            if storage.backend == "postgres":
+                remote = PostgresStore(storage.url,
+                    namespace=storage.namespace or os.path.realpath(_save_dir(name)),
+                    pool_min_size=storage.pool_min_size, pool_max_size=storage.pool_max_size,
+                    pool_timeout=storage.pool_timeout)
+                remote.drop_namespace()
         char_dir = _char_dir(name)
         if os.path.isdir(char_dir):
             shutil.rmtree(char_dir)
@@ -476,7 +492,7 @@ def build_admin_router(
                     and key != "knowledge_graph_k"
                 ):
                     try:
-                        setattr(mem, key, int(val))
+                        setattr(mem, key, max(0, int(val)))
                     except (TypeError, ValueError):
                         pass
                 elif key == "knowledge_graph_token_budget":

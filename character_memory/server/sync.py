@@ -228,6 +228,14 @@ class MemorySync:
             return False
         reloaded = False
         for name, mem in self.agent.memories.items():
+            hybrid = getattr(mem, "hybrid", None)
+            if isinstance(mem, WorldMemory):
+                hybrid = mem.records.hybrid
+            if isinstance(mem, KnowledgeGraphMemory):
+                hybrid = mem.retriever.hybrid
+            if getattr(hybrid, "remote", False):
+                reloaded = hybrid.refresh() or reloaded
+                continue
             p = self._index_nodes_json(name)
             m = _mtime(p)
             if m <= self._index_mtimes.get(name, 0.0) or m <= 0.0:

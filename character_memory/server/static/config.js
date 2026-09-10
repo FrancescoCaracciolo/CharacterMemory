@@ -797,8 +797,9 @@ function renderMemoryList(mem) {
     const enabled = mem[`enabled_${m.name}`] !== false;
     const kVal = mem[`${m.name}_k`] != null ? mem[`${m.name}_k`] : "";
     const kInput = el("input", {
-      type: "number", min: "1", max: "50", value: String(kVal),
+      type: "number", min: "0", max: "50", value: String(kVal),
       class: "k-input", "data-mem": m.name, disabled: !enabled,
+      title: "Automatic retrieval size. 0 skips prompt injection; MCP and tools still work.",
     });
     kInput.addEventListener("input", () => {
       const v = parseInt(kInput.value, 10);
@@ -1012,7 +1013,7 @@ function gatherConfig() {
     if (m.k) {
       const k = document.querySelector(`.k-input[data-mem="${m.name}"]`);
       const v = parseInt(k && k.value, 10);
-      if (!Number.isNaN(v)) mem[`${m.name}_k`] = v;
+      if (!Number.isNaN(v)) mem[`${m.name}_k`] = Math.max(0, v);
     }
   }
   const kgTokenBudget = parseInt($("cfg-kg-token-budget").value, 10);
