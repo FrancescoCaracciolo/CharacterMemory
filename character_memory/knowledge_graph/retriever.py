@@ -11,13 +11,15 @@ This is the class the example API in the design doc drives::
     items = kg.retrieve("message", user_id="...", token_budget=1000)
     kg.save(save_dir)
 
-It owns a :class:`KnowledgeGraph`, a node-text :class:`HybridSearch`, and an
-optional :class:`SQLiteStore` + :class:`LLMClient`. Every public method is a
+It owns a :class:`KnowledgeGraph`, a node-text :class:`RAGSystem`, and an
+optional :class:`Store` + :class:`LLMClient`. Every public method is a
 thin orchestrator over :mod:`ingest`, :mod:`activation`, and
 :mod:`persistence`; the heavy lifting lives there.
 """
 
 from __future__ import annotations
+
+from ..concurrency import synchronized
 
 import time
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
@@ -35,11 +37,11 @@ from ..memory.character_base import CharacterInfoMemory
 from ..memory.dedup import DedupReport
 from ..memory.emotion import EmotionStatus
 from ..memory.episodic import EpisodicMemory
-from ..memory.store import SQLiteStore
+from ..memory.store_base import Store
 from ..memory.user_facts import UserFactMemory
 from ..memory.user_summary import UserSummaryMemory
 from ..rag.base import as_queries
-from ..rag.hybrid import HybridSearch
+from ..rag.base import RAGSystem
 from .activation import combined_activation, combined_activation_breakdown
 from .edges import CoOccurrenceEdge, EpisodeEdge, FactEdge
 from .graph import KnowledgeGraph
@@ -126,8 +128,8 @@ class KnowledgeGraphRetriever:
         self.config = config or KnowledgeGraphConfig()
         self.llm: Optional[LLMClient] = None
         self.embedder: Optional[EmbeddingProvider] = None
-        self.hybrid: Optional[HybridSearch] = None
-        self.store: Optional[SQLiteStore] = None
+        self.hybrid: Optional[RAGSystem] = None
+        self.store: Optional[Store] = None
         # A brand-new/rebuilt retriever owns an authoritative full snapshot;
         # once loaded or saved, routine extraction persists as a merge so a
         # stale worker cannot erase wiki rows written by another process.
@@ -153,9 +155,9 @@ class KnowledgeGraphRetriever:
         self,
         llm: Optional[LLMClient],
         embedder: EmbeddingProvider,
-        hybrid: HybridSearch,
+        hybrid: RAGSystem,
         *,
-        store: Optional[SQLiteStore] = None,
+        store: Optional[Store] = None,
     ) -> "KnowledgeGraphRetriever":
         """Wire the LLM / embedder / hybrid index (and optional SQLite store).
 
@@ -167,7 +169,30 @@ class KnowledgeGraphRetriever:
         self.embedder = embedder
         self.hybrid = hybrid
         self.store = store
+        if store is not None and getattr(hybrid, "remote", False):
+            from .persistence import _ensure_tables
+            _ensure_tables(store)
+            store.track_table("kg_nodes", collection=hybrid.collection)
+            hybrid._refresh_callback = self._repair_durable_index
         return self
+
+    def _repair_durable_index(self):
+        # Durable graph rows can be repaired without replacing the live graph.
+        with self.hybrid._lock:
+            pending = self.store.pending_index(self.hybrid.collection)
+            for start in range(0, len(pending), self.hybrid.batch_size):
+                batch = pending[start:start + self.hybrid.batch_size]
+                chunks = []
+                ids = [item["row_key"] for item in batch]
+                from ..chunking.base import Chunk
+                for node_id in ids:
+                    rows = self.store.select("kg_nodes", {"id": node_id})
+                    if rows and node_id != self.graph.SELF_ID and (rows[0]["text"] or "").strip():
+                        row = rows[0]
+                        chunks.append(Chunk(text=row["text"].strip(), source=row["kind"],
+                                            metadata={"id": node_id, "kind": row["kind"]}))
+                self.hybrid.replace_documents(ids, chunks, pending=batch)
+            return bool(pending)
 
     # ------------------------------------------------------- source projection
     def _ensure_projection_meta(self) -> None:
@@ -183,6 +208,7 @@ class KnowledgeGraphRetriever:
             pk="projector",
         )
 
+    @synchronized
     def reconcile_sources(
         self, *, force: bool = False, sync_index: bool = True
     ) -> dict[str, dict[str, int]]:
@@ -249,6 +275,7 @@ class KnowledgeGraphRetriever:
         self._pending_projection_meta.clear()
 
     # --------------------------------------------------------------- ingestion
+    @synchronized
     def ingest(
         self,
         memories: Iterable[Any],
@@ -372,6 +399,7 @@ class KnowledgeGraphRetriever:
             (n.source or "").startswith("wiki:") for n in self.graph.nodes.values()
         )
 
+    @synchronized
     def ingest_wiki(
         self,
         sections: Iterable[dict[str, Any]],
@@ -408,6 +436,7 @@ class KnowledgeGraphRetriever:
             self._sync_index()
         return self
 
+    @synchronized
     def _ingest_for_build(
         self,
         memories: Iterable[Any],
@@ -495,6 +524,7 @@ class KnowledgeGraphRetriever:
         )
         return fact_requests + wiki_requests
 
+    @synchronized
     def update(
         self,
         extracted_items: dict[str, list],
@@ -594,6 +624,7 @@ class KnowledgeGraphRetriever:
             self._sync_index()
         return self
 
+    @synchronized
     def apply_deduplication(
         self,
         report: dict[str, DedupReport],
@@ -618,6 +649,7 @@ class KnowledgeGraphRetriever:
             self._sync_index()
         return self
 
+    @synchronized
     def deduplicate_persons(self) -> dict[str, list]:
         """Run the deterministic person-dedup passes and return a report.
 
@@ -842,6 +874,7 @@ class KnowledgeGraphRetriever:
     def _privacy_mode(self) -> KnowledgeGraphPrivacy:
         return KnowledgeGraphPrivacy.coerce(getattr(self.config, "privacy", None))
 
+    @synchronized
     def visible_node_ids(
         self,
         *,
@@ -970,7 +1003,7 @@ class KnowledgeGraphRetriever:
             nid = h.metadata.get("id")
             if not (isinstance(nid, str) and nid in self.graph.nodes):
                 continue
-            # HybridSearch applies this during BM25/FAISS calculation. Keep a
+            # RAGSystem applies this during BM25/FAISS calculation. Keep a
             # defensive boundary here as well for custom RAG implementations.
             if allowed_node_ids is not None and nid not in allowed_node_ids:
                 continue
@@ -1023,6 +1056,7 @@ class KnowledgeGraphRetriever:
         except (TypeError, ValueError, KeyError):
             return None
 
+    @synchronized
     def test_activation(
         self,
         query: str,
@@ -1128,6 +1162,7 @@ class KnowledgeGraphRetriever:
         trace = {nid: score for nid, score in trace.items() if nid in visible}
         return trace
 
+    @synchronized
     def test_activation_details(
         self,
         query: str,
@@ -1174,6 +1209,7 @@ class KnowledgeGraphRetriever:
                 details[nid]["score_breakdown"] = dict(comp)
         return details
 
+    @synchronized
     def retrieve(
         self,
         query: str,
@@ -1243,6 +1279,7 @@ class KnowledgeGraphRetriever:
             self._hebbian_step(set(surfaced_ids))
         return items
 
+    @synchronized
     def record_recall(self, items: Iterable[MemoryItem]) -> None:
         """Record one merged recall (used by multi-participant rendering)."""
         surfaced: set[str] = set()
@@ -1376,6 +1413,7 @@ class KnowledgeGraphRetriever:
         )
 
     # --------------------------------------------------------------- persistence
+    @synchronized
     def save(self, path: str) -> "KnowledgeGraphRetriever":
         if self.hybrid is None or self.store is None:
             return self
@@ -1393,10 +1431,11 @@ class KnowledgeGraphRetriever:
         self._known_users = self._graph_user_ids()
         return self
 
+    @synchronized
     def load_persisted(self, path: str) -> "KnowledgeGraphRetriever":
         if self.hybrid is None or self.store is None:
             return self
-        if not has_persisted(self.store, path):
+        if not has_persisted(self.store, path, self.hybrid):
             return self
         self.graph = load_graph(self.store)
         self._replace_on_next_save = False
@@ -1425,8 +1464,9 @@ class KnowledgeGraphRetriever:
     def has_persisted(self, path: str) -> bool:
         if self.store is None:
             return False
-        return has_persisted(self.store, path)
+        return has_persisted(self.store, path, self.hybrid)
 
+    @synchronized
     def reset(self) -> "KnowledgeGraphRetriever":
         """Wipe the in-memory graph (counters included)."""
         self.graph = KnowledgeGraph()
@@ -1496,6 +1536,7 @@ class KnowledgeGraphRetriever:
             return False
 
     # ----------------------------------------------------------- introspection
+    @synchronized
     def overview(
         self,
         *,

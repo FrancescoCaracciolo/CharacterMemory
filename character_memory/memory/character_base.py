@@ -1,6 +1,6 @@
 """Memories backed purely by a RAG index.
 
-Both wrap a `HybridSearch` class and simply return the top-k chunks for a
+Both wrap a `RAGSystem` class and simply return the top-k chunks for a
 query; they differ only in how the hits are formatted into the prompt.
 This is used for a inner memory type, not relevant to the user. 
 For example wikis, conversations and base character information.
@@ -8,7 +8,7 @@ For example wikis, conversations and base character information.
 
 from typing import Optional
 
-from ..rag.hybrid import HybridSearch
+from ..rag.base import RAGSystem
 from .base import Memory, MemoryItem, MemoryScope
 from ..chunking import Chunk
 
@@ -20,7 +20,7 @@ class RAGMemory(Memory):
     # is in the conversation.
     scope = MemoryScope.CHARACTER
 
-    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True, _title: Optional[str] = None, name: Optional[str] = None) -> None:
+    def __init__(self, hybrid: RAGSystem, *, enabled: bool = True, _title: Optional[str] = None, name: Optional[str] = None) -> None:
         super().__init__(enabled=enabled, name=name)
         self.hybrid = hybrid
         self._title = _title
@@ -31,7 +31,10 @@ class RAGMemory(Memory):
 
     def recall(self, query: str, user_id: str, limit: int, state_changing: bool = True) -> list[MemoryItem]:
         # RAG recall is read-only by nature; `state_changing` is accepted for
-        # interface symmetry but has no effect.
+        # interface symmetry but has no effect. ``limit=0`` disables automatic
+        # prompt retrieval while leaving the index available to tools/MCP.
+        if limit <= 0:
+            return []
         hits = self.hybrid.search(query, k=limit)
         return [
             MemoryItem(text=h.text, score=h.score, kind=self.name, metadata=h.metadata)
@@ -68,7 +71,7 @@ class CharacterInfoMemory(RAGMemory):
 
     name = "character_info"
 
-    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True, name: Optional[str] = None) -> None:
+    def __init__(self, hybrid: RAGSystem, *, enabled: bool = True, name: Optional[str] = None) -> None:
         super().__init__(hybrid, enabled=enabled, _title="Character Information", name=name)
 
 
@@ -77,7 +80,7 @@ class DialogueStyleMemory(RAGMemory):
 
     name = "dialogue_style"
 
-    def __init__(self, hybrid: HybridSearch, *, enabled: bool = True, name: Optional[str] = None) -> None:
+    def __init__(self, hybrid: RAGSystem, *, enabled: bool = True, name: Optional[str] = None) -> None:
         super().__init__(hybrid, enabled=enabled, _title="Example Exchanges (style reference)", name=name)
 
     def format(self, items: list[MemoryItem]) -> str:

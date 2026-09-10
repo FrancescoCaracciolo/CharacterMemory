@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from datetime import UTC, datetime
 from typing import Any, Optional
@@ -50,6 +49,8 @@ class ConversationEventMemory(StructuredMemory):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.store.create_table(self._KEY_TABLE, self._KEY_COLUMNS)
+        if getattr(self.hybrid, "remote", False):
+            self.store.track_table(self._KEY_TABLE, key="event_id", collection=self.hybrid.collection)
         self._backfill_occurrence_times()
 
     def temporal_interval(
@@ -67,7 +68,7 @@ class ConversationEventMemory(StructuredMemory):
                 f"SELECT occurred_at, created_at FROM messages WHERE id IN ({placeholders}) ORDER BY id ASC",
                 message_ids,
             )
-        except sqlite3.OperationalError:
+        except self.store.operational_errors:
             return None
         for row in rows:
             value = row.get("occurred_at")
@@ -412,6 +413,9 @@ class ConversationEventMemory(StructuredMemory):
                 "created_at": time.time(),
             },
         )
+        if getattr(self.hybrid, "remote", False):
+            self.hybrid.refresh()
+            return key_id
         self.hybrid.add_documents(
             [
                 Chunk(

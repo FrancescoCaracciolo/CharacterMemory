@@ -1,7 +1,6 @@
 """User summary: a consolidated per-user profile (name, aliases, quick summary)."""
 
 import json
-import sqlite3
 from typing import TYPE_CHECKING, Any, Optional
 
 from .base import ExtractionSpec, MemoryItem
@@ -48,7 +47,7 @@ class UserSummaryMemory(StructuredMemory):
                 self.store.execute(
                     f"ALTER TABLE {self.table} ADD COLUMN updated_at REAL"
                 )
-            except sqlite3.OperationalError:
+            except self.store.operational_errors:
                 # Another process may have completed the same additive
                 # migration between the column check and ALTER TABLE.
                 if "updated_at" not in self.store.columns(self.table):

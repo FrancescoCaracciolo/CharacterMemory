@@ -248,9 +248,11 @@ class Memory(ABC):
     ) -> list[MemoryItem]:
         """Return results within ``limit`` for ``query`` and ``user_id``.
 
-        For most memories ``limit`` is a top-k item count. Memories whose
-        entries vary substantially in size may define another unit; the
-        knowledge graph treats it as a rendered prompt-token budget.
+        For most memories ``limit`` is a top-k item count. ``0`` disables
+        automatic prompt retrieval for this memory; MCP and tools still
+        search with their own limits. Memories whose entries vary
+        substantially in size may define another unit; the knowledge graph
+        treats it as a rendered prompt-token budget.
 
         `query` is normally the last user message, but may be a list of
         ``(text, weight)`` pairs (e.g. one per recent chat message, with older

@@ -11,8 +11,10 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
+from .store_base import Store
 
-class SQLiteStore:
+
+class SQLiteStore(Store):
     """Thin, thread-safe wrapper around a sqlite3 connection."""
 
     def __init__(self, path: str) -> None:
@@ -30,56 +32,14 @@ class SQLiteStore:
             self._conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({cols_sql})")
             self._conn.commit()
 
-    def upsert(self, table: str, row: dict[str, Any], pk: str = "id") -> int:
-        cols = list(row.keys())
-        placeholders = ", ".join("?" for _ in cols)
-        col_list = ", ".join(cols)
-        update_list = ", ".join(f"{c}=excluded.{c}" for c in cols if c != pk)
-        sql = (
-            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})"
-            + (f" ON CONFLICT({pk}) DO UPDATE SET {update_list}" if update_list else "")
-        )
-        with self._lock:
-            cur = self._conn.execute(sql, [row[c] for c in cols])
-            self._conn.commit()
-            new_id = cur.lastrowid if cur.lastrowid is not None else row.get(pk)
-        return int(new_id) if new_id is not None else 0
-
-    def select(
-        self,
-        table: str,
-        where: Optional[dict[str, Any]] = None,
-        order_by: Optional[str] = None,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
-    ) -> list[dict[str, Any]]:
-        sql = f"SELECT * FROM {table}"
-        params: list[Any] = []
-        if where:
-            clauses = " AND ".join(f"{k}=?" for k in where)
-            sql += f" WHERE {clauses}"
-            params.extend(where.values())
-        if order_by:
-            sql += f" ORDER BY {order_by}"
-        if limit is not None:
-            sql += f" LIMIT {int(limit)}"
-        if offset is not None:
-            # Requires a LIMIT in standard SQLite; guard with -1 (unlimited).
-            sql += f" OFFSET {int(offset)}"
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
-
-    def delete(self, table: str, where: dict[str, Any]) -> None:
-        clauses = " AND ".join(f"{k}=?" for k in where)
-        with self._lock:
-            self._conn.execute(f"DELETE FROM {table} WHERE {clauses}", list(where.values()))
-            self._conn.commit()
-
     def execute(self, sql: str, params: Optional[list[Any]] = None) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._conn.execute(sql, params or []).fetchall()
-            self._conn.commit()
+            try:
+                rows = self._conn.execute(sql, params or []).fetchall()
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         return [dict(r) for r in rows]
 
     @contextmanager

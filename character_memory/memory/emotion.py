@@ -1,12 +1,14 @@
 """Emotion status: baseline/current mood plus configurable per-user dims."""
 
+from ..concurrency import synchronized
+
 import json
 from typing import TYPE_CHECKING, Any, Optional
 
 from .base import ExtractionSpec, Memory, MemoryItem, MemoryScope
 from ..chunking import Chunk
 from ..emotion_vectors import decode_emotion_vector, emotion_vector, encode_emotion_vector
-from .store import SQLiteStore
+from .store_base import Store
 
 if TYPE_CHECKING:  # avoid circular import at runtime
     from .extract import ExtractionContext
@@ -29,7 +31,7 @@ class EmotionStatus(Memory):
 
     def __init__(
         self,
-        store: SQLiteStore,
+        store: Store,
         *,
         enabled: bool = True,
         baseline: Optional[dict[str, float]] = None,
@@ -93,6 +95,7 @@ class EmotionStatus(Memory):
         blob = self._read_blob(user_id)
         return {k: float(v) for k, v in blob.items() if k != "comment"}
 
+    @synchronized
     def set_user_state(self, user_id: str, state: dict[str, float]) -> None:
         """Replace the dims, preserving the existing `comment`."""
         blob = self._read_blob(user_id)
@@ -103,12 +106,14 @@ class EmotionStatus(Memory):
         """The relationship descriptor for `user_id` ("" when unset)."""
         return str(self._read_blob(user_id).get("comment") or "")
 
+    @synchronized
     def set_user_comment(self, user_id: str, comment: str) -> None:
         """Set the relationship descriptor, preserving the dims."""
         blob = self._read_blob(user_id)
         blob["comment"] = str(comment or "").strip()
         self._write_blob(user_id, blob)
 
+    @synchronized
     def update(self, user_id: str, deltas: dict[str, float]) -> dict[str, float]:
         """Apply signed `deltas` to the per-user dims, clamped to `[-1, 1]`."""
         current = self.get_user_state(user_id)
@@ -126,6 +131,7 @@ class EmotionStatus(Memory):
         clean = decode_emotion_vector(rows[0]["state"], allowed_axes=self.baseline)
         return {axis: float(clean.get(axis, 0.0)) for axis in self.baseline}
 
+    @synchronized
     def set_current_mood(self, mood: dict[str, float]) -> dict[str, float]:
         """Replace the character-wide mood with an absolute snapshot."""
         clean = emotion_vector(mood, allowed_axes=self.baseline)
@@ -318,6 +324,7 @@ class EmotionStatus(Memory):
             ),
         )
 
+    @synchronized
     def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
         if not value:
             return []

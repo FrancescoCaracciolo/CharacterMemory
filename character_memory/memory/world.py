@@ -8,12 +8,13 @@ intact.
 
 from __future__ import annotations
 
+from ..concurrency import synchronized
+
 import copy
 import hashlib
 import json
 import os
 import re
-import sqlite3
 import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
@@ -26,9 +27,9 @@ import yaml
 from ..chunking import Chunk
 from ..config import WorldConfig
 from ..rag.base import Query
-from ..rag.hybrid import HybridSearch
+from ..rag.base import RAGSystem
 from .base import ExtractionSpec, Memory, MemoryItem, MemoryScope, item_bullet
-from .store import SQLiteStore
+from .store_base import Store
 from .structured import StructuredMemory
 
 if TYPE_CHECKING:
@@ -204,7 +205,7 @@ class WorldRecordMemory(StructuredMemory):
 class WorldStateStore:
     """Exact state and authored definitions for one private world."""
 
-    def __init__(self, store: SQLiteStore) -> None:
+    def __init__(self, store: Store) -> None:
         self.store = store
         self._create_tables()
 
@@ -263,7 +264,7 @@ class WorldStateStore:
                     "ALTER TABLE world_actor_state ADD COLUMN activity_source "
                     "TEXT NOT NULL DEFAULT 'legacy'"
                 )
-            except sqlite3.OperationalError:
+            except self.store.operational_errors:
                 if "activity_source" not in self.store.columns("world_actor_state"):
                     raise
         if "active_routine_id" not in actor_state_columns:
@@ -271,7 +272,7 @@ class WorldStateStore:
                 self.store.execute(
                     "ALTER TABLE world_actor_state ADD COLUMN active_routine_id TEXT"
                 )
-            except sqlite3.OperationalError:
+            except self.store.operational_errors:
                 if "active_routine_id" not in self.store.columns("world_actor_state"):
                     raise
 
@@ -384,6 +385,7 @@ class WorldStateStore:
             row["interruptible"] = bool(row.get("interruptible"))
         return rows
 
+    @synchronized
     def set_features(
         self, values: dict[str, Optional[bool]], *, actor_id: Optional[str] = None,
         now: Optional[float] = None,
@@ -553,6 +555,7 @@ class WorldSimulator(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    @synchronized
     def advance(self, now: float) -> list[WorldEvent]:
         raise NotImplementedError
 
@@ -893,6 +896,7 @@ class RuleBasedWorldSimulator(WorldSimulator):
                 output[actor["id"]] = self._project_state(row, actor, now)
         return output
 
+    @synchronized
     def advance(self, now: float) -> list[WorldEvent]:
         stored_previous = self.state_store.meta("advanced_at", None)
         previous = float(now if stored_previous is None else stored_previous)
@@ -999,7 +1003,7 @@ class WorldMemory(Memory):
     supports_temporal_resolution = True
 
     def __init__(
-        self, store: SQLiteStore, hybrid: HybridSearch, *, character_name: str,
+        self, store: Store, hybrid: RAGSystem, *, character_name: str,
         character_dir: str, config: Optional[WorldConfig] = None,
         enabled: bool = True, half_life: float = 60 * 60 * 24 * 7,
         sticky_threshold: float = 0.95,
@@ -1096,6 +1100,7 @@ class WorldMemory(Memory):
         self._reconcile_seed_facts(seed.get("facts") or [])
         return seed
 
+    @synchronized
     def save_seed(self, seed: dict[str, Any]) -> dict[str, Any]:
         os.makedirs(os.path.dirname(self.seed_path), exist_ok=True)
         with open(self.seed_path, "w", encoding="utf-8") as handle:
@@ -1176,18 +1181,22 @@ class WorldMemory(Memory):
             revision = int(self.state_store.meta("record_revision", 0) or 0) + mutations
             self.state_store.set_meta("record_revision", revision)
 
+    @synchronized
     def build(self, info_chunks: list[Chunk]) -> None:
         self.records.rebuild_index()
 
+    @synchronized
     def rebuild_index(self) -> None:
         self.records.rebuild_index()
 
+    @synchronized
     def persist(self, path: str) -> None:
         self.records.persist(path)
         self.state_store.set_meta(
             "indexed_record_revision", int(self.state_store.meta("record_revision", 0) or 0)
         )
 
+    @synchronized
     def load(self, path: str) -> None:
         self.records.load(path)
         indexed = int(self.state_store.meta("indexed_record_revision", 0) or 0)
@@ -1199,6 +1208,7 @@ class WorldMemory(Memory):
     def observer_id(self) -> str:
         return self.state_store.observer_id
 
+    @synchronized
     def advance(self, now: Optional[float] = None) -> list[WorldEvent]:
         stamp = self._now() if now is None else float(now)
         stored_previous = self.state_store.meta("advanced_at", None)
@@ -1319,6 +1329,7 @@ class WorldMemory(Memory):
             revision=int(self.state_store.meta("revision", 0) or 0),
         )
 
+    @synchronized
     def snapshot(self, *, commit: bool = False, now: Optional[float] = None) -> WorldSnapshot:
         stamp = self._now() if now is None else float(now)
         if commit and self.config.auto_advance:
@@ -1448,6 +1459,7 @@ class WorldMemory(Memory):
             )
         return "\n".join(lines)
 
+    @synchronized
     def recall(
         self, query: Query, user_id: str, limit: int, state_changing: bool = True,
         *,
@@ -1484,6 +1496,7 @@ class WorldMemory(Memory):
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
         return self.records.get_memories(limit)
 
+    @synchronized
     def add_fact(
         self, content: str, *, subject_id: Optional[str] = None,
         location_id: Optional[str] = None, visibility: str = "known",
@@ -1519,6 +1532,7 @@ class WorldMemory(Memory):
         self._bump_record_revision()
         return row_id
 
+    @synchronized
     def record_event(
         self, content: str, *, actor_id: Optional[str] = None,
         location_id: Optional[str] = None, occurred_at: Optional[float] = None,
@@ -1656,6 +1670,7 @@ class WorldMemory(Memory):
             nested.setdefault("actor_id", command.actor_id)
             self.validate_command_dict(nested)
 
+    @synchronized
     def apply_command(self, command: WorldCommand) -> WorldEvent:
         self.validate_command(command)
         now = self._now() if command.at is None else float(command.at)
@@ -1729,6 +1744,7 @@ class WorldMemory(Memory):
             command.source_message_id, bool(rec.rowcount)
         )
 
+    @synchronized
     def commit_turn(
         self, chat_id: str, reply: str, effects: list["TurnEffect"],
         *, calendar: Optional[Any] = None,
@@ -1902,6 +1918,7 @@ class WorldMemory(Memory):
                 return
         command.until = now + 3_600
 
+    @synchronized
     def set_features(
         self, values: dict[str, Optional[bool]], *, actor_id: Optional[str] = None,
     ) -> dict[str, bool]:
@@ -1965,6 +1982,7 @@ class WorldMemory(Memory):
             ),
         )
 
+    @synchronized
     def apply_extraction(
         self, value: Any, user_id: str, *, chat_id: Optional[str] = None,
     ) -> list[MemoryItem]:

@@ -2,14 +2,14 @@
 
 Two stores, both per-character under `<save_directory>/kg_index/`:
 
-- the **SQLite** tables `kg_nodes` and `kg_edges` in the shared `SQLiteStore`
+- the **SQLite** tables `kg_nodes` and `kg_edges` in the shared `Store`
   (one connection per character, same memory.db the other memories use);
 - the **node-text hybrid index** (BM25 + dense similarity, fused with RRF)
-  via the same `HybridSearch` reused everywhere in the library, persisted as
+  via the same `RAGSystem` reused everywhere in the library, persisted as
   `kg_index/nodes.json` + `kg_index/faiss.index`.
 
 `load(path)` is the inverse of `save(path)` and preserves the rebuild-on-
-embedding-dim-drift behaviour of `HybridSearch` (the dense index is rebuilt
+embedding-dim-drift behaviour of `RAGSystem` (the dense index is rebuilt
 from `nodes.json` when the stored dim no longer matches the live embedder).
 """
 
@@ -26,8 +26,8 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
 from ..chunking.base import Chunk
-from ..memory.store import SQLiteStore
-from ..rag.hybrid import HybridSearch
+from ..memory.store_base import Store
+from ..rag.base import RAGSystem
 from .edges import edge_from_dict
 from .graph import KnowledgeGraph
 from .nodes import node_from_dict
@@ -62,7 +62,7 @@ _EDGE_COLUMNS: dict[str, str] = {
 }
 
 
-def _ensure_tables(store: SQLiteStore) -> None:
+def _ensure_tables(store: Store) -> None:
     store.create_table(NODES_TABLE, _NODE_COLUMNS)
     store.create_table(EDGES_TABLE, _EDGE_COLUMNS)
 
@@ -80,7 +80,7 @@ def _name_of(node_dict: dict[str, Any]) -> Optional[str]:
 def _graph_write_lock(path: str):
     """Serialize a complete SQLite + hybrid-index graph publication.
 
-    ``HybridSearch.persist`` already locks its own two files, but that lock is
+    ``RAGSystem.persist`` already locks its own two files, but that lock is
     too narrow for the graph: SQLite must be updated before ``nodes.json`` is
     published, and two processes must preserve that same ordering.  A
     graph-level lock prevents an older writer from publishing a stale hybrid
@@ -128,7 +128,7 @@ def graph_index_chunks(graph: KnowledgeGraph) -> list[Chunk]:
     ]
 
 
-def sync_hybrid_index(hybrid: HybridSearch, chunks: list[Chunk]) -> bool:
+def sync_hybrid_index(hybrid: RAGSystem, chunks: list[Chunk]) -> bool:
     """Make ``hybrid`` logically equal ``chunks`` using delete/add deltas.
 
     KG node ids are unique, but the comparison deliberately supports repeated
@@ -174,8 +174,8 @@ def sync_hybrid_index(hybrid: HybridSearch, chunks: list[Chunk]) -> bool:
 # --------------------------------------------------------------------- write
 def save_graph(
     graph: KnowledgeGraph,
-    store: SQLiteStore,
-    hybrid: HybridSearch,
+    store: Store,
+    hybrid: RAGSystem,
     path: str,
     *,
     replace: bool = False,
@@ -271,7 +271,7 @@ def save_graph(
 
 
 # --------------------------------------------------------------------- read
-def load_graph(store: SQLiteStore) -> KnowledgeGraph:
+def load_graph(store: Store) -> KnowledgeGraph:
     """Reconstruct the graph from the `kg_nodes` / `kg_edges` tables."""
     _ensure_tables(store)
     data: dict[str, Any] = {"nodes": [], "edges": [], "counters": {}}
@@ -319,11 +319,13 @@ def load_graph(store: SQLiteStore) -> KnowledgeGraph:
     return KnowledgeGraph.from_dict(data)
 
 
-def has_persisted(store: SQLiteStore, index_path: str) -> bool:
+def has_persisted(store: Store, index_path: str, hybrid=None) -> bool:
     """True when both the SQLite tables and the on-disk index exist."""
     cols = store.columns(NODES_TABLE)
     has_table = bool(cols)
-    has_index = os.path.exists(os.path.join(index_path, "nodes.json"))
+    has_index = hybrid.exists(index_path) if hybrid else os.path.exists(os.path.join(index_path, "nodes.json"))
+    if hybrid is not None and hybrid.remote and has_table:
+        return has_index or bool(store.select(NODES_TABLE, limit=1))
     return has_table and has_index
 
 

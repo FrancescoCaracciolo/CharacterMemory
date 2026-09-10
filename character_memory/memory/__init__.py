@@ -71,3 +71,7 @@ __all__ = [
     "CalendarMemory",
     "SELF_OWNER",
 ]
+
+from .store_base import Store
+from .postgres import PostgresStore
+__all__ += ["Store", "PostgresStore"]

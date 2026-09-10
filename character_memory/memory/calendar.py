@@ -19,13 +19,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..chunking import Chunk
 from ..rag.base import Query
-from ..rag.hybrid import HybridSearch
+from ..rag.base import RAGSystem
 from .base import ExtractionSpec, MemoryItem, MemoryScope, item_bullet
 from .structured import StructuredMemory
 
 if TYPE_CHECKING:
     from .extract import ExtractionContext
-    from .store import SQLiteStore
+    from .store_base import Store
     from .world import WorldMemory
     from ..temporal import TemporalResolution, TemporalResolutionEngine
 
@@ -305,8 +305,8 @@ class CalendarMemory(StructuredMemory):
 
     def __init__(
         self,
-        store: "SQLiteStore",
-        hybrid: HybridSearch,
+        store: "Store",
+        hybrid: RAGSystem,
         *,
         timezone: str = "UTC",
         near_past_hours: int = 24,

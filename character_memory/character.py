@@ -144,7 +144,9 @@ class Character:
         extracted = Extractor(llm).extract(turns, schema=schema, instruction=instruction, context=context)
         added: dict[str, list[MemoryItem]] = {}
         for mem, spec in participating:
-            items = mem.apply_extraction(extracted.get(spec.field), user_id, chat_id=chat_id)
+            from .concurrency import object_lock
+            with object_lock(mem):
+                items = mem.apply_extraction(extracted.get(spec.field), user_id, chat_id=chat_id)
             if items:
                 added[mem.name] = items
         # Carry the freshly-added items so the caller (e.g. a deduplicator)

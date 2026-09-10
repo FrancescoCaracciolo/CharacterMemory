@@ -1,6 +1,6 @@
 """Persistent chat / conversation storage.
 
-A `Chat` is a handle over rows in the shared `SQLiteStore` (the same
+A `Chat` is a handle over rows in the shared `Store` (the same
 `memory.db` that holds the structured memories). The agent owns the store
 and hands it to every `Chat`; the chat classes never open a connection of
 their own.
@@ -25,7 +25,7 @@ import time
 import uuid
 from typing import Any, Optional
 
-from .memory.store import SQLiteStore
+from .memory.store_base import Store
 
 _CHAT_COLUMNS: dict[str, str] = {
     "id": "TEXT PRIMARY KEY",
@@ -60,13 +60,13 @@ def _safe_name(user_id: str) -> Optional[str]:
 
 
 class Chat:
-    """A single conversation. Reads/writes through the shared `SQLiteStore`."""
+    """A single conversation. Reads/writes through the shared `Store`."""
 
     def __init__(
         self,
         chat_id: str,
         user_id: str,
-        store: SQLiteStore,
+        store: Store,
         *,
         title: str = "",
         created_at: Optional[float] = None,
@@ -227,7 +227,7 @@ class Chat:
 class _ChatBackend:
     """CRUD for the `chats` / `messages` tables. Owned by the agent."""
 
-    def __init__(self, store: SQLiteStore) -> None:
+    def __init__(self, store: Store) -> None:
         self.store = store
         self.store.create_table("chats", _CHAT_COLUMNS, pk="id")
         self.store.create_table("messages", _MESSAGE_COLUMNS, pk="id")

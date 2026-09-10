@@ -335,7 +335,8 @@ class MemoryConfig:
 
     # Retrieval sizes. Most memories use a top-k item limit; the knowledge
     # graph uses a prompt-token budget because graph nodes vary substantially
-    # in length (short entities versus full facts/episodes).
+    # in length (short entities versus full facts/episodes). ``0`` disables
+    # automatic prompt retrieval for that memory; MCP and tools still work.
     character_info_k: int = 4
     dialogue_style_k: int = 4
     user_facts_k: int = 5
@@ -408,7 +409,7 @@ class MemoryConfig:
         # ``retrieval_limit_for``. The KG value is now tokens, not nodes.
         if name == "knowledge_graph":
             return max(0, int(self.knowledge_graph_token_budget))
-        return int(getattr(self, f"{name}_k", 4))
+        return max(0, int(getattr(self, f"{name}_k", 4)))
 
     def retrieval_limit_for(self, name: str) -> int:
         """Return the configured recall bound for ``name``.
@@ -422,6 +423,41 @@ class MemoryConfig:
 
 
 @dataclass
+class StorageConfig:
+    """Optional production storage. URL may be supplied through CM_DATABASE_URL."""
+    backend: str = field(default_factory=lambda: os.getenv("CM_STORAGE_BACKEND", "sqlite"))
+    url: str = field(default_factory=lambda: os.getenv("CM_DATABASE_URL", ""), repr=False)
+    namespace: str = field(default_factory=lambda: os.getenv("CM_DATABASE_NAMESPACE", ""))
+    pool_min_size: int = field(default_factory=lambda: int(os.getenv("CM_DB_POOL_MIN_SIZE", "2")))
+    pool_max_size: int = field(default_factory=lambda: int(os.getenv("CM_DB_POOL_MAX_SIZE", "20")))
+    pool_timeout: float = field(default_factory=lambda: float(os.getenv("CM_DB_POOL_TIMEOUT", "30")))
+
+    def __post_init__(self):
+        if self.backend not in {"sqlite", "postgres"}:
+            raise ValueError("storage.backend must be sqlite or postgres")
+        if self.pool_min_size < 0 or self.pool_max_size < max(1, self.pool_min_size) or self.pool_timeout <= 0:
+            raise ValueError("Invalid database pool settings")
+
+
+@dataclass
+class RetrievalConfig:
+    """Hybrid backend; postgres requires PostgreSQL storage and pgvector >=0.8."""
+    backend: str = field(default_factory=lambda: os.getenv("CM_RETRIEVAL_BACKEND", "hybrid"))
+    text_search_config: str = field(default_factory=lambda: os.getenv("CM_TEXT_SEARCH_CONFIG", "simple"))
+    candidate_pool: int = field(default_factory=lambda: int(os.getenv("CM_RETRIEVAL_CANDIDATE_POOL", "30")))
+    rrf_k: int = 60
+    hnsw: bool = field(default_factory=lambda: _env_bool("CM_PGVECTOR_HNSW", True))
+    ef_search: int = field(default_factory=lambda: int(os.getenv("CM_PGVECTOR_EF_SEARCH", "100")))
+    batch_size: int = 256
+
+    def __post_init__(self):
+        if self.backend not in {"hybrid", "postgres"}:
+            raise ValueError("retrieval.backend must be hybrid or postgres")
+        if min(self.candidate_pool, self.ef_search, self.batch_size) < 1 or self.rrf_k < 0:
+            raise ValueError("Invalid retrieval settings")
+
+
+@dataclass
 class CharacterMemoryConfig:
     """Top-level config: everything needed to build the whole system."""
 
@@ -432,6 +468,9 @@ class CharacterMemoryConfig:
     temporal_resolution: TemporalResolutionConfig = field(
         default_factory=TemporalResolutionConfig
     )
+
+    storage: StorageConfig = field(default_factory=StorageConfig)
+    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
 
     # Directory used for the SQLite store + persisted RAG indexes.
     data_dir: str = ".cm_data"

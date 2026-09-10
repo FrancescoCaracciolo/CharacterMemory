@@ -73,6 +73,8 @@ import yaml
 
 from .config import (
     CharacterMemoryConfig,
+    StorageConfig,
+    RetrievalConfig,
     ChunkingConfig,
     CalendarConfig,
     DedupConfig,
@@ -305,6 +307,8 @@ def build_full_config(data: dict[str, Any]) -> tuple[CharacterMemoryConfig, Prom
         chunking=_build_subconfig(ChunkingConfig, data.get("chunking")),
         memory=_build_memory_config(data.get("memory")),
         temporal_resolution=temporal,
+        storage=_build_subconfig(StorageConfig, data.get("storage")),
+        retrieval=_build_subconfig(RetrievalConfig, data.get("retrieval")),
     )
     prompts = _build_prompt_config(data.get("prompts"))
     return full, prompts
@@ -457,8 +461,15 @@ def _config_to_dict(config: CharacterMemoryConfig) -> dict[str, Any]:
             return [yaml_value(item) for item in value]
         return value
 
+    storage = asdict(config.storage)
+    # Keep environment credentials out of generated files, and do not write an
+    # empty URL that would override a future CM_DATABASE_URL on reload.
+    if not storage["url"] or storage["url"] == os.getenv("CM_DATABASE_URL"):
+        storage.pop("url")
     return yaml_value(
         {
+            "storage": storage,
+            "retrieval": asdict(config.retrieval),
             "llm": asdict(config.llm),
             "embedding": asdict(config.embedding),
             "chunking": asdict(config.chunking),

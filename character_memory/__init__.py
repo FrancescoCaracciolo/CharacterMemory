@@ -149,7 +149,7 @@ from .tools import (
     tool,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "CharacterAgent",
@@ -285,3 +285,11 @@ __all__ = [
     "CalendarMemory",
     "SELF_OWNER",
 ]
+
+from .memory.store_base import Store
+from .memory.postgres import PostgresStore
+__all__ += ["Store", "PostgresStore"]
+
+from .config import StorageConfig, RetrievalConfig
+from .rag.postgres import PostgresHybridSearch
+__all__ += ["StorageConfig", "RetrievalConfig", "PostgresHybridSearch"]

@@ -51,6 +51,9 @@ from .memory.episodic import EpisodicMemory
 from .memory.heartbeat import HeartbeatJournal
 from .memory.knowledge_graph_memory import KnowledgeGraphMemory
 from .memory.store import SQLiteStore
+from .memory.store_base import Store
+from .concurrency import chat_serialized
+from .rag.base import RAGSystem
 from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
@@ -147,6 +150,7 @@ class CharacterAgent:
         prompt_config: Optional[PromptConfig] = None,
         persona: str = "",
         temporal_resolution_engine: Optional[TemporalResolutionEngine] = None,
+        store: Optional[Store] = None,
     ) -> None:
         self.character_dir = directory
         self.character_name = name or os.path.basename(os.path.normpath(directory))
@@ -177,7 +181,10 @@ class CharacterAgent:
         self.config: Optional[CharacterMemoryConfig] = None
         self.llm: Optional[LLMClient] = None
         self.embedder: Optional[EmbeddingProvider] = None
-        self.store: Optional[SQLiteStore] = None
+        self.store: Optional[Store] = store
+        self._owns_store = store is None
+        self._store_settings = None
+        self._closed = False
         self.memories: dict[str, Memory] = {}
         self.character: Optional[Character] = None
         self.deduplicator: Optional[Deduplicator] = None
@@ -298,9 +305,16 @@ class CharacterAgent:
         self._configure_temporal_resolution(full.temporal_resolution)
 
         self._open_store()
-        self._build_memories(full.memory)
-        self._wire_character()
-        self._chats = _ChatBackend(self.store)
+        try:
+            self._build_memories(full.memory)
+            self._wire_character()
+            self._chats = _ChatBackend(self.store)
+        except BaseException:
+            self.character = None
+            if self._owns_store:
+                self.store.close()
+                self.store = None
+            raise
         return self
 
     def load(
@@ -328,19 +342,50 @@ class CharacterAgent:
 
     def _open_store(self) -> None:
         os.makedirs(self.save_directory, exist_ok=True)
-        self.store = SQLiteStore(os.path.join(self.save_directory, "memory.db"))
+        if self.store is not None and not self._owns_store:
+            self._closed = False
+            return
+        cfg = self.config.storage if self.config else None
+        settings = (self.save_directory, tuple(vars(cfg).items()) if cfg else None)
+        if self.store is not None and self._store_settings == settings and not self._closed:
+            return
+        if self.store is not None and not self._closed:
+            self.close()
+        self.store = None
+        self._closed = False
+        self._store_settings = settings
+        if cfg and cfg.backend == "postgres":
+            from .memory.postgres import PostgresStore
+            if not cfg.url:
+                raise ValueError("PostgreSQL requires storage.url or CM_DATABASE_URL")
+            self.store = PostgresStore(cfg.url, namespace=cfg.namespace or os.path.realpath(self.save_directory),
+                                       pool_min_size=cfg.pool_min_size, pool_max_size=cfg.pool_max_size,
+                                       pool_timeout=cfg.pool_timeout)
+        else:
+            self.store = SQLiteStore(os.path.join(self.save_directory, "memory.db"))
 
     def _build_memories(self, m: MemoryConfig) -> None:
         """Construct the seven standard memories (config-driven path)."""
+        self.memories = {}
         half = m.decay_half_life
         sticky = m.sticky_threshold
 
-        def hybrid() -> HybridSearch:
+        def hybrid(collection: str) -> RAGSystem:
             min_similarity = (
                 self.config.embedding.retrieval_min_similarity
                 if self.config is not None
                 else None
             )
+            cfg = self.config.retrieval
+            if cfg.backend == "postgres":
+                from .memory.postgres import PostgresStore
+                from .rag.postgres import PostgresHybridSearch
+                if not isinstance(self.store, PostgresStore):
+                    raise ValueError("Postgres retrieval requires PostgresStore")
+                return PostgresHybridSearch(self.embedder, self.store, collection,
+                    text_search_config=cfg.text_search_config, candidate_pool=cfg.candidate_pool,
+                    rrf_k=cfg.rrf_k, hnsw=cfg.hnsw, ef_search=cfg.ef_search,
+                    batch_size=cfg.batch_size, min_dense_similarity=min_similarity)
             return HybridSearch(  # type: ignore[arg-type]
                 self.embedder,
                 min_dense_similarity=min_similarity,
@@ -357,17 +402,17 @@ class CharacterAgent:
         )
 
         self.memories["character_info"] = CharacterInfoMemory(
-            hybrid(), enabled=m.is_enabled("character_info")
+            hybrid("character_info"), enabled=m.is_enabled("character_info")
         )
         self.memories["dialogue_style"] = DialogueStyleMemory(
-            hybrid(), enabled=m.is_enabled("dialogue_style")
+            hybrid("dialogue_style"), enabled=m.is_enabled("dialogue_style")
         )
         self.memories["user_facts"] = UserFactMemory(
-            self.store, hybrid(), enabled=m.is_enabled("user_facts"),
+            self.store, hybrid("user_facts"), enabled=m.is_enabled("user_facts"),
             half_life=half, sticky_threshold=sticky,
         )
         self.memories["user_directives"] = UserDirectiveMemory(
-            self.store, hybrid(), enabled=m.is_enabled("user_directives"),
+            self.store, hybrid("user_directives"), enabled=m.is_enabled("user_directives"),
             half_life=half, sticky_threshold=sticky,
         )
         emotion = EmotionStatus(
@@ -375,27 +420,27 @@ class CharacterAgent:
             baseline=m.emotion_baseline, user_dims=m.emotion_user_dims,
         )
         self.memories["episodic"] = EpisodicMemory(
-            self.store, hybrid(), enabled=m.is_enabled("episodic"),
+            self.store, hybrid("episodic"), enabled=m.is_enabled("episodic"),
             half_life=half, sticky_threshold=sticky,
             emotion_baseline=m.emotion_baseline,
             current_mood=(emotion.get_current_mood if emotion.enabled else lambda: {}),
         )
         self.memories["conversation_events"] = ConversationEventMemory(
             self.store,
-            hybrid(),
+            hybrid("conversation_events"),
             enabled=m.is_enabled("conversation_events"),
             half_life=half,
             sticky_threshold=sticky,
         )
         self.memories["heartbeat"] = HeartbeatJournal(
-            self.store, hybrid(), enabled=m.is_enabled("heartbeat"),
+            self.store, hybrid("heartbeat"), enabled=m.is_enabled("heartbeat"),
             half_life=half, sticky_threshold=sticky,
         )
         self.memories["emotion"] = emotion
         if m.is_enabled("world"):
             self.memories["world"] = WorldMemory(
                 self.store,
-                hybrid(),
+                hybrid("world_records"),
                 character_name=self.character_name,
                 character_dir=self.character_dir,
                 config=m.world,
@@ -406,7 +451,7 @@ class CharacterAgent:
         if m.is_enabled("calendar"):
             calendar = CalendarMemory(
                 self.store,
-                hybrid(),
+                hybrid("calendar_events"),
                 timezone=m.calendar.timezone,
                 near_past_hours=m.calendar.near_past_hours,
                 near_future_days=m.calendar.near_future_days,
@@ -420,7 +465,7 @@ class CharacterAgent:
                 calendar.import_world(world)
             self.memories["calendar"] = calendar
         self.memories["user_summary"] = UserSummaryMemory(
-            self.store, hybrid(), enabled=m.is_enabled("user_summary"),
+            self.store, hybrid("user_summary"), enabled=m.is_enabled("user_summary"),
             half_life=half, sticky_threshold=sticky,
         )
 
@@ -429,7 +474,7 @@ class CharacterAgent:
         # after construction in :meth:`_wire_knowledge_graph`.
         if m.is_enabled("knowledge_graph"):
             self.memories[_KG_MEMORY] = KnowledgeGraphMemory(
-                self.store, hybrid(),
+                self.store, hybrid("knowledge_graph"),
                 enabled=m.is_enabled("knowledge_graph"),
                 config=m.knowledge_graph,
                 token_budget=m.knowledge_graph_token_budget,
@@ -526,7 +571,13 @@ class CharacterAgent:
         return len(info_chunks), len(dlg_chunks)
 
     def _has_index(self, subdir: str) -> bool:
-        return os.path.exists(os.path.join(self.save_directory, subdir, "nodes.json"))
+        name = {"info_index": "character_info", "dialogue_index": "dialogue_style"}.get(subdir, subdir.removesuffix("_index"))
+        mem = self.memories.get(name)
+        hybrid = getattr(mem, "hybrid", None)
+        if hybrid is None and isinstance(mem, WorldMemory):
+            hybrid = mem.records.hybrid
+        path = os.path.join(self.save_directory, subdir)
+        return hybrid.exists(path) if hasattr(hybrid, "exists") else os.path.exists(os.path.join(path, "nodes.json"))
 
     def _wiki_sections(self) -> list[dict[str, Any]]:
         """Header-chunk the character's `Information/*.md` into wiki sections.
@@ -989,8 +1040,11 @@ class CharacterAgent:
             where={"chat_id": chat.id, "role": "user"},
         )
         if len(user_turns) % interval == 0:
-            self._extract_chat(chat)
+            # generate_answer already owns the turn lock. This separate path
+            # also permits streaming consumers to resume on another thread.
+            self._extract_chat_unlocked(chat)
 
+    @chat_serialized
     def generate_answer(
         self,
         target: Target,
@@ -1487,7 +1541,11 @@ class CharacterAgent:
             f"UPDATE messages SET extracted=1 WHERE id IN ({qs})", ids
         )
 
+    @chat_serialized
     def _extract_chat(self, chat: Chat) -> None:
+        self._extract_chat_unlocked(chat)
+
+    def _extract_chat_unlocked(self, chat: Chat) -> None:
         interval = max(
             1,
             self.config.memory.extract_interval if self.config is not None else 5,
@@ -1588,26 +1646,20 @@ class CharacterAgent:
         rows = self._chats.all_unextracted()
         if not rows:
             return
-        interval = max(
-            1,
-            self.config.memory.extract_interval if self.config is not None else 5,
-        )
-        window = max(interval * 2, 4)
         by_chat: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             by_chat.setdefault(r["chat_id"], []).append(r)
-        for chat_id, chat_rows in by_chat.items():
+        for chat_id in by_chat:
             chat = self._chats.load_chat(chat_id)
             if chat is None:
                 continue
-            self._extract_messages(
-                chat_rows[-window:],
-                chat.user_id,
-                participants=chat.participants(),
-                chat_id=chat_id,
-            )
+            self._extract_chat(chat)
 
     def close(self) -> None:
-        if self.store is not None:
-            self.persist_structured()
-            self.store.close()
+        if self.store is not None and not self._closed:
+            try:
+                self.persist_structured()
+            finally:
+                self._closed = True
+                if self._owns_store:
+                    self.store.close()

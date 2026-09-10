@@ -21,8 +21,8 @@ from ..knowledge_graph import (
     KnowledgeGraphConfig,
     KnowledgeGraphRetriever,
 )
-from ..memory.store import SQLiteStore
-from ..rag.hybrid import HybridSearch
+from ..memory.store_base import Store
+from ..rag.base import RAGSystem
 from ..rag.base import Query
 from .base import Memory, MemoryItem, MemoryScope, RecallResult
 
@@ -44,8 +44,8 @@ class KnowledgeGraphMemory(Memory):
 
     def __init__(
         self,
-        store: SQLiteStore,
-        hybrid: HybridSearch,
+        store: Store,
+        hybrid: RAGSystem,
         *,
         enabled: bool = True,
         config: Optional[KnowledgeGraphConfig] = None,

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from ..chunking.base import Chunk
 from ..config import ContradictionPolicy
 from ..rag.base import Query
-from ..rag.hybrid import HybridSearch
+from ..rag.base import RAGSystem
 from .base import Memory, MemoryItem
 from .decay import (
     age_seconds,
@@ -24,7 +24,7 @@ from .decay import (
     intrinsic_score,
     relevance_repaired_score,
 )
-from .store import SQLiteStore
+from .store_base import Store
 
 if TYPE_CHECKING:
     from ..temporal import TemporalMatch, TemporalResolution, TemporalResolutionEngine
@@ -53,8 +53,8 @@ class StructuredMemory(Memory):
 
     def __init__(
         self,
-        store: SQLiteStore,
-        hybrid: HybridSearch,
+        store: Store,
+        hybrid: RAGSystem,
         *,
         enabled: bool = True,
         half_life: float = 60 * 60 * 24 * 7,
@@ -70,6 +70,30 @@ class StructuredMemory(Memory):
         self._now = clock or time.time
         cols = {**COMMON_COLUMNS, **self.extra_columns}
         self.store.create_table(self.table, cols)
+        if getattr(hybrid, "remote", False) and getattr(store, "durable_indexes", False):
+            self._repair_lock = hybrid._lock
+            store.track_table(self.table, collection=hybrid.collection)
+            hybrid._refresh_callback = self._repair_index
+
+
+    def _repair_index(self) -> bool:
+        """Replay transactional source changes; acknowledge only indexed revisions."""
+        with self._repair_lock:
+            pending = self.store.pending_index(self.hybrid.collection)
+            if not pending:
+                return False
+            # Work is bounded per embedding batch. A newer concurrent revision
+            # is retained by the conditional acknowledgement in the backend.
+            for start in range(0, len(pending), self.hybrid.batch_size):
+                batch = pending[start:start + self.hybrid.batch_size]
+                ids = [int(item["row_key"]) for item in batch]
+                chunks = []
+                placeholders = ','.join('?' for _ in ids)
+                rows = self.store.execute(f"SELECT * FROM {self.table} WHERE id IN ({placeholders})", ids)
+                for row in rows:
+                    chunks.extend(self.index_chunks(row))
+                self.hybrid.replace_documents(ids, chunks, pending=batch)
+            return True
 
     def build(self, info_chunks: list[Chunk]) -> None:
         return self.hybrid.build(info_chunks)
@@ -135,7 +159,10 @@ class StructuredMemory(Memory):
         row_id = self.store.upsert(self.table, row)
         # Index the new row so BM25+similarity can find it.
         stored = self.store.select(self.table, {"id": row_id})[0]
-        self.hybrid.add_documents(self.index_chunks(stored))
+        if getattr(self.hybrid, "remote", False):
+            self.hybrid.refresh()
+        else:
+            self.hybrid.add_documents(self.index_chunks(stored))
         return row_id
 
     def add_many(
@@ -157,6 +184,9 @@ class StructuredMemory(Memory):
                     },
                 )
             )
+        if row_ids and getattr(self.hybrid, "remote", False):
+            self.hybrid.refresh()
+            return row_ids
         if row_ids:
             rows = [self.get_row(row_id) for row_id in row_ids]
             chunks = [
@@ -180,6 +210,9 @@ class StructuredMemory(Memory):
         appended in one embedding batch. Backends without deletion retain the
         legacy one-shot rebuild fallback.
         """
+        if getattr(self.hybrid, "remote", False):
+            self.hybrid.refresh()
+            return
         removed = {int(row_id) for row_id in removed_ids}
         updated = {int(row_id) for row_id in updated_ids}
         affected = removed | updated
@@ -201,9 +234,16 @@ class StructuredMemory(Memory):
             self.hybrid.add_documents(chunks)
 
     def rebuild_index(self) -> None:
-        rows = self.store.select(self.table)
-        chunks = [chunk for row in rows for chunk in self.index_chunks(row)]
-        self.hybrid.build(chunks)
+        if getattr(self.hybrid, "remote", False):
+            with self._repair_lock:
+                pending = self.store.pending_index(self.hybrid.collection)
+                rows = self.store.select(self.table)
+                chunks = [chunk for row in rows for chunk in self.index_chunks(row)]
+                self.hybrid.build(chunks, pending=pending)
+        else:
+            rows = self.store.select(self.table)
+            chunks = [chunk for row in rows for chunk in self.index_chunks(row)]
+            self.hybrid.build(chunks)
 
     # RECALL functions
     def _effective(self, row: dict[str, Any]) -> float:
@@ -363,7 +403,7 @@ class StructuredMemory(Memory):
         if not rows_by_id:
             return []
 
-        # Search forms the query candidates. HybridSearch supplies an absolute
+        # Search forms the query candidates. RAGSystem supplies an absolute
         # normalized score; third-party RAG backends fall back to normalization
         # against their best hit for this call.
         candidate_pool = int(getattr(self.hybrid, "candidate_pool", max(limit, 30)))

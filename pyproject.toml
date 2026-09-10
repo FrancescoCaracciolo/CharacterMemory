@@ -39,6 +39,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres = ["psycopg[binary,pool]>=3.2,<4"]
 # The optional FastAPI server + memory-browser GUI.
 # Install with:  pip install charactermemory[server]
 server = [

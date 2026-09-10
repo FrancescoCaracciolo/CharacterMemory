@@ -1,7 +1,6 @@
 """Episodic memory: events weighted by emotional impact and mood congruence."""
 
 import json
-import sqlite3
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Optional
 from ..config import ContradictionPolicy
@@ -58,7 +57,7 @@ class EpisodicMemory(StructuredMemory):
                 self.store.execute(
                     f"ALTER TABLE {self.table} ADD COLUMN occurred_at REAL"
                 )
-            except sqlite3.OperationalError:
+            except self.store.operational_errors:
                 if "occurred_at" not in self.store.columns(self.table):
                     raise
         self._backfill_occurrence_times()
@@ -78,7 +77,7 @@ class EpisodicMemory(StructuredMemory):
                 f"SELECT occurred_at, created_at FROM messages WHERE id IN ({placeholders}) ORDER BY id ASC",
                 [int(value) for value in message_ids],
             )
-        except sqlite3.OperationalError:
+        except self.store.operational_errors:
             return None
         for row in rows:
             value = row.get("occurred_at")
