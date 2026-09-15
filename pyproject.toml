@@ -55,6 +55,7 @@ dev = [
 
 [project.scripts]
 charactermemory-server = "character_memory.server.api:main"
+charactermemory-server-setup = "character_memory.server_setup:main"
 
 [project.urls]
 Homepage = "https://github.com/FrancescoCaracciolo/CharacterMemory"
