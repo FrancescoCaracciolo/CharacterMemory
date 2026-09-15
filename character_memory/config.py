@@ -6,13 +6,16 @@ from enum import Enum
 from typing import Optional
 import os
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from pathlib import Path
+
+from ._dotenv import read_text, read_values
 
 
 def _load_dotenv() -> None:
     """Minimal, dependency-free `.env` loader.
 
-    Reads `KEY=VALUE` lines from a `.env` file at the project root (the parent
-    of this package) and exports them via :func:`os.environ.setdefault`, so
+    Reads literal `KEY=VALUE` lines from `.env` in the current directory
+    (falling back to the parent of this package) via :func:`os.environ.setdefault`, so
     values already present in the real environment win. Runs at import time,
     before the config dataclasses evaluate their `os.getenv` defaults.
     """
@@ -21,15 +24,8 @@ def _load_dotenv() -> None:
         path = os.path.join(root, ".env")
         if not os.path.isfile(path):
             continue
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key, value = key.strip(), value.strip().strip('"').strip("'")
-                if key:
-                    os.environ.setdefault(key, value)
+        for key, value in read_values(read_text(Path(path))).items():
+            os.environ.setdefault(key, value)
         break
 
 
@@ -110,7 +106,7 @@ class EmbeddingConfig:
     """Settings for an embedding client."""
 
     base_url: str = os.getenv("OPENAI_EMBEDDINGS_BASE_URL", "https://api.openai.com/v1")
-    api_key: str = os.getenv("OPENAI_API_KEY", "")
+    api_key: str = os.getenv("OPENAI_EMBEDDINGS_API_KEY", os.getenv("OPENAI_API_KEY", ""))
     model: str = os.getenv("OPENAI_EMBEDDINGS_MODEL", "text-embedding-ada-002")
     dim: Optional[int] = None  # inferred from the first request if None
     batch_size: int = 64
@@ -349,6 +345,10 @@ class MemoryConfig:
     calendar_k: int = 8
     knowledge_graph_token_budget: int = 1_000
 
+    # Shared maximum for rendered memory sections. None preserves unlimited
+    # prompt assembly; per-memory limits still bound the candidate pool.
+    token_budget: Optional[int] = None
+
     # Structured Memory behavior
     # Facts/directives whose effective importance is at/above this value are
     # always injected into the prompt ("sticky"), regardless of the query.
@@ -400,6 +400,11 @@ class MemoryConfig:
     retrieval_history_window: int = 5
     #: Per-step weight multiplier for older messages (0 < decay <= 1.0).
     retrieval_recency_decay: float = 0.6
+
+    def __post_init__(self) -> None:
+        from .reranking import validate_budget
+
+        validate_budget(self.token_budget)
 
     def is_enabled(self, name: str) -> bool:
         return bool(getattr(self, f"enabled_{name}", False))

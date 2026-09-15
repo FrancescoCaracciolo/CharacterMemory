@@ -43,6 +43,7 @@ from .config import (
 from .llm.base import LLMClient
 from .llm.embedding_base import EmbeddingProvider
 from .memory.base import Memory
+from .reranking import Budget, UNSET, MemoryReranker, TokenCounter
 from .memory.character_base import CharacterInfoMemory, DialogueStyleMemory
 from .memory.conversation_events import ConversationEventMemory
 from .memory.dedup import Deduplicator, DedupReport
@@ -151,7 +152,11 @@ class CharacterAgent:
         persona: str = "",
         temporal_resolution_engine: Optional[TemporalResolutionEngine] = None,
         store: Optional[Store] = None,
+        reranker: Optional[MemoryReranker] = None,
+        token_counter: Optional[TokenCounter] = None,
     ) -> None:
+        self.reranker = reranker
+        self.token_counter = token_counter
         self.character_dir = directory
         self.character_name = name or os.path.basename(os.path.normpath(directory))
         self.save_directory = save_directory or os.path.join(directory, ".cm_data")
@@ -513,6 +518,9 @@ class CharacterAgent:
             memories=list(self.memories.values()),
             llm=self.llm,
             prompts=self.prompts,
+            budget=self.config.memory.token_budget if self.config is not None else None,
+            reranker=self.reranker,
+            token_counter=self.token_counter,
         )
         # Wire the knowledge graph's backends + source-memory back-reference
         # so it can ingest/update/apply-deduplication against the others.
@@ -949,14 +957,36 @@ class CharacterAgent:
         )
 
     # Prompt
+    def _memory_budget(self, budget: Budget) -> Optional[int]:
+        if budget is UNSET:
+            return self.config.memory.token_budget if self.config is not None else None
+        return budget
+
+    def recall(
+        self, target: Target, *, user_id: str = "default",
+        budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
+    ) -> ContextSnapshot:
+        """Recall selected memories with rendered sections and token usage.
+
+        Omitted budget inherits memory.token_budget; None explicitly removes
+        the cap. Existing per-memory limits determine the candidate pool.
+        """
+        return self.build_context_snapshot(
+            target, user_id=user_id, budget=budget, reranker=reranker,
+        )
+
     def build_context(
-        self, target: Target, *, user_id: str = "default"
+        self, target: Target, *, user_id: str = "default",
+        budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
     ) -> dict[str, str]:
         """Return ordered rendered memory sections and intermediate prompts."""
-        return self.build_context_snapshot(target, user_id=user_id).sections
+        return self.build_context_snapshot(
+            target, user_id=user_id, budget=budget, reranker=reranker,
+        ).sections
 
     def build_context_snapshot(
-        self, target: Target, *, user_id: str = "default"
+        self, target: Target, *, user_id: str = "default",
+        budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
     ) -> ContextSnapshot:
         """Build context once and expose the exact recalls used to build it."""
         self._require_loaded()
@@ -971,9 +1001,14 @@ class CharacterAgent:
             participants=participants,
             temporal_resolution=temporal,
             temporal_weight=self._temporal_weight(),
+            budget=self._memory_budget(budget),
+            reranker=reranker,
         )
 
-    def render_prompt(self, target: Target, *, user_id: str = "default") -> str:
+    def render_prompt(
+        self, target: Target, *, user_id: str = "default",
+        budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
+    ) -> str:
         """Full system-style context block (system line + all sections)."""
         self._require_loaded()
         assert self.character is not None
@@ -987,6 +1022,8 @@ class CharacterAgent:
             participants=participants,
             temporal_resolution=temporal,
             temporal_weight=self._temporal_weight(),
+            budget=self._memory_budget(budget),
+            reranker=reranker,
         )
 
     # Chat management
@@ -1016,6 +1053,9 @@ class CharacterAgent:
         prior: list[dict[str, str]],
         participants: Optional[list[str]] = None,
         temporal_resolution: Optional[TemporalResolution] = None,
+        *,
+        budget: Budget = UNSET,
+        reranker: Optional[MemoryReranker] = None,
     ) -> list[dict[str, str]]:
         assert self.character is not None
         system = self.character.render_prompt(
@@ -1025,6 +1065,8 @@ class CharacterAgent:
             participants=participants,
             temporal_resolution=temporal_resolution,
             temporal_weight=self._temporal_weight(),
+            budget=self._memory_budget(budget),
+            reranker=reranker,
         )
         return [{"role": "system", "content": system}, *prior]
 
@@ -1056,6 +1098,8 @@ class CharacterAgent:
         max_tool_iterations: int = 8,
         tool_choice: Optional[Any] = None,
         auto_extract: bool = True,
+        budget: Budget = UNSET,
+        reranker: Optional[MemoryReranker] = None,
     ) -> Union[str, Iterator[Any]]:
         """Generate an assistant reply for `target`.
 
@@ -1095,6 +1139,10 @@ class CharacterAgent:
         as soon as it's generated and will run :meth:`extract` / extraction on
         its own (e.g. on a background thread). The reply row is still written,
         so conversation history stays intact.
+
+        ``budget`` and ``reranker`` control the memory portion of the system
+        prompt. Omitted budget inherits ``config.memory.token_budget``;
+        ``None`` removes the cap. History and tool messages are outside it.
         """
         self._require_loaded()
         assert self.llm is not None
@@ -1107,6 +1155,8 @@ class CharacterAgent:
             prior,
             participants=participants,
             temporal_resolution=temporal,
+            budget=budget,
+            reranker=reranker,
         )
 
         chat: Optional[Chat] = None

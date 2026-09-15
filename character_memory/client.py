@@ -22,6 +22,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .memory.base import MemoryItem
+from .reranking import Budget, UNSET, validate_budget
 
 
 class CharacterMemoryClientError(RuntimeError):
@@ -676,13 +677,20 @@ class CharacterMemoryClient:
         *,
         chat_id: Optional[str] = None,
         occurred_at: Optional[float] = None,
+        budget: Budget = UNSET,
     ) -> ContextResponse:
         """Persist a user turn and retrieve the character's memory context.
 
         Omit ``chat_id`` for the first turn. The server creates a chat and the
         returned :attr:`ContextResponse.chat_id` should be passed on later
         turns and to :meth:`save`.
+
+        Omitted ``budget`` inherits the character configuration. ``None``
+        removes the cap; ``0`` omits memories; a positive integer caps the
+        rendered memory sections (excluding intermediate prompt blocks).
         """
+        if budget is not UNSET:
+            validate_budget(budget)
         body: dict[str, Any] = {
             "character": character,
             "user": user,
@@ -692,6 +700,8 @@ class CharacterMemoryClient:
             body["chat_id"] = chat_id
         if occurred_at is not None:
             body["occurred_at"] = occurred_at
+        if budget is not UNSET:
+            body["budget"] = budget
         return ContextResponse.from_dict(self._request("POST", "/context", body))
 
     # Explicit verb alias for callers who prefer method names that distinguish

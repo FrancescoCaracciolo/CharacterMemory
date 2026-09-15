@@ -286,6 +286,30 @@ class Memory(ABC):
         """Render recalled `items` into a prompt fragment (override me)."""
         return "\n".join(item_bullet(it, self.timestamp_style) for it in items)
 
+    def format_selection(self, items: list[MemoryItem], participants: list[str]) -> str:
+        """Render a selected subset without retrieving again.
+
+        Override when custom section-result rendering differs from the usual
+        single-user/participant formatting (for example merged graph nodes).
+        """
+        if len(participants) > 1 and self.scope is MemoryScope.PER_USER:
+            return self.format_grouped(items, participants)
+        return self.format(items)
+
+    def prepare_recall(self) -> None:
+        """Perform non-exposure lifecycle work before selective recall.
+
+        Normally a no-op. World simulation uses this to advance independently
+        of whether its context will fit the global budget.
+        """
+
+    def record_recall(self, items: list[MemoryItem]) -> None:
+        """Record exposure of selected items after read-only retrieval.
+
+        Stateful third-party memories should override this hook. The default
+        is a no-op so existing Memory subclasses remain source-compatible.
+        """
+
     def build_section(
         self,
         query: Query,
@@ -364,6 +388,11 @@ class Memory(ABC):
           dummy ``user_id`` and ignored by the implementation.
 
         The single participant is the fast path: a plain ``recall`` call.
+
+        The temporal kwargs are forwarded to :meth:`recall` (via
+        ``_recall_with_temporal``) only when :attr:`supports_temporal_resolution`
+        is set, so subclasses that don't opt in keep the pre-temporal
+        ``recall`` signature.
         """
         if not participants:
             return []
@@ -475,7 +504,13 @@ class Memory(ABC):
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: Optional[float] = None,
     ) -> RecallResult:
-        """Group-aware equivalent of :meth:`build_section_result`."""
+        """Group-aware equivalent of :meth:`build_section_result`.
+
+        The temporal kwargs are forwarded to :meth:`recall_participants` only
+        when :attr:`supports_temporal_resolution` is set; otherwise the legacy
+        four-argument call is used, so overrides that predate (or opt out of)
+        temporal resolution keep working.
+        """
         if not participants:
             return RecallResult()
         if len(participants) == 1:
@@ -490,15 +525,20 @@ class Memory(ABC):
             )
         if not self.enabled:
             return RecallResult()
-        items = self.recall_participants(
-            query,
-            participants,
-            limit,
-            state_changing=state_changing,
-            temporal_resolution=temporal_resolution,
-            temporal_resolution_engine=temporal_resolution_engine,
-            temporal_weight=temporal_weight,
-        )
+        if self.supports_temporal_resolution:
+            items = self.recall_participants(
+                query,
+                participants,
+                limit,
+                state_changing=state_changing,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=temporal_weight,
+            )
+        else:
+            items = self.recall_participants(
+                query, participants, limit, state_changing=state_changing
+            )
         if not items:
             return RecallResult(items=[])
         body = self.format(items) if self.scope is MemoryScope.CHARACTER else self.format_grouped(items, participants)

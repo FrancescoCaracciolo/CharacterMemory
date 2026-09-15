@@ -1486,12 +1486,26 @@ class WorldMemory(Memory):
             ))
         return items
 
+    @synchronized
+    def prepare_recall(self) -> None:
+        if self.config.auto_advance:
+            self.snapshot(commit=True)
+
+    @synchronized
+    def record_recall(self, items: list[MemoryItem]) -> None:
+        self.records.record_recall([
+            item for item in items if not item.metadata.get("world_current")
+        ])
+
     def format(self, items: list[MemoryItem]) -> str:
         if not items:
             return ""
-        current = items[0].text
-        history = [item_bullet(item, self.timestamp_style) for item in items[1:]]
-        return current + ("\nRelevant world facts/events:\n" + "\n".join(history) if history else "")
+        current = "\n".join(item.text for item in items if item.metadata.get("world_current"))
+        history = [item_bullet(item, self.timestamp_style) for item in items
+                   if not item.metadata.get("world_current")]
+        if history:
+            return (current + "\n" if current else "") + "Relevant world facts/events:\n" + "\n".join(history)
+        return current
 
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
         return self.records.get_memories(limit)

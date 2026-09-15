@@ -511,6 +511,12 @@ class StructuredMemory(Memory):
             rows = rows[:limit]
         return [self.row_item(r, self._effective(r)) for r in rows]
 
+    def record_recall(self, items: list[MemoryItem]) -> None:
+        self._bump_recall(list(dict.fromkeys(
+            int(item.metadata["id"]) for item in items
+            if item.metadata.get("id") is not None
+        )))
+
     def _bump_recall(self, ids: list[int]) -> None:
         if not ids:
             return

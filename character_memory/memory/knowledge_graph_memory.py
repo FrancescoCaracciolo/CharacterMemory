@@ -293,6 +293,13 @@ class KnowledgeGraphMemory(Memory):
             return ""
         return self.retriever.format_items(items, timestamp_style=self.timestamp_style)
 
+    def format_selection(self, items: list[MemoryItem], participants: list[str]) -> str:
+        # Group retrieval already merges shared nodes and filters visibility.
+        return self.format(items)
+
+    def record_recall(self, items: list[MemoryItem]) -> None:
+        self.retriever.record_recall(items)
+
     # ----------------------------------------------- build / persist / load stubs
     def build(self, info_chunks: list[Chunk]) -> None:
         # The graph is built from the source memories, not from info chunks;

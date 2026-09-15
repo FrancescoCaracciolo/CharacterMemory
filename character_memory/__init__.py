@@ -10,6 +10,7 @@ Public surface:
 
 from .agent import CharacterAgent
 from .character import Character, ContextSnapshot, MemoryRecallSnapshot
+from .reranking import MemoryCandidate, MemoryReranker, ScoreMemoryReranker
 from .chat import Chat
 from .client import (
     CalendarEventsResponse,
@@ -156,6 +157,9 @@ __all__ = [
     "Character",
     "ContextSnapshot",
     "MemoryRecallSnapshot",
+    "MemoryCandidate",
+    "MemoryReranker",
+    "ScoreMemoryReranker",
     "Chat",
     "CharacterMemoryClient",
     "CharacterMemoryClientError",

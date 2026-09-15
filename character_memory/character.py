@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 from character_memory.llm.base import LLMClient
 from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX, PromptConfig
@@ -11,6 +11,10 @@ from .memory.base import Memory, MemoryItem, RecallResult
 from .memory.structured import StructuredMemory
 from .rag.base import Query
 from .temporal import TemporalResolution
+from .reranking import (
+    Budget, UNSET, MemoryCandidate, MemoryReranker, ScoreMemoryReranker,
+    TokenCounter, count_tokens, validate_budget,
+)
 
 
 @dataclass
@@ -36,17 +40,119 @@ class ContextSnapshot:
     user_id: str
     participants: list[str]
     temporal_resolution: Optional[TemporalResolution] = None
+    memory_token_count: int = 0
+    memory_budget: Optional[int] = None
 
 
 class Character:
 
-    def __init__(self, character_name: str, base_instruction: str = "", memories: Optional[list[Memory]] = None, llm: Optional[LLMClient] = None, prompts: Optional[PromptConfig] = None) -> None:
+    def __init__(
+        self, character_name: str, base_instruction: str = "",
+        memories: Optional[list[Memory]] = None,
+        llm: Optional[LLMClient] = None, prompts: Optional[PromptConfig] = None,
+        *, budget: Optional[int] = None,
+        reranker: Optional[MemoryReranker] = None,
+        token_counter: Optional[TokenCounter] = None,
+    ) -> None:
+        validate_budget(budget)
+        self.budget = budget
+        self.reranker = reranker
+        self.token_counter = token_counter if token_counter is not None else count_tokens
         self.character_name = character_name
         self.base_instruction = base_instruction
         self.memories = memories if memories is not None else []
         self.llm = llm
         self.prompts = prompts
         self._by_name = {m.name: m for m in self.memories}
+
+    def recall(
+        self, query: Query, user_id: str = "default", *,
+        limits: Optional[dict[str, int]] = None,
+        participants: Optional[list[str]] = None,
+        budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
+        temporal_resolution: Optional[TemporalResolution] = None,
+        temporal_weight: float = 1.0,
+    ) -> ContextSnapshot:
+        """Select memories and return their items, sections and token usage.
+
+        Omitted budget inherits the character default; None is unlimited.
+        Unlike the older build_context API, omitted limits use MemoryConfig
+        defaults so direct Character callers get a useful candidate pool.
+        """
+        if limits is None:
+            from .config import MemoryConfig
+
+            defaults = MemoryConfig()
+            limits = {m.name: defaults.retrieval_limit_for(m.name) for m in self.memories}
+        return self.build_context_snapshot(
+            query, user_id, limits=limits, participants=participants,
+            temporal_resolution=temporal_resolution, temporal_weight=temporal_weight,
+            budget=budget, reranker=reranker,
+        )
+
+    def _count_memory_tokens(self, text: str) -> int:
+        value = self.token_counter(text)
+        if type(value) is not int or value < 0 or (not text and value != 0):
+            raise ValueError("token_counter must return nonnegative integers (zero for empty text)")
+        return value
+
+    def _select_memories(
+        self, query: Query, recalls: dict[str, MemoryRecallSnapshot], *,
+        participants: list[str], template: str, budget: Optional[int],
+        reranker: MemoryReranker,
+    ) -> tuple[dict[str, MemoryRecallSnapshot], int]:
+        """Rank once, then fit whole items against exact grouped rendering."""
+        candidates: list[MemoryCandidate] = []
+        for name, recall in recalls.items():
+            mem = self._by_name[name]
+            for item in recall.items or [None]:
+                body = mem.format_selection([item], participants) if item is not None else recall.body
+                text = template.format(title=recall.title, body=body)
+                candidates.append(MemoryCandidate(
+                    id=len(candidates), memory_name=name, item=item,
+                    rendered_text=text, token_count=self._count_memory_tokens(text),
+                ))
+        ranked = list(reranker.rerank(query, tuple(candidates), budget=budget))
+        supplied = {c.id: c for c in candidates}
+        seen: set[int] = set()
+        for candidate in ranked:
+            if (not isinstance(candidate, MemoryCandidate)
+                    or type(candidate.id) is not int
+                    or supplied.get(candidate.id) is not candidate):
+                raise ValueError("reranker returned an unknown or replaced candidate")
+            if candidate.id in seen:
+                raise ValueError("reranker returned a duplicate candidate")
+            seen.add(candidate.id)
+
+        def render(selected: set[int]) -> dict[str, MemoryRecallSnapshot]:
+            grouped: dict[str, list[MemoryItem]] = {}
+            for candidate in candidates:
+                if candidate.id in selected:
+                    items = grouped.setdefault(candidate.memory_name, [])
+                    if candidate.item is not None:
+                        items.append(candidate.item)
+            result = {}
+            for name, items in grouped.items():
+                original = recalls[name]
+                body = (self._by_name[name].format_selection(items, participants)
+                        if original.items else original.body)
+                if body:
+                    result[name] = replace(
+                        original, items=items, body=body,
+                        section=template.format(title=original.title, body=body),
+                    )
+            return result
+
+        selected: set[int] = set()
+        result: dict[str, MemoryRecallSnapshot] = {}
+        used = 0
+        for candidate in ranked:
+            trial = selected | {candidate.id}
+            rendered = render(trial)
+            tokens = self._count_memory_tokens("\n\n".join(r.section for r in rendered.values()))
+            if budget is None or tokens <= budget:
+                selected, result, used = trial, rendered, tokens
+        return result, used
 
     def add_memory(self, memory: Memory):
         self.memories.append(memory)
@@ -162,6 +268,9 @@ class Character:
         participants: Optional[list[str]] = None,
         temporal_resolution: Optional[TemporalResolution] = None,
         temporal_weight: float = 1.0,
+        *,
+        budget: Budget = UNSET,
+        reranker: Optional[MemoryReranker] = None,
     ) -> ContextSnapshot:
         """Build the context and retain the exact items recalled by each memory.
 
@@ -174,7 +283,18 @@ class Character:
         (PER_USER memories recall
         + group per speaker; CHARACTER memories recall once). A single
         participant (or none) uses the legacy single-user rendering unchanged.
+
+        ``budget`` caps rendered memory sections, including headers and
+        separators, but excludes system instructions and intermediate prompts.
+        Omitted budget inherits the constructor default; None is unlimited.
+        Rerankers order/filter candidates; only selected items are reinforced.
         """
+        budget = self.budget if budget is UNSET else budget
+        validate_budget(budget)
+        reranker = self.reranker if reranker is None else reranker
+        selective = budget is not None or reranker is not None
+        # Fail before lifecycle/retrieval side effects for a broken tokenizer.
+        self._count_memory_tokens("")
         order = self.prompts.section_order if self.prompts is not None else [m.name for m in self.memories]
         template = self.prompts.section_template if self.prompts is not None else "## {title}\n{body}"
         intermediate_prompts = (
@@ -192,11 +312,17 @@ class Character:
             mem = self._by_name.get(name)
             if mem is None or not mem.enabled:
                 continue
+            if selective:
+                mem.prepare_recall()
+            if budget == 0:
+                continue
+            recall_kwargs = {"state_changing": False} if selective else {}
             if multi:
                 result: RecallResult = mem.build_section_participants_result(
                     query,
                     participants,
                     limits.get(name, 0),
+                    **recall_kwargs,
                     temporal_resolution=temporal_resolution,
                     temporal_weight=temporal_weight,
                 )
@@ -205,6 +331,7 @@ class Character:
                     query,
                     user_id,
                     limits.get(name, 0),
+                    **recall_kwargs,
                     temporal_resolution=temporal_resolution,
                     temporal_weight=temporal_weight,
                 )
@@ -260,6 +387,25 @@ class Character:
                 else:
                     sections.pop("knowledge_graph", None)
                     recalls.pop("knowledge_graph", None)
+        if selective:
+            recalls, memory_tokens = self._select_memories(
+                query, recalls, participants=list(participants or [user_id]),
+                template=template, budget=budget,
+                reranker=reranker if reranker is not None else ScoreMemoryReranker(),
+            )
+            sections = {
+                name: recalls[name].section if name in recalls else text
+                for name, text in sections.items()
+                if name in recalls or name.startswith(INTERMEDIATE_PROMPT_PREFIX)
+            }
+            from .concurrency import object_lock
+
+            for name, recall in recalls.items():
+                mem = self._by_name[name]
+                with object_lock(mem):
+                    mem.record_recall(recall.items)
+        else:
+            memory_tokens = self._count_memory_tokens("\n\n".join(r.section for r in recalls.values()))
         return ContextSnapshot(
             sections=sections,
             recalls=recalls,
@@ -267,6 +413,8 @@ class Character:
             user_id=user_id,
             participants=list(participants or [user_id]),
             temporal_resolution=temporal_resolution,
+            memory_token_count=memory_tokens,
+            memory_budget=budget,
         )
 
     def build_context(
@@ -277,6 +425,9 @@ class Character:
         participants: Optional[list[str]] = None,
         temporal_resolution: Optional[TemporalResolution] = None,
         temporal_weight: float = 1.0,
+        *,
+        budget: Budget = UNSET,
+        reranker: Optional[MemoryReranker] = None,
     ) -> dict[str, str]:
         """Return ordered rendered memory sections and intermediate prompts."""
         return self.build_context_snapshot(
@@ -286,6 +437,8 @@ class Character:
             participants=participants,
             temporal_resolution=temporal_resolution,
             temporal_weight=temporal_weight,
+            budget=budget,
+            reranker=reranker,
         ).sections
 
     def _header_for_multi(self, name: str) -> str:
@@ -305,6 +458,9 @@ class Character:
         participants: Optional[list[str]] = None,
         temporal_resolution: Optional[TemporalResolution] = None,
         temporal_weight: float = 1.0,
+        *,
+        budget: Budget = UNSET,
+        reranker: Optional[MemoryReranker] = None,
     ) -> str:
         """Full system-style context block (system line + all sections)."""
         sections = self.build_context(
@@ -314,6 +470,8 @@ class Character:
             participants=participants,
             temporal_resolution=temporal_resolution,
             temporal_weight=temporal_weight,
+            budget=budget,
+            reranker=reranker,
         )
         if self.prompts is None:
             parts = []

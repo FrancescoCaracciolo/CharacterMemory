@@ -238,6 +238,16 @@ class ContextRequest(BaseModel):
         default=None,
         description="Optional Unix timestamp for when the user message occurred.",
     )
+    budget: Optional[int] = Field(
+        default=None,
+        ge=0,
+        strict=True,
+        description=(
+            "Global token cap for rendered memory sections. Omit to inherit "
+            "the character's configured budget; null removes the cap; "
+            "0 omits memory sections."
+        ),
+    )
 
 
 class ContextResponse(BaseModel):
@@ -366,7 +376,10 @@ def context(req: ContextRequest) -> ContextResponse:
         "user", req.message, user_id=req.user, occurred_at=req.occurred_at
     )
 
-    snapshot = agent.build_context_snapshot(chat)
+    # Missing and explicit null differ: only the latter removes the
+    # character's configured cap.
+    recall_options = {"budget": req.budget} if "budget" in req.model_fields_set else {}
+    snapshot = agent.build_context_snapshot(chat, **recall_options)
     try:
         event = build_context_event(
             agent,
@@ -735,12 +748,12 @@ def main() -> None:  # pragma: no cover - manual run helper / console script
         description="Run the CharacterMemory FastAPI server.",
     )
     parser.add_argument(
-        "--host", default="0.0.0.0",
-        help="Bind host (default: 0.0.0.0).",
+        "--host", default=os.environ.get("CM_HOST", "0.0.0.0"),
+        help="Bind host (default: CM_HOST or 0.0.0.0).",
     )
     parser.add_argument(
-        "--port", type=int, default=8000,
-        help="Bind port (default: 8000).",
+        "--port", type=int, default=os.environ.get("CM_PORT", "8000"),
+        help="Bind port (default: CM_PORT or 8000).",
     )
     reload_group = parser.add_mutually_exclusive_group()
     reload_group.add_argument(

@@ -171,7 +171,13 @@ class EmotionStatus(Memory):
         participants: list[str],
         limit: int,
         state_changing: bool = True,
+        *,
+        temporal_resolution=None,
+        temporal_resolution_engine=None,
+        temporal_weight=None,
     ) -> list[MemoryItem]:
+        # Current emotion is a snapshot: accept the shared orchestration
+        # arguments without applying temporal search to its dimensions.
         if not participants:
             return []
         if len(participants) == 1:
