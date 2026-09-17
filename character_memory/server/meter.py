@@ -35,11 +35,25 @@ class RequestMeterMiddleware:
                 status = message["status"]
             await send(message)
 
-        def report_memory(character: str, memory: str, elapsed_ms: float, failed: bool) -> None:
+        def report_memory(
+            character: str,
+            memory: str,
+            elapsed_ms: float,
+            failed: bool,
+            phases: dict[str, float] | None = None,
+        ) -> None:
+            # Nested-phase breakdown (e.g. embed network time inside a
+            # recall) turns "why is this memory slow" into a readout.
+            suffix = ""
+            if phases:
+                rendered = " ".join(
+                    f"{name}={ms:.1f}ms" for name, ms in sorted(phases.items())
+                )
+                suffix = f" [{rendered}]"
             print(
                 f"[meter] {scope['method']} {scope['path']} "
                 f"character={character!r} memory={memory!r} "
-                f"{'ERROR ' if failed else ''}{elapsed_ms:.2f} ms",
+                f"{'ERROR ' if failed else ''}{elapsed_ms:.2f} ms{suffix}",
                 flush=True,
             )
 

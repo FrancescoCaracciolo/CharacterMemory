@@ -20,6 +20,7 @@ thin orchestrator over :mod:`ingest`, :mod:`activation`, and
 from __future__ import annotations
 
 from ..concurrency import synchronized
+from .._timing import time_phase
 
 import time
 from collections import OrderedDict
@@ -1223,18 +1224,20 @@ class KnowledgeGraphRetriever:
                 and (calculation_ids is None or pid in calculation_ids)
             ):
                 seeds[pid] = seeds.get(pid, 0.0) + self.config.self_seed * 0.6
-        breakdown = combined_activation_breakdown(
-            self.graph, seeds,
-            now=self._now(),
-            decay=self.config.decay,
-            decay_half_life=self.config.decay_half_life,
-            gain=self.config.gain,
-            hops=self.config.hops,
-            base_weight=self.config.base_weight,
-            spread_weight=self.config.spread_weight,
-            allowed_node_ids=calculation_ids,
-            engine=self.config.activation_engine,
-        )
+        breakdown = None
+        with time_phase("activation"):
+            breakdown = combined_activation_breakdown(
+                self.graph, seeds,
+                now=self._now(),
+                decay=self.config.decay,
+                decay_half_life=self.config.decay_half_life,
+                gain=self.config.gain,
+                hops=self.config.hops,
+                base_weight=self.config.base_weight,
+                spread_weight=self.config.spread_weight,
+                allowed_node_ids=calculation_ids,
+                engine=self.config.activation_engine,
+            )
         # Stash on the nodes for the GUI / debugging.
         for nid, node in self.graph.nodes.items():
             comp = self._with_temporal_extras(nid, breakdown.get(nid, {}))
@@ -1482,86 +1485,87 @@ class KnowledgeGraphRetriever:
             if pid in self.graph.nodes:
                 biases[uid] = {pid: self.config.self_seed * 0.6}
         now = self._now()
-        bll = {
-            nid: base_level_activation(
-                node,
-                now=now,
-                decay=self.config.decay,
-                decay_half_life=self.config.decay_half_life,
-            )
-            for nid, node in self.graph.nodes.items()
-        }
-        shared_seeds = dict(seeds)
-        if (
-            self.graph.SELF_ID in self.graph.nodes
-            and self.graph.SELF_ID not in shared_seeds
-        ):
-            shared_seeds[self.graph.SELF_ID] = 0.5
-        engine = self.config.activation_engine
-        spread_shared = spread_activation(
-            self.graph,
-            shared_seeds,
-            gain=self.config.gain,
-            hops=self.config.hops,
-            engine=engine,
-        )
-        bias_spreads = {
-            uid: (
-                spread_activation(
-                    self.graph, bias,
-                    gain=self.config.gain, hops=self.config.hops, engine=engine,
+        with time_phase("activation"):
+            bll = {
+                nid: base_level_activation(
+                    node,
+                    now=now,
+                    decay=self.config.decay,
+                    decay_half_life=self.config.decay_half_life,
                 )
-                if bias else {}
-            )
-            for uid, bias in biases.items()
-        }
-        self_node = self.graph.nodes.get(self.graph.SELF_ID)
-        current_mood = getattr(self_node, "current_mood", {}) or {}
-        budget = max(0, int(token_budget))
-        items = {}
-        activation = {}
-        breakdowns = {}
-        for uid in participants:
-            seeds_p = dict(shared_seeds)
-            for pid, bias_value in biases.get(uid, {}).items():
-                seeds_p[pid] = seeds_p.get(pid, 0.0) + bias_value
-            spread_maps = [spread_shared]
-            if bias_spreads.get(uid):
-                spread_maps.append(bias_spreads[uid])
-            breakdown = combine_scores(
-                self.graph.nodes.items(),
-                bll,
-                spread_maps,
-                seeds_p,
-                base_weight=self.config.base_weight,
-                spread_weight=self.config.spread_weight,
-                current_mood=current_mood,
-            )
-            for nid in self._last_temporal_matches:
-                if nid in breakdown:
-                    breakdown[nid] = self._with_temporal_extras(
-                        nid, breakdown[nid]
-                    )
-            trace = {
-                nid: comp["score"]
-                for nid, comp in breakdown.items()
-                if nid in visible
+                for nid, node in self.graph.nodes.items()
             }
-            activation[uid] = trace
-            breakdowns[uid] = breakdown
-            if budget == 0:
-                items[uid] = []
-                continue
-            ranked = sorted(
-                (
-                    (a, nid)
-                    for nid, a in trace.items()
-                    if a >= self.config.min_activation
-                ),
-                reverse=True,
+            shared_seeds = dict(seeds)
+            if (
+                self.graph.SELF_ID in self.graph.nodes
+                and self.graph.SELF_ID not in shared_seeds
+            ):
+                shared_seeds[self.graph.SELF_ID] = 0.5
+            engine = self.config.activation_engine
+            spread_shared = spread_activation(
+                self.graph,
+                shared_seeds,
+                gain=self.config.gain,
+                hops=self.config.hops,
+                engine=engine,
             )
-            selected, _ = self._select_within_budget(ranked, budget, timestamp_style)
-            items[uid] = selected
+            bias_spreads = {
+                uid: (
+                    spread_activation(
+                        self.graph, bias,
+                        gain=self.config.gain, hops=self.config.hops, engine=engine,
+                    )
+                    if bias else {}
+                )
+                for uid, bias in biases.items()
+            }
+            self_node = self.graph.nodes.get(self.graph.SELF_ID)
+            current_mood = getattr(self_node, "current_mood", {}) or {}
+            budget = max(0, int(token_budget))
+            items = {}
+            activation = {}
+            breakdowns = {}
+            for uid in participants:
+                seeds_p = dict(shared_seeds)
+                for pid, bias_value in biases.get(uid, {}).items():
+                    seeds_p[pid] = seeds_p.get(pid, 0.0) + bias_value
+                spread_maps = [spread_shared]
+                if bias_spreads.get(uid):
+                    spread_maps.append(bias_spreads[uid])
+                breakdown = combine_scores(
+                    self.graph.nodes.items(),
+                    bll,
+                    spread_maps,
+                    seeds_p,
+                    base_weight=self.config.base_weight,
+                    spread_weight=self.config.spread_weight,
+                    current_mood=current_mood,
+                )
+                for nid in self._last_temporal_matches:
+                    if nid in breakdown:
+                        breakdown[nid] = self._with_temporal_extras(
+                            nid, breakdown[nid]
+                        )
+                trace = {
+                    nid: comp["score"]
+                    for nid, comp in breakdown.items()
+                    if nid in visible
+                }
+                activation[uid] = trace
+                breakdowns[uid] = breakdown
+                if budget == 0:
+                    items[uid] = []
+                    continue
+                ranked = sorted(
+                    (
+                        (a, nid)
+                        for nid, a in trace.items()
+                        if a >= self.config.min_activation
+                    ),
+                    reverse=True,
+                )
+                selected, _ = self._select_within_budget(ranked, budget, timestamp_style)
+                items[uid] = selected
         # GUI parity with the sequential path: the last participant's trace
         # is what lands on the nodes.
         last = breakdowns[participants[-1]]

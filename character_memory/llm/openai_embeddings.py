@@ -6,8 +6,14 @@ from typing import Optional
 
 import numpy as np
 from openai import OpenAI
+from .._timing import time_phase
 from ..config import EmbeddingConfig
 from .embedding_base import EmbeddingProvider
+
+# Small query batches are cached per text; the bound keeps a few days of a
+# sliding history window resident (texts repeat across turns) without ever
+# retaining bulk indexing batches.
+_TEXT_CACHE_LIMIT = 512
 
 
 class OpenAICompatibleEmbeddings(EmbeddingProvider):
@@ -21,9 +27,11 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
         self._client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key, timeout=cfg.timeout)
         self._dim: Optional[int] = cfg.dim
         # Context assembly asks several independent indexes to embed the same
-        # small query batch. Keep a tiny process-local cache so only the first
-        # one reaches the embedding server; never retain bulk indexing batches.
-        self._cache: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
+        # small query batch, and the history-aware window slides by one
+        # message per turn — so most texts were embedded on the previous
+        # request. Cache per (role, prefix, text); only misses reach the
+        # embedding server. Bulk indexing batches are never retained.
+        self._cache: dict[tuple[str, str, str], np.ndarray] = {}
 
     @property
     def dim(self) -> int:
@@ -72,24 +80,47 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
         if isinstance(texts, str):
             texts = [texts]
         texts = list(texts)
-        key = (role, tuple(texts))
         cacheable = len(texts) <= 8
+        rows: list[Optional[np.ndarray]] = [None] * len(texts)
+        misses: list[int] = list(range(len(texts)))
         if cacheable:
-            cached = self._cache.get(key)
-            if cached is not None:
-                return cached.copy()
+            misses = []
+            for i, text in enumerate(texts):
+                cached = self._cache.get((role, prefix, text))
+                if cached is not None:
+                    rows[i] = cached
+                else:
+                    misses.append(i)
 
-        vecs: list[list[float]] = []
-        bs = self.config.batch_size
-        for i in range(0, len(texts), bs):
-            batch = [prefix + text for text in texts[i : i + bs]]
-            resp = self._client.embeddings.create(model=self.config.model, input=batch)
-            vecs.extend(d.embedding for d in resp.data)
-        arr = np.asarray(vecs, dtype=np.float32)
+        if misses:
+            pending = [prefix + texts[i] for i in misses]
+            fetched: list[np.ndarray] = []
+            bs = self.config.batch_size
+            for j in range(0, len(pending), bs):
+                batch = pending[j : j + bs]
+                with time_phase("embed"):
+                    resp = self._client.embeddings.create(
+                        model=self.config.model, input=batch
+                    )
+                fetched.append(
+                    np.asarray(
+                        [d.embedding for d in resp.data], dtype=np.float32
+                    )
+                )
+            vectors = fetched[0] if len(fetched) == 1 else np.concatenate(fetched, axis=0)
+            for offset, i in enumerate(misses):
+                rows[i] = vectors[offset]
+            if cacheable:
+                for i in misses:
+                    self._cache[(role, prefix, texts[i])] = rows[i]
+                while len(self._cache) > _TEXT_CACHE_LIMIT:
+                    self._cache.pop(next(iter(self._cache)))
+
+        if not texts:
+            return np.asarray([], dtype=np.float32)
+        # np.stack copies into a fresh array, so callers can mutate the
+        # result without corrupting the cached rows.
+        arr = np.stack(rows)
         if arr.ndim == 2 and arr.shape[0] > 0:
             self._dim = int(arr.shape[1])
-        if cacheable:
-            if len(self._cache) >= 16:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[key] = arr.copy()
         return arr
