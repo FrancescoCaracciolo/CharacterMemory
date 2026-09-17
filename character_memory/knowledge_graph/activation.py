@@ -139,6 +139,13 @@ def spread_activation(
         if allowed_node_ids is None or nid in allowed_node_ids
     }
 
+    # Query-local caches: reinforcement, emotions and privacy can change
+    # between calls. Cache only visited nodes/edges, preserving neighbor order
+    # and parallel edges so both fan-out and floating-point sums stay exact.
+    node_strengths: dict[str, float] = {}
+    edge_strengths: dict[str, float] = {}
+    weighted_neighbors: dict[str, list[tuple[str, float]]] = {}
+
     frontier = dict(activation)
     for hop in range(1, max(1, hops) + 1):
         g = gain * (decay_per_hop ** (hop - 1))
@@ -146,22 +153,32 @@ def spread_activation(
         for u_id, u_act in frontier.items():
             if u_act <= 0.0:
                 continue
-            neighbours = [
-                (edge, neighbour)
-                for edge, neighbour in graph.neighbors(u_id)
-                if allowed_node_ids is None or neighbour.id in allowed_node_ids
-            ]
+            neighbours = weighted_neighbors.get(u_id)
+            if neighbours is None:
+                neighbours = []
+                for edge, neighbour in graph.neighbors(u_id):
+                    if allowed_node_ids is not None and neighbour.id not in allowed_node_ids:
+                        continue
+                    edge_strength = edge_strengths.get(edge.id)
+                    if edge_strength is None:
+                        edge_strength = _edge_strength(edge)
+                        edge_strengths[edge.id] = edge_strength
+                    node_strength = node_strengths.get(neighbour.id)
+                    if node_strength is None:
+                        node_strength = _node_strength(neighbour)
+                        node_strengths[neighbour.id] = node_strength
+                    neighbours.append((neighbour.id, edge_strength * node_strength))
+                weighted_neighbors[u_id] = neighbours
             fan = len(neighbours)
             if fan <= 0:
                 continue
-            for edge, neighbour in neighbours:
-                w = _edge_strength(edge) * _node_strength(neighbour)
+            for neighbour_id, w in neighbours:
                 contributed = g * (u_act * w) / fan
                 if contributed <= 0.0:
                     continue
-                cur = activation.get(neighbour.id, 0.0) + contributed
-                activation[neighbour.id] = cur
-                next_frontier[neighbour.id] = next_frontier.get(neighbour.id, 0.0) + contributed
+                cur = activation.get(neighbour_id, 0.0) + contributed
+                activation[neighbour_id] = cur
+                next_frontier[neighbour_id] = next_frontier.get(neighbour_id, 0.0) + contributed
         if not next_frontier:
             break
         frontier = next_frontier
