@@ -22,9 +22,18 @@ from typing import AbstractSet, Optional
 
 from ..emotion_vectors import emotion_similarity, emotional_impact
 from ..memory.decay import MAX_EXPOSURE_BOOST, exposure_saturation
-from .edges import CoOccurrenceEdge, Edge, EpisodeEdge, FactEdge, RelationEdge
+from .edges import ChatEdge, CoOccurrenceEdge, Edge, EpisodeEdge, FactEdge, RelationEdge
 from .graph import KnowledgeGraph
 from .nodes import Node
+
+# Numeric spreading rebuilds the full privacy-filtered snapshot every query.
+# On the prod-db snapshot that snapshot costs ~75 ms, so it only beats the
+# scalar walker for high-degree multi-seed queries. ``auto`` therefore stays
+# on the scalar path; tests and the microbenchmark force ``engine="numeric"``.
+NUMERIC_MIN_NODES = 10_000
+NUMERIC_MIN_EDGES = 200_000
+
+_STRENGTH_ATTRS = ("trust", "affection", "importance", "confidence")
 
 
 def base_level_activation(
@@ -85,8 +94,32 @@ def _node_strength(node: Node) -> float:
     return min(1.5, s)
 
 
-def _edge_strength(edge: Edge) -> float:
-    """The `u->v` edge weight in [0, 1]."""
+def _has_attached_strength_attrs(edge: Edge) -> bool:
+    """True when extra strength fields were attached after construction.
+
+    Chat/co-occurrence fast paths skip the generic attribute scan. A caller
+    that dynamically sets ``trust`` / ``affection`` / ``importance`` /
+    ``confidence`` must still take the generic path.
+    """
+    data = getattr(edge, "__dict__", None)
+    if not data:
+        return False
+    for attr in _STRENGTH_ATTRS:
+        if attr not in data:
+            continue
+        value = data[attr]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return True
+    return False
+
+
+def _clamped_weight(value: object, default: float = 0.5) -> float:
+    """Clamp an edge weight, treating a missing/zero value as ``default``."""
+    return max(0.0, min(1.0, float(value or default)))
+
+
+def _edge_strength_generic(edge: Edge) -> float:
+    """The `u->v` edge weight in [0, 1] (all edge kinds)."""
     if isinstance(edge, CoOccurrenceEdge):
         base = edge.effective_weight()
     else:
@@ -94,7 +127,7 @@ def _edge_strength(edge: Edge) -> float:
     base = max(0.0, min(1.0, base))
     # Strong relationship signals and episode-vector impact push the weight
     # up from the centre.
-    for attr in ("trust", "affection", "importance", "confidence"):
+    for attr in _STRENGTH_ATTRS:
         v = getattr(edge, attr, None)
         if isinstance(v, (int, float)):
             base = max(base, min(1.0, 0.5 + 0.5 * abs(float(v))))
@@ -112,7 +145,62 @@ def _edge_strength(edge: Edge) -> float:
     return base
 
 
-def spread_activation(
+def _edge_strength(edge: Edge) -> float:
+    """The `u->v` edge weight in [0, 1].
+
+    Exact ``ChatEdge`` / ``CoOccurrenceEdge`` instances take a fast path;
+    subclasses and edges with dynamically attached strength attributes keep
+    the generic evaluation.
+    """
+    exact = type(edge)
+    if exact is ChatEdge and not _has_attached_strength_attrs(edge):
+        return _clamped_weight(getattr(edge, "weight", 0.5))
+    if exact is CoOccurrenceEdge and not _has_attached_strength_attrs(edge):
+        return max(0.0, min(1.0, edge.effective_weight()))
+    return _edge_strength_generic(edge)
+
+
+def _filtered_graph_size(
+    graph: KnowledgeGraph,
+    allowed_node_ids: Optional[AbstractSet[str]],
+) -> tuple[int, int]:
+    """Node/edge counts after the privacy filter, used for engine dispatch."""
+    if allowed_node_ids is None:
+        return len(graph.nodes), len(graph.edges)
+    n_nodes = 0
+    for nid in allowed_node_ids:
+        if nid in graph.nodes:
+            n_nodes += 1
+    n_edges = 0
+    for edge in graph.edges.values():
+        if edge.src in allowed_node_ids and edge.dst in allowed_node_ids:
+            n_edges += 1
+    return n_nodes, n_edges
+
+
+def _use_numeric(
+    graph: KnowledgeGraph,
+    allowed_node_ids: Optional[AbstractSet[str]],
+    engine: str,
+) -> bool:
+    """Choose NumPy spreading only when it is safe and large enough."""
+    if engine == "scalar":
+        return False
+    # Custom graph subclasses may override neighbour walking; the numeric
+    # snapshot reconstructs adjacency from stored edges and SYMMETRIC_KINDS.
+    if type(graph) is not KnowledgeGraph:
+        return False
+    if engine != "numeric":
+        # Cheap unfiltered check first so typical queries never scan edges.
+        if len(graph.nodes) < NUMERIC_MIN_NODES or len(graph.edges) < NUMERIC_MIN_EDGES:
+            return False
+        n_nodes, n_edges = _filtered_graph_size(graph, allowed_node_ids)
+        if n_nodes < NUMERIC_MIN_NODES or n_edges < NUMERIC_MIN_EDGES:
+            return False
+    return True
+
+
+def _spread_activation_scalar(
     graph: KnowledgeGraph,
     seeds: dict[str, float],
     *,
@@ -122,17 +210,7 @@ def spread_activation(
     floor: float = 0.0,
     allowed_node_ids: Optional[AbstractSet[str]] = None,
 ) -> dict[str, float]:
-    """Propagate activation from `seeds` over up to `hops` neighbours.
-
-    The classic Anderson update, applied hop by hop:
-
-        A_v += gain_h * (A_u * w_uv) / fan(u)
-
-    where `gain_h = gain * decay_per_hop ** (hop - 1)` attenuates each
-    successive hop and `fan(u)` is `u`'s degree (the fan effect: a node
-    pointing at many things spreads less to each). `seeds` provides the
-    initial activation (SelfNode base + matched nodes' RRF score).
-    """
+    """Reference Python walker. Exact neighbour order and float sums."""
     activation: dict[str, float] = {
         nid: max(floor, float(a))
         for nid, a in seeds.items()
@@ -185,6 +263,55 @@ def spread_activation(
     return activation
 
 
+def spread_activation(
+    graph: KnowledgeGraph,
+    seeds: dict[str, float],
+    *,
+    gain: float = 0.35,
+    hops: int = 2,
+    decay_per_hop: float = 0.6,
+    floor: float = 0.0,
+    allowed_node_ids: Optional[AbstractSet[str]] = None,
+    engine: str = "auto",
+) -> dict[str, float]:
+    """Propagate activation from `seeds` over up to `hops` neighbours.
+
+    The classic Anderson update, applied hop by hop:
+
+        A_v += gain_h * (A_u * w_uv) / fan(u)
+
+    where `gain_h = gain * decay_per_hop ** (hop - 1)` attenuates each
+    successive hop and `fan(u)` is `u`'s degree (the fan effect: a node
+    pointing at many things spreads less to each). `seeds` provides the
+    initial activation (SelfNode base + matched nodes' RRF score).
+
+    ``engine`` is ``"auto"`` (scalar unless the graph is far larger than the
+    current production snapshot), ``"scalar"`` (this module's walker, the
+    correctness reference) or ``"numeric"``.
+    """
+    if _use_numeric(graph, allowed_node_ids, engine):
+        from .numeric_activation import spread_activation_numeric
+
+        return spread_activation_numeric(
+            graph,
+            seeds,
+            gain=gain,
+            hops=hops,
+            decay_per_hop=decay_per_hop,
+            floor=floor,
+            allowed_node_ids=allowed_node_ids,
+        )
+    return _spread_activation_scalar(
+        graph,
+        seeds,
+        gain=gain,
+        hops=hops,
+        decay_per_hop=decay_per_hop,
+        floor=floor,
+        allowed_node_ids=allowed_node_ids,
+    )
+
+
 def combined_activation(
     graph: KnowledgeGraph,
     seeds: dict[str, float],
@@ -197,6 +324,7 @@ def combined_activation(
     base_weight: float = 1.0,
     spread_weight: float = 1.0,
     allowed_node_ids: Optional[AbstractSet[str]] = None,
+    engine: str = "auto",
 ) -> dict[str, float]:
     """Final activation per node = `base_weight * BLL + spread_weight * spread`.
 
@@ -214,6 +342,7 @@ def combined_activation(
             gain=gain, hops=hops,
             base_weight=base_weight, spread_weight=spread_weight,
             allowed_node_ids=allowed_node_ids,
+            engine=engine,
         ).items()
     }
 
@@ -230,6 +359,7 @@ def combined_activation_breakdown(
     base_weight: float = 1.0,
     spread_weight: float = 1.0,
     allowed_node_ids: Optional[AbstractSet[str]] = None,
+    engine: str = "auto",
 ) -> dict[str, dict[str, float]]:
     """Same fusion as :func:`combined_activation`, but with per-factor detail.
 
@@ -277,6 +407,7 @@ def combined_activation_breakdown(
         gain=gain,
         hops=hops,
         allowed_node_ids=allowed_node_ids,
+        engine=engine,
     )
     out: dict[str, dict[str, float]] = {}
     self_node = graph.nodes.get(graph.SELF_ID)
@@ -314,6 +445,8 @@ def combined_activation_breakdown(
 
 
 __all__ = [
+    "NUMERIC_MIN_EDGES",
+    "NUMERIC_MIN_NODES",
     "base_level_activation",
     "spread_activation",
     "combined_activation",
