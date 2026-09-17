@@ -37,9 +37,13 @@ _EMPTY_FLOAT = np.empty(0, dtype=np.float64)
 _MAX_SCOPED_SNAPSHOTS = 8
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class NumericAdjacency:
-    """Sparse directed walks for one scope, privacy-filtered."""
+    """Sparse directed walks for one scope, privacy-filtered.
+
+    Not frozen: quietly-added co-occurrence edges (the Hebbian step) append
+    rows in place instead of forcing a rebuild.
+    """
 
     node_ids: list[str]
     index: dict[str, int]
@@ -48,8 +52,8 @@ class NumericAdjacency:
     weight: np.ndarray
     fan: np.ndarray
     # Rows per co-occurrence edge id (self-loops occupy two rows). Only this
-    # kind has its strength patched in place (Hebbian step); everything else
-    # invalidates through the graph version and forces a rebuild.
+    # kind has its strength patched/appended in place (Hebbian step);
+    # everything else invalidates through the graph version.
     edge_rows: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
 
@@ -245,18 +249,85 @@ def _patch_edge_strengths(
                 weight[row] = strength * _node_strength(node)
 
 
+def _append_edges(
+    graph: KnowledgeGraph,
+    edge_ids: set[str],
+    snapshots: list[NumericAdjacency],
+) -> None:
+    """Append rows for quietly-added edges (symmetric walk, exact strengths).
+
+    Mirrors the builder's ``emit`` semantics: symmetric kinds emit both
+    directions, self-loops twice, dangling or out-of-scope endpoints are
+    dropped, and each row is ``_edge_strength(edge) * _node_strength(dst)``.
+    Fan-out is incremented per emitted row, so the append leaves the snapshot
+    exactly as a full rebuild would produce.
+    """
+    from .activation import _edge_strength, _node_strength
+
+    nodes = graph.nodes
+    edges = graph.edges
+    for adj in snapshots:
+        new_src: list[int] = []
+        new_dst: list[int] = []
+        new_weight: list[float] = []
+        for eid in edge_ids:
+            edge = edges.get(eid)
+            if edge is None:
+                continue
+            strength = _edge_strength(edge)
+            pairs = [(edge.src, edge.dst)]
+            if edge.src == edge.dst:
+                pairs.append((edge.src, edge.dst))
+            elif edge.kind in SYMMETRIC_KINDS:
+                pairs.append((edge.dst, edge.src))
+            emitted: list[int] = []
+            for src_id, dst_id in pairs:
+                src_i = adj.index.get(src_id)
+                dst_i = adj.index.get(dst_id)
+                if src_i is None or dst_i is None:
+                    continue
+                node = nodes.get(dst_id)
+                if node is None:
+                    continue
+                new_src.append(src_i)
+                new_dst.append(dst_i)
+                new_weight.append(strength * _node_strength(node))
+                emitted.append(len(new_src) - 1)
+            if emitted:
+                # Pending rows are appended after the loop; their final
+                # indices are the original array size plus their position.
+                base = adj.src.size
+                new_rows = tuple(base + offset for offset in emitted)
+                existing = adj.edge_rows.get(eid)
+                adj.edge_rows[eid] = (
+                    new_rows if existing is None else existing + new_rows
+                )
+        if new_src:
+            adj.src = np.concatenate(
+                [adj.src, np.asarray(new_src, dtype=np.int64)]
+            )
+            adj.dst = np.concatenate(
+                [adj.dst, np.asarray(new_dst, dtype=np.int64)]
+            )
+            adj.weight = np.concatenate(
+                [adj.weight, np.asarray(new_weight, dtype=np.float64)]
+            )
+            np.add.at(adj.fan, adj.src[adj.src.size - len(new_src):], 1.0)
+
+
 def cached_numeric_adjacency(
     graph: KnowledgeGraph,
     allowed_node_ids: Optional[AbstractSet[str]] = None,
 ) -> NumericAdjacency:
     """Return the snapshot for ``allowed_node_ids``, rebuilding only if stale.
 
-    Keyed by :attr:`KnowledgeGraph.version`; pending in-place strength
-    notifications are drained and applied as row patches to every live
-    snapshot. Fresh builds read the live graph, so draining before building
-    keeps newly built snapshots exact as well. Rebuilds are recorded as a
-    ``kg_snapshot`` phase so the meter can distinguish "rebuilding every
-    query" from genuinely slow warm propagation.
+    Keyed by :attr:`KnowledgeGraph.version`. Pending quietly-added edges are
+    appended row-wise and in-place strength notifications patched row-wise to
+    every live snapshot. Fresh builds read the live graph, so draining the
+    journals before building keeps newly built snapshots exact as well.
+    Rebuilds are recorded as a ``kg_snapshot`` phase so the meter can
+    distinguish "rebuilding every query" from genuinely slow warm
+    propagation.
     """
     cache: Optional[_NumericAdjacencyCache] = getattr(graph, "_numeric_adj_cache", None)
     if cache is None:
@@ -266,14 +337,18 @@ def cached_numeric_adjacency(
         cache.version = graph.version
         cache.unscoped = None
         cache.scoped.clear()
+    appended = graph.take_appended_edge_ids()
     dirty = graph.take_strength_dirty_edges()
-    if dirty:
+    live = None
+    if appended or dirty:
         live = [
             adj
             for adj in (cache.unscoped, *cache.scoped.values())
             if adj is not None
         ]
-        if live:
+        if appended and live:
+            _append_edges(graph, appended, live)
+        if dirty and live:
             _patch_edge_strengths(graph, dirty, live)
     if allowed_node_ids is None:
         if cache.unscoped is None:

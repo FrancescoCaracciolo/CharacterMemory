@@ -72,6 +72,11 @@ class KnowledgeGraph:
         # on every state-changing retrieval, so a full rebuild would defeat
         # snapshot caching; consumers patch just these rows instead).
         self._strength_dirty_edge_ids: set[str] = set()
+        # Edge ids added since the last cache read without bumping the
+        # version (the Hebbian step mints co-occurrence edges on every
+        # retrieval whose surfaced nodes never co-fired before; appending
+        # their rows beats rebuilding the whole snapshot each query).
+        self._appended_edge_ids: set[str] = set()
         # O(1) lookup indexes over person user ids and external refs, kept in
         # sync by the mutators. Hits are verified against the live node, so a
         # stale entry degrades to the legacy scan instead of a wrong answer.
@@ -104,6 +109,7 @@ class KnowledgeGraph:
         """
         self._version += 1
         self._strength_dirty_edge_ids.clear()
+        self._appended_edge_ids.clear()
 
     def touch_edge_strength(self, edge_id: str) -> None:
         """Flag one edge whose strength attributes changed in place.
@@ -122,6 +128,12 @@ class KnowledgeGraph:
         dirty = self._strength_dirty_edge_ids
         self._strength_dirty_edge_ids = set()
         return dirty
+
+    def take_appended_edge_ids(self) -> set[str]:
+        """Drain the pending quietly-added edge notifications."""
+        appended = self._appended_edge_ids
+        self._appended_edge_ids = set()
+        return appended
 
     # ------------------------------------------------------------------ lookup
     @staticmethod
@@ -966,12 +978,19 @@ class KnowledgeGraph:
     ) -> Optional[CoOccurrenceEdge]:
         """Create or strengthen the co-occurrence edge between `a` and `b`.
 
-        No-op when `a == b` or either endpoint is missing.
+        No-op when `a == b` or either endpoint is missing. A brand-new edge
+        is inserted *quietly*: the mutation clock is not bumped and the id is
+        journalled via ``_appended_edge_ids`` instead, so the numeric
+        activation snapshot appends its rows rather than rebuilding — the
+        Hebbian step calls this on every state-changing retrieval, and on a
+        large graph the never-co-fired pair space effectively never
+        saturates. Any other mutation still bumps and supersedes the journal.
         """
         if a == b or a not in self.nodes or b not in self.nodes:
             return None
+        canonical = self.edge_id("co_occurrence", a, b)
         edge = CoOccurrenceEdge(
-            id="",  # filled in by upsert_edge
+            id=canonical,
             kind="co_occurrence",
             src=a,
             dst=b,
@@ -980,8 +999,14 @@ class KnowledgeGraph:
             co_recall_count=co_recall_count,
             creation_weight=weight,
         )
-        merged = self.upsert_edge(edge)
-        return merged if isinstance(merged, CoOccurrenceEdge) else None
+        if canonical not in self.edges:
+            self._removed_edge_ids.discard(canonical)
+            self.edges[canonical] = edge
+            self._adj.setdefault(a, []).append(canonical)
+            self._adj.setdefault(b, []).append(canonical)
+            self._appended_edge_ids.add(canonical)
+            return edge
+        return self.upsert_edge(edge)
 
     # ----------------------------------------------------------- serialization
     def to_dict(self) -> dict:
