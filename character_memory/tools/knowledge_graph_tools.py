@@ -255,13 +255,19 @@ class GetKnowledgeGraphNeighbors(Tool):
         cap = max(1, min(50, int(limit)))
         max_chars = max(300, min(5000, int(max_chars_each)))
         neighbors = []
-        for edge in graph.edges.values():
-            if edge.src == anchor.id:
-                other_id = edge.dst
-            elif edge.dst == anchor.id:
-                other_id = edge.src
-            else:
+        # Adjacency walk instead of a full edge scan: `_adj` lists every edge
+        # touching the anchor (both endpoints, any kind), matching the
+        # undirected expansion semantics this tool exposes. Self-loops land
+        # in the list twice; dedupe by edge id.
+        seen_edge_ids: set[str] = set()
+        for eid in graph._adj.get(anchor.id, []):
+            if eid in seen_edge_ids:
                 continue
+            seen_edge_ids.add(eid)
+            edge = graph.edges.get(eid)
+            if edge is None:
+                continue
+            other_id = edge.dst if edge.src == anchor.id else edge.src
             other = graph.get_node(other_id)
             if other is None or other.id not in visible:
                 continue

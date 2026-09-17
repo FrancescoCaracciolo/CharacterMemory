@@ -236,34 +236,61 @@ class KnowledgeGraphMemory(Memory):
                 },
             )
 
-        # Participant-specific activation is computed read-only, then shared
-        # graph nodes are merged and recorded once. This prevents a global
-        # heartbeat/world/wiki node from being rendered and practiced once per
-        # human speaker in a group chat.
+        # Participant-specific activation is computed once, shared, then
+        # biased per speaker: the seed search, BLL and spreading run a single
+        # time and each participant's PersonNode bias is composed in
+        # linearly. Shared graph nodes are merged and recorded once. This
+        # prevents a global heartbeat/world/wiki node from being rendered and
+        # practiced once per human speaker in a group chat — and keeps a
+        # P-participant group from paying P full retrievals.
+        resolution = self.resolve_temporal(
+            query, temporal_resolution, temporal_resolution_engine
+        )
+        multi = self.retriever.retrieve_multi(
+            query,
+            user_ids=participants,
+            token_budget=limit,
+            timestamp_style=self.timestamp_style,
+            temporal_resolution=resolution,
+            temporal_weight=(
+                self.temporal_resolution_weight
+                if temporal_weight is None
+                else temporal_weight
+            ),
+        )
         by_node: dict[str, MemoryItem] = {}
-        by_participant: dict[str, dict[str, Any]] = {}
         for uid in participants:
-            result = self.build_section_result(
-                query,
-                uid,
-                limit,
-                state_changing=False,
-                temporal_resolution=temporal_resolution,
-                temporal_resolution_engine=temporal_resolution_engine,
-                temporal_weight=temporal_weight,
-            )
-            for item in result.items:
+            for item in multi.items.get(uid, ()):
                 node_id = str(item.metadata.get("node_id") or "")
                 current = by_node.get(node_id)
                 if current is None or item.score > current.score:
                     by_node[node_id] = item
-            if result.items:
-                by_participant[uid] = result.diagnostics
-        items = list(by_node.values())
-        if not items:
+        if not by_node:
             return RecallResult()
+        items = list(by_node.values())
         if state_changing:
             self.retriever.record_recall(items)
+        visible = self.retriever.visible_node_ids(user_ids=participants)
+        by_participant: dict[str, dict[str, Any]] = {}
+        for uid in participants:
+            surfaced = [
+                str(item.metadata.get("node_id"))
+                for item in multi.items.get(uid, ())
+                if item.metadata.get("node_id") is not None
+            ]
+            by_participant[uid] = {
+                "activation": {
+                    nid: score
+                    for nid, score in multi.activation.get(uid, {}).items()
+                    if nid in visible
+                },
+                "breakdowns": {
+                    nid: dict(comp)
+                    for nid, comp in multi.breakdowns.get(uid, {}).items()
+                    if nid in visible
+                },
+                "retrieved_ids": list(dict.fromkeys(surfaced)),
+            }
         body = self.format(items)
         return RecallResult(
             items=items,

@@ -445,6 +445,9 @@ def ingest_emotion(
             stored.affection = edge.affection
             stored.comment = edge.comment
             stored.provenance = "emotion"
+            # In-place strength overwrite (decreases included): a merge bump
+            # alone would leave the cached numeric snapshot stale.
+            graph.bump_version()
 
 
 # -------------------------------------------------------------------- summaries
@@ -1402,6 +1405,7 @@ def ingest_wiki_llm(
                 stored.affection = relation.affection
                 stored.comment = relation.comment
                 stored.provenance = "wiki"
+                graph.bump_version()
         entity_by_key: dict[str, str] = {}
         # Named entities -> EntityNode.
         for e in ext.get("entities", []):

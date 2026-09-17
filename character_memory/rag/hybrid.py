@@ -93,6 +93,13 @@ class HybridSearch(RAGSystem):
         self._scoped_bm25_cache: OrderedDict[
             tuple[int, frozenset[int]], Optional[BM25Retriever]
         ] = OrderedDict()
+        # Positions of live nodes per allowed-id set, memoized by object
+        # identity: retrieval reuses one frozenset per visibility scope, so
+        # the O(N) scan below runs once per scope per revision instead of
+        # once per query.
+        self._allowed_positions_memo: dict[
+            tuple[int, int], tuple[object, frozenset[int]]
+        ] = {}
         # Nodes, BM25 and FAISS are one positional data structure.  A write
         # must not interleave with another write (or a search): compaction can
         # otherwise clear/remap nodes while an incremental add is embedding,
@@ -102,6 +109,29 @@ class HybridSearch(RAGSystem):
     def _invalidate_scoped_search(self) -> None:
         self._index_revision += 1
         self._scoped_bm25_cache.clear()
+        self._allowed_positions_memo.clear()
+
+    def _allowed_positions_for(self, allowed_ids: object, wanted: set) -> frozenset[int]:
+        """Positions of live nodes whose app id is in ``wanted``, memoized.
+
+        Keyed by ``(revision, id(allowed_ids))``; the entry keeps the key
+        object referenced so a recycled id cannot alias a live entry, and an
+        identity check on hit guards against pathological recycling. Any
+        index mutation clears the memo via :meth:`_invalidate_scoped_search`.
+        """
+        key = (self._index_revision, id(allowed_ids))
+        hit = self._allowed_positions_memo.get(key)
+        if hit is not None and hit[0] is allowed_ids:
+            return hit[1]
+        positions = frozenset(
+            pos
+            for pos, node in enumerate(self._nodes)
+            if not self._is_deleted(node) and node.metadata.get("id") in wanted
+        )
+        if len(self._allowed_positions_memo) >= 64:
+            self._allowed_positions_memo.clear()
+        self._allowed_positions_memo[key] = (allowed_ids, positions)
+        return positions
 
     # ------------------------------------------------------------------ build
     def _chunk_to_node(self, chunk: Chunk, idx: int) -> TextNode:
@@ -385,12 +415,7 @@ class HybridSearch(RAGSystem):
                 if isinstance(allowed_ids, (str, bytes))
                 else set(allowed_ids)
             )
-            allowed_positions = frozenset(
-                pos
-                for pos, node in enumerate(self._nodes)
-                if not self._is_deleted(node)
-                and node.metadata.get("id") in wanted
-            )
+            allowed_positions = self._allowed_positions_for(allowed_ids, wanted)
         if k <= 0:
             return []
         active_count = (

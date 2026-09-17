@@ -22,6 +22,8 @@ from __future__ import annotations
 from ..concurrency import synchronized
 
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from ..config import KnowledgeGraphConfig, KnowledgeGraphPrivacy
@@ -42,7 +44,13 @@ from ..memory.user_facts import UserFactMemory
 from ..memory.user_summary import UserSummaryMemory
 from ..rag.base import as_queries
 from ..rag.base import RAGSystem
-from .activation import combined_activation, combined_activation_breakdown
+from .activation import (
+    base_level_activation,
+    combine_scores,
+    combined_activation,
+    combined_activation_breakdown,
+    spread_activation,
+)
 from .edges import CoOccurrenceEdge, EpisodeEdge, FactEdge
 from .graph import KnowledgeGraph
 from .ingest import (
@@ -114,6 +122,43 @@ def _default_clock() -> float:
     return time.time()
 
 
+class _VisibilityCache:
+    """Per-version node-id sets used by retrieval, attached to the graph.
+
+    Visibility depends only on graph state (``character_scoped`` /
+    ``memory_owners`` / ``internal`` flags) plus the viewer union, so the
+    O(N) scans run once per ``(version, privacy mode, viewers)`` and are
+    reused across queries. Living on the graph means a load/save replacement
+    discards it along with the object it described.
+    """
+
+    __slots__ = ("version", "all_ids", "all_public", "scoped")
+
+    def __init__(self) -> None:
+        self.version = -1
+        self.all_ids: Optional[frozenset[str]] = None
+        self.all_public: Optional[frozenset[str]] = None
+        # (privacy mode, viewers) -> (scoped_all, scoped_public), LRU-bounded.
+        self.scoped: "OrderedDict[tuple[KnowledgeGraphPrivacy, frozenset[str]], tuple[frozenset[str], frozenset[str]]]" = OrderedDict()
+
+
+_MAX_VISIBILITY_SCOPES = 64
+
+
+@dataclass
+class MultiParticipantRetrieval:
+    """Per-participant results of one shared group computation.
+
+    ``items`` holds each participant's token-budgeted selections,
+    ``activation`` the visible activation trace per participant, and
+    ``breakdowns`` the per-factor score components used by diagnostics.
+    """
+
+    items: dict[str, list[MemoryItem]]
+    activation: dict[str, dict[str, float]]
+    breakdowns: dict[str, dict[str, dict[str, float]]]
+
+
 class KnowledgeGraphRetriever:
     """Orchestrates ingestion, activation, retrieval and persistence."""
 
@@ -149,6 +194,11 @@ class KnowledgeGraphRetriever:
         self._pending_projection_meta: dict[str, tuple[int, str]] = {}
         self._last_projection_report: dict[str, dict[str, int]] = {}
         self._last_temporal_matches: dict[str, "TemporalMatch"] = {}
+        # Source-row temporal intervals, memoized per (memory, row id). Source
+        # rows only change through extraction/dedup/save, which clear this.
+        self._temporal_interval_cache: dict[
+            tuple[str, str], Optional[tuple[float, Optional[float]]]
+        ] = {}
 
     # --------------------------------------------------------------- backends
     def load(
@@ -253,6 +303,10 @@ class KnowledgeGraphRetriever:
             )
         if changed:
             self._dedup_persons()
+            # Projectors refresh node fields in place (scope owners, text);
+            # a single bump covers writes the mutators cannot see.
+            self.graph.bump_version()
+            self._temporal_interval_cache.clear()
             if sync_index:
                 self._sync_index()
         self._last_projection_report = reports
@@ -620,6 +674,8 @@ class KnowledgeGraphRetriever:
         # ingested fact should bridge to pre-existing episodes of that chat.
         wire_chat_edges(self.graph)
         self._ensure_privacy_scopes()
+        # Source rows changed: cached temporal intervals are stale.
+        self._temporal_interval_cache.clear()
         if sync_index:
             self._sync_index()
         return self
@@ -643,6 +699,7 @@ class KnowledgeGraphRetriever:
                 self._remove_by_source(mem_name, rid)
             for rid in rep.updated_ids or []:
                 self._refresh_by_source(mem_name, rid)
+        self._temporal_interval_cache.clear()
         if sync_index and any(
             rep.removed_ids or rep.updated_ids for rep in report.values()
         ):
@@ -874,6 +931,58 @@ class KnowledgeGraphRetriever:
     def _privacy_mode(self) -> KnowledgeGraphPrivacy:
         return KnowledgeGraphPrivacy.coerce(getattr(self.config, "privacy", None))
 
+    def _visibility_cache(self) -> _VisibilityCache:
+        """Fresh cache holder when the graph version moved on."""
+        cache = getattr(self.graph, "_visibility_cache", None)
+        if cache is None or cache.version != self.graph.version:
+            cache = _VisibilityCache()
+            cache.version = self.graph.version
+            self.graph._visibility_cache = cache
+        return cache
+
+    def _all_ids(self) -> frozenset[str]:
+        cache = self._visibility_cache()
+        if cache.all_ids is None:
+            cache.all_ids = frozenset(self.graph.nodes)
+        return cache.all_ids
+
+    def _all_public_ids(self) -> frozenset[str]:
+        cache = self._visibility_cache()
+        if cache.all_public is None:
+            cache.all_public = frozenset(
+                node.id
+                for node in self.graph.nodes.values()
+                if not bool(getattr(node, "internal", False))
+            )
+        return cache.all_public
+
+    def _scoped_ids(
+        self, viewers: frozenset[str]
+    ) -> tuple[frozenset[str], frozenset[str]]:
+        """``(scoped_all, scoped_public)`` for this privacy mode + viewers."""
+        cache = self._visibility_cache()
+        key = (self._privacy_mode(), viewers)
+        hit = cache.scoped.get(key)
+        if hit is not None:
+            cache.scoped.move_to_end(key)
+            return hit
+        scoped_all = frozenset(
+            node.id
+            for node in self.graph.nodes.values()
+            if node.character_scoped
+            or bool(viewers.intersection(node.memory_owners or []))
+        )
+        nodes = self.graph.nodes
+        scoped_public = frozenset(
+            nid
+            for nid in scoped_all
+            if not bool(getattr(nodes[nid], "internal", False))
+        )
+        cache.scoped[key] = (scoped_all, scoped_public)
+        if len(cache.scoped) > _MAX_VISIBILITY_SCOPES:
+            cache.scoped.popitem(last=False)
+        return scoped_all, scoped_public
+
     @synchronized
     def visible_node_ids(
         self,
@@ -892,21 +1001,9 @@ class KnowledgeGraphRetriever:
         """
         viewers = self._viewer_ids(user_id, user_ids)
         if self._privacy_mode() is KnowledgeGraphPrivacy.NONE or not viewers:
-            visible = frozenset(self.graph.nodes)
-        else:
-            visible = frozenset(
-                node.id
-                for node in self.graph.nodes.values()
-                if node.character_scoped
-                or bool(viewers.intersection(node.memory_owners or []))
-            )
-        if include_internal:
-            return visible
-        return frozenset(
-            node_id
-            for node_id in visible
-            if not bool(getattr(self.graph.nodes[node_id], "internal", False))
-        )
+            return self._all_ids() if include_internal else self._all_public_ids()
+        scoped_all, scoped_public = self._scoped_ids(viewers)
+        return scoped_all if include_internal else scoped_public
 
     def is_node_visible(
         self,
@@ -1045,6 +1142,9 @@ class KnowledgeGraphRetriever:
         if ":" not in source or not self.sources_wired:
             return None
         memory_name, raw_id = source.split(":", 1)
+        key = (memory_name, raw_id)
+        if key in self._temporal_interval_cache:
+            return self._temporal_interval_cache[key]
         memory = self._source_memory_for(memory_name)
         if memory is None and memory_name == "world_records":
             world = self._source_memory_for("world")
@@ -1052,9 +1152,13 @@ class KnowledgeGraphRetriever:
         try:
             row = memory.get_row(int(raw_id)) if memory is not None else None
             interval_fn = getattr(memory, "temporal_interval", None)
-            return interval_fn(row) if row is not None and callable(interval_fn) else None
+            result = (
+                interval_fn(row) if row is not None and callable(interval_fn) else None
+            )
         except (TypeError, ValueError, KeyError):
             return None
+        self._temporal_interval_cache[key] = result
+        return result
 
     @synchronized
     def test_activation(
@@ -1082,40 +1186,27 @@ class KnowledgeGraphRetriever:
         viewers = self._viewer_ids(user_id, user_ids)
         mode = self._privacy_mode()
         scoped = mode is not KnowledgeGraphPrivacy.NONE and bool(viewers)
-        scoped_ids = (
-            self.visible_node_ids(user_ids=viewers, include_internal=True)
-            if scoped
-            else frozenset(self.graph.nodes)
-        )
-        visible = (
-            scoped_ids
-            if include_internal
-            else frozenset(
-                nid
-                for nid in scoped_ids
-                if not bool(getattr(self.graph.nodes[nid], "internal", False))
-            )
-        )
+        if scoped:
+            scoped_ids, scoped_public = self._scoped_ids(viewers)
+        else:
+            scoped_ids = self._all_ids()
+            scoped_public = self._all_public_ids()
+        visible = scoped_ids if include_internal else scoped_public
         calculation_ids = (
             scoped_ids
             if mode is KnowledgeGraphPrivacy.PRIVATE and scoped
             else None
         )
-        queryable_ids = (
-            scoped_ids
-            if include_internal
-            else frozenset(
-                nid
-                for nid in self.graph.nodes
-                if not bool(getattr(self.graph.nodes[nid], "internal", False))
-            )
-        )
-        if mode is KnowledgeGraphPrivacy.PRIVATE and scoped:
+        if include_internal:
+            queryable_ids = scoped_ids
+        elif mode is KnowledgeGraphPrivacy.PRIVATE and scoped:
             queryable_ids = visible
+        else:
+            queryable_ids = self._all_public_ids()
         search_filter = (
             None
             if len(queryable_ids) == len(self.graph.nodes)
-            else frozenset(queryable_ids)
+            else queryable_ids
         )
         seeds = self._seed_activations(
             query,
@@ -1142,20 +1233,11 @@ class KnowledgeGraphRetriever:
             base_weight=self.config.base_weight,
             spread_weight=self.config.spread_weight,
             allowed_node_ids=calculation_ids,
+            engine=self.config.activation_engine,
         )
         # Stash on the nodes for the GUI / debugging.
         for nid, node in self.graph.nodes.items():
-            comp = breakdown.get(nid, {})
-            temporal_match = self._last_temporal_matches.get(nid)
-            if temporal_match is not None and temporal_match.range is not None:
-                comp = dict(comp)
-                comp.update({
-                    "temporal_relevance": temporal_match.score,
-                    "temporal_expression": temporal_match.range.expression,
-                    "temporal_range_start": temporal_match.range.start_timestamp,
-                    "temporal_range_end": temporal_match.range.end_timestamp,
-                    "temporal_grain": temporal_match.range.grain,
-                })
+            comp = self._with_temporal_extras(nid, breakdown.get(nid, {}))
             node.activation = float(comp.get("score", 0.0))
             node.score_breakdown = dict(comp)
         trace = {nid: comp["score"] for nid, comp in breakdown.items()}
@@ -1255,19 +1337,9 @@ class KnowledgeGraphRetriever:
             ((a, nid) for nid, a in act.items() if a >= self.config.min_activation),
             reverse=True,
         )
-        items: list[MemoryItem] = []
-        surfaced_ids: list[str] = []
-        for a, nid in ranked:
-            node = self.graph.nodes.get(nid)
-            if node is None:
-                continue
-            item = self._node_to_item(node, a)
-            if _count_tokens(
-                self.format_items([*items, item], timestamp_style=timestamp_style)
-            ) > budget:
-                break
-            items.append(item)
-            surfaced_ids.append(nid)
+        items, surfaced_ids = self._select_within_budget(
+            ranked, budget, timestamp_style
+        )
         if not items:
             return []
         if state_changing:
@@ -1278,6 +1350,226 @@ class KnowledgeGraphRetriever:
                     node.touch(now)
             self._hebbian_step(set(surfaced_ids))
         return items
+
+    def _select_within_budget(
+        self,
+        ranked: list[tuple[float, str]],
+        budget: int,
+        timestamp_style: str,
+    ) -> tuple[list[MemoryItem], list[str]]:
+        """Activation-ordered items whose rendered body fits ``budget`` tokens.
+
+        Tokenize each candidate's rendered bullet once instead of
+        re-tokenizing the whole accumulated body per candidate (O(k^2) ->
+        O(k)). Per-line counts ignore BPE merges at the "\n" joins, so the
+        exact rendered body is verified once at the end and the tail is
+        dropped if the boundary merges pushed it over budget.
+        """
+        items: list[MemoryItem] = []
+        surfaced_ids: list[str] = []
+        running_tokens = 0
+        for a, nid in ranked:
+            node = self.graph.nodes.get(nid)
+            if node is None:
+                continue
+            item = self._node_to_item(node, a)
+            line_tokens = _count_tokens(item_bullet(item, timestamp_style))
+            if running_tokens + line_tokens > budget:
+                break
+            items.append(item)
+            surfaced_ids.append(nid)
+            running_tokens += line_tokens
+        while items and _count_tokens(
+            self.format_items(items, timestamp_style=timestamp_style)
+        ) > budget:
+            items.pop()
+            surfaced_ids.pop()
+        return items, surfaced_ids
+
+    def _with_temporal_extras(
+        self, nid: str, comp: dict[str, float]
+    ) -> dict[str, float]:
+        """Copy ``comp`` with the node's last temporal match appended."""
+        temporal_match = self._last_temporal_matches.get(nid)
+        if temporal_match is None or temporal_match.range is None:
+            return comp
+        comp = dict(comp)
+        comp.update({
+            "temporal_relevance": temporal_match.score,
+            "temporal_expression": temporal_match.range.expression,
+            "temporal_range_start": temporal_match.range.start_timestamp,
+            "temporal_range_end": temporal_match.range.end_timestamp,
+            "temporal_grain": temporal_match.range.grain,
+        })
+        return comp
+
+    @synchronized
+    def retrieve_multi(
+        self,
+        query: str,
+        *,
+        user_ids: Iterable[str],
+        token_budget: int = 1_000,
+        timestamp_style: str = "both",
+        temporal_resolution: Optional["TemporalResolution"] = None,
+        temporal_weight: float = 1.0,
+    ) -> "MultiParticipantRetrieval":
+        """Per-participant token-budgeted retrieval, one shared computation.
+
+        Valid for the unscoped privacy modes where every participant sees the
+        same node universe (``none``). The seed search (and its embedding
+        round-trip), the base-level activation pass and the shared spreading
+        run once; each participant's PersonNode bias is composed in through
+        the linearity of spreading, so a P-participant group pays roughly one
+        retrieval plus small per-participant deltas instead of P full ones.
+        Scoped modes fall back to sequential :meth:`retrieve` calls.
+
+        Read-only by design: group rendering merges the per-participant items
+        and records the merged recall once via :meth:`record_recall`, exactly
+        like the sequential path it replaces.
+        """
+        participants = list(dict.fromkeys(
+            str(uid).strip() for uid in user_ids if str(uid).strip()
+        ))
+        empty = MultiParticipantRetrieval({}, {}, {})
+        if not participants or not self.graph.nodes:
+            return empty
+        mode = self._privacy_mode()
+        if mode is not KnowledgeGraphPrivacy.NONE:
+            items: dict[str, list[MemoryItem]] = {}
+            activation: dict[str, dict[str, float]] = {}
+            breakdowns: dict[str, dict[str, dict[str, float]]] = {}
+            for uid in participants:
+                participant_items = self.retrieve(
+                    query,
+                    user_id=uid,
+                    token_budget=token_budget,
+                    state_changing=False,
+                    timestamp_style=timestamp_style,
+                    temporal_resolution=temporal_resolution,
+                    temporal_weight=temporal_weight,
+                )
+                items[uid] = participant_items
+                visible = self.visible_node_ids(user_id=uid)
+                activation[uid] = {
+                    nid: node.activation
+                    for nid, node in self.graph.nodes.items()
+                    if nid in visible
+                }
+                breakdowns[uid] = {
+                    nid: dict(getattr(node, "score_breakdown", {}) or {})
+                    for nid, node in self.graph.nodes.items()
+                    if nid in visible
+                    and isinstance(getattr(node, "score_breakdown", None), dict)
+                }
+            return MultiParticipantRetrieval(items, activation, breakdowns)
+
+        # One seed search, one BLL pass, one shared spread.
+        visible = self._all_public_ids()
+        search_filter = (
+            None if len(visible) == len(self.graph.nodes) else visible
+        )
+        seeds = self._seed_activations(
+            query,
+            allowed_node_ids=search_filter,
+            temporal_resolution=temporal_resolution,
+            temporal_weight=temporal_weight,
+        )
+        biases: dict[str, dict[str, float]] = {}
+        for uid in participants:
+            person = self.graph.find_person_by_user_id(uid)
+            pid = person.id if person is not None else f"person:{uid}"
+            if pid in self.graph.nodes:
+                biases[uid] = {pid: self.config.self_seed * 0.6}
+        now = self._now()
+        bll = {
+            nid: base_level_activation(
+                node,
+                now=now,
+                decay=self.config.decay,
+                decay_half_life=self.config.decay_half_life,
+            )
+            for nid, node in self.graph.nodes.items()
+        }
+        shared_seeds = dict(seeds)
+        if (
+            self.graph.SELF_ID in self.graph.nodes
+            and self.graph.SELF_ID not in shared_seeds
+        ):
+            shared_seeds[self.graph.SELF_ID] = 0.5
+        engine = self.config.activation_engine
+        spread_shared = spread_activation(
+            self.graph,
+            shared_seeds,
+            gain=self.config.gain,
+            hops=self.config.hops,
+            engine=engine,
+        )
+        bias_spreads = {
+            uid: (
+                spread_activation(
+                    self.graph, bias,
+                    gain=self.config.gain, hops=self.config.hops, engine=engine,
+                )
+                if bias else {}
+            )
+            for uid, bias in biases.items()
+        }
+        self_node = self.graph.nodes.get(self.graph.SELF_ID)
+        current_mood = getattr(self_node, "current_mood", {}) or {}
+        budget = max(0, int(token_budget))
+        items = {}
+        activation = {}
+        breakdowns = {}
+        for uid in participants:
+            seeds_p = dict(shared_seeds)
+            for pid, bias_value in biases.get(uid, {}).items():
+                seeds_p[pid] = seeds_p.get(pid, 0.0) + bias_value
+            spread_maps = [spread_shared]
+            if bias_spreads.get(uid):
+                spread_maps.append(bias_spreads[uid])
+            breakdown = combine_scores(
+                self.graph.nodes.items(),
+                bll,
+                spread_maps,
+                seeds_p,
+                base_weight=self.config.base_weight,
+                spread_weight=self.config.spread_weight,
+                current_mood=current_mood,
+            )
+            for nid in self._last_temporal_matches:
+                if nid in breakdown:
+                    breakdown[nid] = self._with_temporal_extras(
+                        nid, breakdown[nid]
+                    )
+            trace = {
+                nid: comp["score"]
+                for nid, comp in breakdown.items()
+                if nid in visible
+            }
+            activation[uid] = trace
+            breakdowns[uid] = breakdown
+            if budget == 0:
+                items[uid] = []
+                continue
+            ranked = sorted(
+                (
+                    (a, nid)
+                    for nid, a in trace.items()
+                    if a >= self.config.min_activation
+                ),
+                reverse=True,
+            )
+            selected, _ = self._select_within_budget(ranked, budget, timestamp_style)
+            items[uid] = selected
+        # GUI parity with the sequential path: the last participant's trace
+        # is what lands on the nodes.
+        last = breakdowns[participants[-1]]
+        for nid, node in self.graph.nodes.items():
+            comp = last.get(nid, {})
+            node.activation = float(comp.get("score", 0.0))
+            node.score_breakdown = dict(comp)
+        return MultiParticipantRetrieval(items, activation, breakdowns)
 
     @synchronized
     def record_recall(self, items: Iterable[MemoryItem]) -> None:
@@ -1323,6 +1615,10 @@ class KnowledgeGraphRetriever:
                     float(edge.creation_weight or 0.0) + 0.10,
                     float(edge.weight) + lr,
                 )
+                # In-place strength bump: patch the numeric snapshot's row for
+                # this edge instead of invalidating (and rebuilding) it. A
+                # freshly created edge already bumped the graph version.
+                self.graph.touch_edge_strength(edge.id)
 
     # --------------------------------------------------------------- rendering
     @staticmethod
@@ -1429,6 +1725,9 @@ class KnowledgeGraphRetriever:
         self._replace_on_next_save = False
         self._commit_projection_meta()
         self._known_users = self._graph_user_ids()
+        # The reload replaced the graph (dropping its attached caches); the
+        # retriever-side temporal memo refers to rows that may have merged.
+        self._temporal_interval_cache.clear()
         return self
 
     @synchronized
@@ -1439,6 +1738,7 @@ class KnowledgeGraphRetriever:
             return self
         self.graph = load_graph(self.store)
         self._replace_on_next_save = False
+        self._temporal_interval_cache.clear()
         try:
             self.hybrid.load(path)
         except Exception:
@@ -1473,6 +1773,7 @@ class KnowledgeGraphRetriever:
         self._known_users = []
         self._replace_on_next_save = True
         self._pending_projection_meta.clear()
+        self._temporal_interval_cache.clear()
         return self
 
     # ----------------------------------------------------------------- helpers

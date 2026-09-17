@@ -54,6 +54,7 @@ from .retriever import (
     KnowledgeGraphConfig,
     KnowledgeGraphRetriever,
     KnowledgeGraphRetrivier,
+    MultiParticipantRetrieval,
 )
 from ..config import KnowledgeGraphPrivacy
 
@@ -100,6 +101,7 @@ __all__ = [
     # retriever
     "KnowledgeGraphRetriever",
     "KnowledgeGraphRetrivier",
+    "MultiParticipantRetrieval",
     "KnowledgeGraphConfig",
     "KnowledgeGraphPrivacy",
 ]

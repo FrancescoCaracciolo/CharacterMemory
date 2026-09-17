@@ -26,12 +26,15 @@ from .edges import ChatEdge, CoOccurrenceEdge, Edge, EpisodeEdge, FactEdge, Rela
 from .graph import KnowledgeGraph
 from .nodes import Node
 
-# Numeric spreading rebuilds the full privacy-filtered snapshot every query.
-# On the prod-db snapshot that snapshot costs ~75 ms, so it only beats the
-# scalar walker for high-degree multi-seed queries. ``auto`` therefore stays
-# on the scalar path; tests and the microbenchmark force ``engine="numeric"``.
-NUMERIC_MIN_NODES = 10_000
-NUMERIC_MIN_EDGES = 200_000
+# Numeric spreading uses a snapshot cached across queries and keyed by the
+# graph's mutation clock, so the per-query cost is just the NumPy propagate
+# (~2-4 ms at 10k nodes / 100k edges vs ~150 ms for the scalar walker). The
+# one-time snapshot build (~140 ms at that scale) is paid again only after
+# structural mutations (ingest/dedup), never on routine retrieval: the
+# Hebbian step's in-place co-occurrence bumps are patched row-wise instead.
+# Below these thresholds the scalar walker's first-query latency still wins.
+NUMERIC_MIN_NODES = 1_200
+NUMERIC_MIN_EDGES = 8_000
 
 _STRENGTH_ATTRS = ("trust", "affection", "importance", "confidence")
 
@@ -160,24 +163,6 @@ def _edge_strength(edge: Edge) -> float:
     return _edge_strength_generic(edge)
 
 
-def _filtered_graph_size(
-    graph: KnowledgeGraph,
-    allowed_node_ids: Optional[AbstractSet[str]],
-) -> tuple[int, int]:
-    """Node/edge counts after the privacy filter, used for engine dispatch."""
-    if allowed_node_ids is None:
-        return len(graph.nodes), len(graph.edges)
-    n_nodes = 0
-    for nid in allowed_node_ids:
-        if nid in graph.nodes:
-            n_nodes += 1
-    n_edges = 0
-    for edge in graph.edges.values():
-        if edge.src in allowed_node_ids and edge.dst in allowed_node_ids:
-            n_edges += 1
-    return n_nodes, n_edges
-
-
 def _use_numeric(
     graph: KnowledgeGraph,
     allowed_node_ids: Optional[AbstractSet[str]],
@@ -191,11 +176,9 @@ def _use_numeric(
     if type(graph) is not KnowledgeGraph:
         return False
     if engine != "numeric":
-        # Cheap unfiltered check first so typical queries never scan edges.
+        # Unfiltered sizes only: the snapshot cache keeps per-scope variants,
+        # so a privacy filter no longer changes which engine wins.
         if len(graph.nodes) < NUMERIC_MIN_NODES or len(graph.edges) < NUMERIC_MIN_EDGES:
-            return False
-        n_nodes, n_edges = _filtered_graph_size(graph, allowed_node_ids)
-        if n_nodes < NUMERIC_MIN_NODES or n_edges < NUMERIC_MIN_EDGES:
             return False
     return True
 
@@ -285,9 +268,10 @@ def spread_activation(
     pointing at many things spreads less to each). `seeds` provides the
     initial activation (SelfNode base + matched nodes' RRF score).
 
-    ``engine`` is ``"auto"`` (scalar unless the graph is far larger than the
-    current production snapshot), ``"scalar"`` (this module's walker, the
-    correctness reference) or ``"numeric"``.
+    ``engine`` is ``"auto"`` (numeric on graphs at/above
+    ``NUMERIC_MIN_NODES``/``NUMERIC_MIN_EDGES``, scalar below), ``"scalar"``
+    (this module's walker, the correctness reference) or ``"numeric"`` (the
+    version-cached NumPy snapshot; see :mod:`numeric_activation`).
     """
     if _use_numeric(graph, allowed_node_ids, engine):
         from .numeric_activation import spread_activation_numeric
@@ -345,6 +329,52 @@ def combined_activation(
             engine=engine,
         ).items()
     }
+
+
+def combine_scores(
+    nodes,
+    bll,
+    spread_maps,
+    seeds,
+    *,
+    base_weight: float = 1.0,
+    spread_weight: float = 1.0,
+    current_mood: Optional[dict] = None,
+) -> dict[str, dict[str, float]]:
+    """Fuse BLL and spreading into per-node score breakdowns.
+
+    ``spread_maps`` are summed per node: spreading is linear in the seed
+    vector, so ``spread(shared + bias)`` equals ``spread(shared) +
+    spread(bias)`` and a group retrieval can share the expensive map while
+    composing each participant's person bias in separately. ``nodes`` is an
+    iterable of ``(node_id, node)``; ``seeds`` is used only for the
+    informational ``seed`` component.
+    """
+    out: dict[str, dict[str, float]] = {}
+    mood = current_mood or {}
+    for nid, node in nodes:
+        bll_val = bll.get(nid, 0.0)
+        spread_val = 0.0
+        for spread_map in spread_maps:
+            spread_val += spread_map.get(nid, 0.0)
+        base_term = base_weight * bll_val
+        spread_term = spread_weight * spread_val
+        score = base_term + spread_term
+        shift = getattr(node, "emotional_shift", None)
+        emotion_mult = 1.0
+        if score > 0.0 and isinstance(shift, dict):
+            emotion_mult = 1.0 + emotion_similarity(shift, mood)
+            score *= emotion_mult
+        out[nid] = {
+            "bll": float(bll_val),
+            "spread": float(spread_val),
+            "seed": float(seeds.get(nid, 0.0)),
+            "base": float(base_term),
+            "spread_w": float(spread_term),
+            "emotion_mult": float(emotion_mult),
+            "score": float(score),
+        }
+    return out
 
 
 def combined_activation_breakdown(
@@ -409,7 +439,6 @@ def combined_activation_breakdown(
         allowed_node_ids=allowed_node_ids,
         engine=engine,
     )
-    out: dict[str, dict[str, float]] = {}
     self_node = graph.nodes.get(graph.SELF_ID)
     current_mood = getattr(self_node, "current_mood", {}) or {}
     output_nodes = (
@@ -421,33 +450,22 @@ def combined_activation_breakdown(
             if nid in graph.nodes
         )
     )
-    for nid, node in output_nodes:
-        bll_val = bll.get(nid, 0.0)
-        spread_val = spread.get(nid, 0.0)
-        base_term = base_weight * bll_val
-        spread_term = spread_weight * spread_val
-        score = base_term + spread_term
-        shift = getattr(node, "emotional_shift", None)
-        emotion_mult = 1.0
-        if score > 0.0 and isinstance(shift, dict):
-            emotion_mult = 1.0 + emotion_similarity(shift, current_mood)
-            score *= emotion_mult
-        out[nid] = {
-            "bll": float(bll_val),
-            "spread": float(spread_val),
-            "seed": float(seeds.get(nid, 0.0)),
-            "base": float(base_term),
-            "spread_w": float(spread_term),
-            "emotion_mult": float(emotion_mult),
-            "score": float(score),
-        }
-    return out
+    return combine_scores(
+        output_nodes,
+        bll,
+        [spread],
+        seeds,
+        base_weight=base_weight,
+        spread_weight=spread_weight,
+        current_mood=current_mood,
+    )
 
 
 __all__ = [
     "NUMERIC_MIN_EDGES",
     "NUMERIC_MIN_NODES",
     "base_level_activation",
+    "combine_scores",
     "spread_activation",
     "combined_activation",
     "combined_activation_breakdown",

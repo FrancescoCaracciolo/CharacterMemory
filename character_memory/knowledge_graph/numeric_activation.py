@@ -1,17 +1,26 @@
-"""Query-local numeric spreading activation.
+"""Numeric spreading activation over a version-cached sparse snapshot.
 
-Builds a sparse directed walk (source/destination/strength/fan) from the
-live graph, then propagates with float64 NumPy indexed reductions. The
-snapshot is discarded at the end of the call; nothing is cached across
-queries. Positions are temporary integers, distinct from durable node IDs.
+The weighted adjacency (edge strength × destination node strength, one row
+per directed walk) is a pure function of graph state — it does not depend on
+the query. :func:`cached_numeric_adjacency` therefore keeps one unscoped
+snapshot plus a small LRU of privacy-scoped variants on the graph, keyed by
+the graph's mutation clock, rebuilding lazily after structural changes. The
+Hebbian step bumps co-occurrence strengths in place on every state-changing
+retrieval; those edges are notified via ``graph.touch_edge_strength`` and
+patched row-by-row here instead of triggering a full rebuild, so routine
+retrieval never pays the snapshot cost.
 
-This module is a private backend for :func:`spread_activation`. Custom
-``KnowledgeGraph`` subclasses keep the scalar walker.
+Positions are temporary integers, distinct from durable node IDs. This module
+is a private backend for :func:`spread_activation`. Custom
+``KnowledgeGraph`` subclasses keep the scalar walker. Cache reads happen
+under the retriever's lock or on single-threaded callers; snapshots are built
+locally and assigned atomically.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import AbstractSet, Optional
 
 import numpy as np
@@ -22,10 +31,14 @@ from .graph import KnowledgeGraph
 _EMPTY_INT = np.empty(0, dtype=np.int64)
 _EMPTY_FLOAT = np.empty(0, dtype=np.float64)
 
+# Scoped privacy variants kept per graph version. One per participant union
+# covers group chats; more exotic viewer sets simply cycle the LRU.
+_MAX_SCOPED_SNAPSHOTS = 8
+
 
 @dataclass(frozen=True, slots=True)
 class NumericAdjacency:
-    """Sparse directed walks for one query, privacy-filtered."""
+    """Sparse directed walks for one scope, privacy-filtered."""
 
     node_ids: list[str]
     index: dict[str, int]
@@ -33,6 +46,10 @@ class NumericAdjacency:
     dst: np.ndarray
     weight: np.ndarray
     fan: np.ndarray
+    # Rows per co-occurrence edge id (self-loops occupy two rows). Only this
+    # kind has its strength patched in place (Hebbian step); everything else
+    # invalidates through the graph version and forces a rebuild.
+    edge_rows: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 def _include_node(node_id: str, allowed: Optional[AbstractSet[str]]) -> bool:
@@ -119,15 +136,17 @@ def build_numeric_adjacency(
     append_dst = dsts.append
     append_w = weights.append
 
-    def emit(src_id: str, dst_id: str, edge_strength: float) -> None:
+    def emit(src_id: str, dst_id: str, edge_strength: float) -> Optional[int]:
         src_i = index.get(src_id)
         dst_i = index.get(dst_id)
         if src_i is None or dst_i is None:
-            return
+            return None
         append_src(src_i)
         append_dst(dst_i)
         append_w(edge_strength * node_strengths[dst_i])
+        return len(srcs) - 1
 
+    co_rows: dict[str, list[int]] = {}
     for edge, edge_strength in zip(edges, edge_strengths):
         src_id = edge.src
         dst_id = edge.dst
@@ -137,13 +156,21 @@ def build_numeric_adjacency(
             continue
         strength = float(edge_strength)
         symmetric = edge.kind in SYMMETRIC_KINDS
-        emit(src_id, dst_id, strength)
+        rows = co_rows.setdefault(edge.id, []) if edge.kind == "co_occurrence" else None
+        row = emit(src_id, dst_id, strength)
+        if rows is not None and row is not None:
+            rows.append(row)
         if src_id == dst_id:
             # add_edge appends the same id onto one adj list twice.
-            emit(src_id, dst_id, strength)
+            row = emit(src_id, dst_id, strength)
+            if rows is not None and row is not None:
+                rows.append(row)
         elif symmetric:
-            emit(dst_id, src_id, strength)
+            row = emit(dst_id, src_id, strength)
+            if rows is not None and row is not None:
+                rows.append(row)
 
+    edge_rows = {eid: tuple(rows) for eid, rows in co_rows.items()}
     if not srcs:
         fan = np.zeros(n, dtype=np.float64)
         return NumericAdjacency(
@@ -153,6 +180,7 @@ def build_numeric_adjacency(
             dst=_EMPTY_INT,
             weight=_EMPTY_FLOAT,
             fan=fan,
+            edge_rows=edge_rows,
         )
 
     src = np.asarray(srcs, dtype=np.int64)
@@ -167,7 +195,101 @@ def build_numeric_adjacency(
         dst=dst,
         weight=weight,
         fan=fan,
+        edge_rows=edge_rows,
     )
+
+
+class _NumericAdjacencyCache:
+    """Version-keyed snapshot store attached to one graph instance."""
+
+    __slots__ = ("version", "unscoped", "scoped")
+
+    def __init__(self) -> None:
+        self.version = -1
+        self.unscoped: Optional[NumericAdjacency] = None
+        self.scoped: "OrderedDict[frozenset[str], NumericAdjacency]" = OrderedDict()
+
+
+def _patch_edge_strengths(
+    graph: KnowledgeGraph,
+    dirty: set[str],
+    snapshots: list[NumericAdjacency],
+) -> None:
+    """Rewrite the rows of edges whose strengths changed in place.
+
+    Destination node strengths are unaffected by the Hebbian step, so each
+    patched row is exactly ``_edge_strength(edge) * _node_strength(dst)``,
+    the same product the snapshot builder stores.
+    """
+    from .activation import _edge_strength, _node_strength
+
+    nodes = graph.nodes
+    edges = graph.edges
+    for adj in snapshots:
+        for eid in dirty:
+            rows = adj.edge_rows.get(eid)
+            if not rows:
+                continue
+            edge = edges.get(eid)
+            if edge is None:
+                continue
+            strength = _edge_strength(edge)
+            node_ids = adj.node_ids
+            dst = adj.dst
+            weight = adj.weight
+            for row in rows:
+                node = nodes.get(node_ids[int(dst[row])])
+                if node is None:
+                    continue
+                weight[row] = strength * _node_strength(node)
+
+
+def cached_numeric_adjacency(
+    graph: KnowledgeGraph,
+    allowed_node_ids: Optional[AbstractSet[str]] = None,
+) -> NumericAdjacency:
+    """Return the snapshot for ``allowed_node_ids``, rebuilding only if stale.
+
+    Keyed by :attr:`KnowledgeGraph.version`; pending in-place strength
+    notifications are drained and applied as row patches to every live
+    snapshot. Fresh builds read the live graph, so draining before building
+    keeps newly built snapshots exact as well.
+    """
+    cache: Optional[_NumericAdjacencyCache] = getattr(graph, "_numeric_adj_cache", None)
+    if cache is None:
+        cache = _NumericAdjacencyCache()
+        graph._numeric_adj_cache = cache
+    if graph.version != cache.version:
+        cache.version = graph.version
+        cache.unscoped = None
+        cache.scoped.clear()
+    dirty = graph.take_strength_dirty_edges()
+    if dirty:
+        live = [
+            adj
+            for adj in (cache.unscoped, *cache.scoped.values())
+            if adj is not None
+        ]
+        if live:
+            _patch_edge_strengths(graph, dirty, live)
+    if allowed_node_ids is None:
+        if cache.unscoped is None:
+            cache.unscoped = build_numeric_adjacency(graph, None)
+        return cache.unscoped
+    key = (
+        allowed_node_ids
+        if isinstance(allowed_node_ids, frozenset)
+        else frozenset(allowed_node_ids)
+    )
+    adj = cache.scoped.get(key)
+    if adj is None:
+        adj = build_numeric_adjacency(graph, key)
+        cache.scoped[key] = adj
+        if len(cache.scoped) > _MAX_SCOPED_SNAPSHOTS:
+            cache.scoped.popitem(last=False)
+    else:
+        cache.scoped.move_to_end(key)
+    return adj
 
 
 def propagate_numeric(
@@ -180,7 +302,7 @@ def propagate_numeric(
     floor: float = 0.0,
     allowed_node_ids: Optional[AbstractSet[str]] = None,
 ) -> dict[str, float]:
-    """Anderson spreading on a query-local numeric adjacency."""
+    """Anderson spreading on a numeric adjacency. Touches nothing on ``adj``."""
     n = len(adj.node_ids)
     act = np.zeros(n, dtype=np.float64)
     out: dict[str, float] = {}
@@ -241,8 +363,8 @@ def spread_activation_numeric(
     floor: float = 0.0,
     allowed_node_ids: Optional[AbstractSet[str]] = None,
 ) -> dict[str, float]:
-    """Build a query-local snapshot and propagate. Public retrieval is unchanged."""
-    adj = build_numeric_adjacency(graph, allowed_node_ids)
+    """Propagate over the version-cached snapshot for this scope."""
+    adj = cached_numeric_adjacency(graph, allowed_node_ids)
     return propagate_numeric(
         adj,
         seeds,
@@ -257,6 +379,7 @@ def spread_activation_numeric(
 __all__ = [
     "NumericAdjacency",
     "build_numeric_adjacency",
+    "cached_numeric_adjacency",
     "propagate_numeric",
     "spread_activation_numeric",
 ]

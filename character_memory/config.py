@@ -246,6 +246,10 @@ class KnowledgeGraphConfig:
       Authored world routines and mutable actor state are never projected.
     - `world_location_seed`: transient retrieval boost for the observer's
       current location; it does not persist current state as a graph fact.
+    - `activation_engine`: spreading-activation backend. `auto` picks the
+      NumPy snapshot engine on graphs at/above the size thresholds (see
+      :data:`character_memory.knowledge_graph.activation.NUMERIC_MIN_NODES`),
+      `scalar` forces the reference Python walker, `numeric` forces NumPy.
     """
 
     privacy: KnowledgeGraphPrivacy = KnowledgeGraphPrivacy.NONE
@@ -278,9 +282,17 @@ class KnowledgeGraphConfig:
     # Runtime-only activation boost for the observer's current location.
     # The snapshot itself is never persisted into the graph.
     world_location_seed: float = 0.6
+    activation_engine: str = "auto"
 
     def __post_init__(self) -> None:
         self.privacy = KnowledgeGraphPrivacy.coerce(self.privacy)
+        engine = str(self.activation_engine or "auto").strip().lower()
+        if engine not in ("auto", "scalar", "numeric"):
+            raise ValueError(
+                "knowledge-graph activation_engine must be one of: "
+                "auto, scalar, numeric"
+            )
+        self.activation_engine = engine
 
 
 @dataclass

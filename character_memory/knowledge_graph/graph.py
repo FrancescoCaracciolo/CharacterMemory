@@ -61,6 +61,22 @@ class KnowledgeGraph:
         # still propagate intentional removals (dedup/wiki refresh) precisely.
         self._removed_node_ids: set[str] = set()
         self._removed_edge_ids: set[str] = set()
+        # Mutation clock, bumped by every structural/attribute change made
+        # through this API. Cross-query caches (the numeric activation
+        # snapshot, visibility sets) key off it; raw in-place attribute writes
+        # must call :meth:`bump_version` (or :meth:`touch_edge_strength`) to
+        # stay observable.
+        self._version = 0
+        # Edge ids whose strength-relevant attributes changed in place since
+        # the last cache read (the Hebbian step bumps co-occurrence weights
+        # on every state-changing retrieval, so a full rebuild would defeat
+        # snapshot caching; consumers patch just these rows instead).
+        self._strength_dirty_edge_ids: set[str] = set()
+        # O(1) lookup indexes over person user ids and external refs, kept in
+        # sync by the mutators. Hits are verified against the live node, so a
+        # stale entry degrades to the legacy scan instead of a wrong answer.
+        self._person_id_by_user: dict[str, str] = {}
+        self._node_id_by_ref: dict[str, str] = {}
         # Transient observer used only while a bulk build is running. It is
         # deliberately not part of the serialized graph state.
         self._on_node_added: Optional[Callable[[Node], None]] = None
@@ -69,6 +85,69 @@ class KnowledgeGraph:
         self._adj: dict[str, list[str]] = {}
         # Auto-increment counters per node kind (fact / episode / entity).
         self._counters: dict[str, int] = {"fact": 0, "episode": 0, "entity": 0}
+
+    # ------------------------------------------------------------- invalidation
+    @property
+    def version(self) -> int:
+        """Monotonic mutation clock; 0 on a fresh graph."""
+        return self._version
+
+    def bump_version(self) -> None:
+        """Invalidate cross-query caches after an in-place mutation.
+
+        Structural changes made through the mutators bump automatically.
+        Call this after writing strength- or visibility-relevant attributes
+        directly on a stored node/edge (importance, confidence,
+        emotional_shift, trust/affection/valence, memory_owners, ...).
+        Recall telemetry written by ``node.touch`` needs no bump: it feeds
+        only per-query base-level activation, never a cached snapshot.
+        """
+        self._version += 1
+        self._strength_dirty_edge_ids.clear()
+
+    def touch_edge_strength(self, edge_id: str) -> None:
+        """Flag one edge whose strength attributes changed in place.
+
+        Cheaper than :meth:`bump_version`: the numeric activation snapshot
+        patches just this edge's rows instead of rebuilding. Falls back to a
+        full invalidation when the edge no longer exists.
+        """
+        if edge_id not in self.edges:
+            self.bump_version()
+            return
+        self._strength_dirty_edge_ids.add(edge_id)
+
+    def take_strength_dirty_edges(self) -> set[str]:
+        """Drain the pending in-place edge-strength notifications."""
+        dirty = self._strength_dirty_edge_ids
+        self._strength_dirty_edge_ids = set()
+        return dirty
+
+    # ------------------------------------------------------------------ lookup
+    @staticmethod
+    def _person_lookup_keys(node: "PersonNode") -> set[str]:
+        return {
+            uid
+            for uid in [node.user_id, *(node.user_ids or [])]
+            if uid
+        }
+
+    def _index_node(self, node: Node) -> None:
+        if isinstance(node, PersonNode):
+            for uid in self._person_lookup_keys(node):
+                self._person_id_by_user[uid] = node.id
+        for ref in (node.external_refs or []):
+            if ref:
+                self._node_id_by_ref[ref] = node.id
+
+    def _unindex_node(self, node: Node) -> None:
+        if isinstance(node, PersonNode):
+            for uid in self._person_lookup_keys(node):
+                if self._person_id_by_user.get(uid) == node.id:
+                    del self._person_id_by_user[uid]
+        for ref in (node.external_refs or []):
+            if ref and self._node_id_by_ref.get(ref) == node.id:
+                del self._node_id_by_ref[ref]
 
     # ------------------------------------------------------------------ nodes
     def add_node(self, node: Node) -> Node:
@@ -87,6 +166,8 @@ class KnowledgeGraph:
         self._removed_node_ids.discard(node.id)
         self.nodes[node.id] = node
         self._adj.setdefault(node.id, [])
+        self._index_node(node)
+        self._version += 1
         if self._on_node_added is not None:
             self._on_node_added(node)
         return node
@@ -120,7 +201,10 @@ class KnowledgeGraph:
                 int(current.privacy_scope_version or 0),
                 int(node.privacy_scope_version or 0),
             )
+            self._unindex_node(current)
             self.nodes[node.id] = node
+            self._index_node(node)
+            self.bump_version()
             return node
         return self.add_node(node)
 
@@ -137,6 +221,7 @@ class KnowledgeGraph:
         if owner and owner not in node.memory_owners:
             node.memory_owners.append(owner)
         node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
+        self.bump_version()
         return node
 
     def mark_character_scope(self, node_or_id: Node | str) -> Optional[Node]:
@@ -150,6 +235,7 @@ class KnowledgeGraph:
             return None
         node.character_scoped = True
         node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
+        self.bump_version()
         return node
 
     def mark_scope_resolved(self, node_or_id: Node | str) -> Optional[Node]:
@@ -161,6 +247,7 @@ class KnowledgeGraph:
         )
         if node is not None:
             node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
+            self.bump_version()
         return node
 
     def get_node(self, node_id: str) -> Optional[Node]:
@@ -170,6 +257,14 @@ class KnowledgeGraph:
         """Return the node carrying ``external_ref``, if any."""
         if not external_ref:
             return None
+        nid = self._node_id_by_ref.get(external_ref)
+        if nid is not None:
+            node = self.nodes.get(nid)
+            if node is not None and external_ref in (
+                getattr(node, "external_refs", []) or []
+            ):
+                return node
+            # Stale index entry (in-place ref edit); fall through to the scan.
         return next(
             (
                 node
@@ -183,17 +278,21 @@ class KnowledgeGraph:
         """Attach a stable source identifier to a canonical node."""
         if external_ref and external_ref not in node.external_refs:
             node.external_refs.append(external_ref)
+            self._node_id_by_ref[external_ref] = node.id
         return node
 
     def remove_node(self, node_id: str) -> None:
         """Remove a node and every edge that touched it."""
-        if node_id not in self.nodes:
+        node = self.nodes.get(node_id)
+        if node is None:
             return
         for eid in list(self._adj.get(node_id, [])):
             self.remove_edge(eid)
         self._adj.pop(node_id, None)
+        self._unindex_node(node)
         del self.nodes[node_id]
         self._removed_node_ids.add(node_id)
+        self.bump_version()
 
     def ensure_self(
         self,
@@ -262,6 +361,7 @@ class KnowledgeGraph:
                 merged = list(dict.fromkeys([*node.aliases, *aliases]))
                 node.aliases = merged
             node.text = self._person_text(node.name, node.aliases)
+            self._index_node(node)
             return node
         import time as _time
         now = _time.time()
@@ -327,6 +427,7 @@ class KnowledgeGraph:
                 node.aliases = merged
             # Rebuild the indexed text so new aliases are searchable.
             node.text = self._person_text(node.name, node.aliases)
+            self._index_node(node)
             return node
         import time as _time
         now = _time.time()
@@ -349,6 +450,14 @@ class KnowledgeGraph:
         """Return the person carrying ``user_id`` as a primary/linked id."""
         if not user_id:
             return None
+        nid = self._person_id_by_user.get(user_id)
+        if nid is not None:
+            node = self.nodes.get(nid)
+            if isinstance(node, PersonNode) and (
+                node.user_id == user_id or user_id in (node.user_ids or [])
+            ):
+                return node
+            # Stale index entry; fall through to the scan.
         for node in self.nodes.values():
             if not isinstance(node, PersonNode):
                 continue
@@ -576,6 +685,9 @@ class KnowledgeGraph:
                 ]))
                 self_node.character_scoped = True
                 self_node.privacy_scope_version = PRIVACY_SCOPE_SCHEMA_VERSION
+                self._index_node(self_node)
+        if removed:
+            self.bump_version()
         return removed
 
     def _pick_person_survivor(self, member_ids: list[str]) -> str:
@@ -656,6 +768,8 @@ class KnowledgeGraph:
             self._rewire_edges(rid, survivor_id)
             self.remove_node(rid)
         survivor.text = self._person_text(survivor.name, survivor.aliases)
+        self._index_node(survivor)
+        self.bump_version()
 
     def _rewire_edges(self, old_id: str, new_id: str) -> None:
         """Move every edge touching ``old_id`` onto ``new_id``.
@@ -713,6 +827,7 @@ class KnowledgeGraph:
         self.edges[edge.id] = edge
         self._adj.setdefault(edge.src, []).append(edge.id)
         self._adj.setdefault(edge.dst, []).append(edge.id)
+        self._version += 1
         return edge
 
     def get_edge(self, edge_id: str) -> Optional[Edge]:
@@ -727,6 +842,7 @@ class KnowledgeGraph:
             if edge_id in lst:
                 lst.remove(edge_id)
         self._removed_edge_ids.add(edge_id)
+        self._version += 1
 
     def edge_id(self, kind: str, src: str, dst: str) -> str:
         """Canonical edge id for a `(kind, src, dst)` triple.
@@ -762,6 +878,9 @@ class KnowledgeGraph:
         # Merge scalar strengths by max so re-ingestion strengthens rather
         # than overwrites; co-occurrence counts are summed by the caller.
         self._merge_edge(existing, edge)
+        # The merge mutates the stored edge in place (any kind, not just the
+        # co-occurrence rows the snapshot can patch), so invalidate fully.
+        self.bump_version()
         return existing
 
     @staticmethod
