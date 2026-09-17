@@ -777,7 +777,7 @@ def main() -> None:  # pragma: no cover - manual run helper / console script
     )
     parser.add_argument(
         "--meter", action="store_true",
-        help="Print each HTTP request's elapsed time to the console (CM_METER=1).",
+        help="Print HTTP request and per-memory retrieval times to the console (CM_METER=1).",
     )
     parser.add_argument(
         "--api-key", default=None, metavar="KEY",

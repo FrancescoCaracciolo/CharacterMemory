@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
+from ._timing import time_memory
 from character_memory.llm.base import LLMClient
 from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX, PromptConfig
 from .memory.extract import Extractor, ExtractionContext, build_extraction
@@ -317,24 +318,25 @@ class Character:
             if budget == 0:
                 continue
             recall_kwargs = {"state_changing": False} if selective else {}
-            if multi:
-                result: RecallResult = mem.build_section_participants_result(
-                    query,
-                    participants,
-                    limits.get(name, 0),
-                    **recall_kwargs,
-                    temporal_resolution=temporal_resolution,
-                    temporal_weight=temporal_weight,
-                )
-            else:
-                result = mem.build_section_result(
-                    query,
-                    user_id,
-                    limits.get(name, 0),
-                    **recall_kwargs,
-                    temporal_resolution=temporal_resolution,
-                    temporal_weight=temporal_weight,
-                )
+            with time_memory(self.character_name, name):
+                if multi:
+                    result: RecallResult = mem.build_section_participants_result(
+                        query,
+                        participants,
+                        limits.get(name, 0),
+                        **recall_kwargs,
+                        temporal_resolution=temporal_resolution,
+                        temporal_weight=temporal_weight,
+                    )
+                else:
+                    result = mem.build_section_result(
+                        query,
+                        user_id,
+                        limits.get(name, 0),
+                        **recall_kwargs,
+                        temporal_resolution=temporal_resolution,
+                        temporal_weight=temporal_weight,
+                    )
             if not result.body:
                 continue
             title = self._header_for_multi(name) if multi else self._header_for(name)
