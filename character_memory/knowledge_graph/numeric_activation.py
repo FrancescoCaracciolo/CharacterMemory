@@ -26,6 +26,7 @@ from typing import AbstractSet, Optional
 import numpy as np
 
 from .edges import ChatEdge, CoOccurrenceEdge, SYMMETRIC_KINDS
+from .._timing import time_phase
 from .graph import KnowledgeGraph
 
 _EMPTY_INT = np.empty(0, dtype=np.int64)
@@ -253,7 +254,9 @@ def cached_numeric_adjacency(
     Keyed by :attr:`KnowledgeGraph.version`; pending in-place strength
     notifications are drained and applied as row patches to every live
     snapshot. Fresh builds read the live graph, so draining before building
-    keeps newly built snapshots exact as well.
+    keeps newly built snapshots exact as well. Rebuilds are recorded as a
+    ``kg_snapshot`` phase so the meter can distinguish "rebuilding every
+    query" from genuinely slow warm propagation.
     """
     cache: Optional[_NumericAdjacencyCache] = getattr(graph, "_numeric_adj_cache", None)
     if cache is None:
@@ -274,7 +277,8 @@ def cached_numeric_adjacency(
             _patch_edge_strengths(graph, dirty, live)
     if allowed_node_ids is None:
         if cache.unscoped is None:
-            cache.unscoped = build_numeric_adjacency(graph, None)
+            with time_phase("kg_snapshot"):
+                cache.unscoped = build_numeric_adjacency(graph, None)
         return cache.unscoped
     key = (
         allowed_node_ids
@@ -283,7 +287,8 @@ def cached_numeric_adjacency(
     )
     adj = cache.scoped.get(key)
     if adj is None:
-        adj = build_numeric_adjacency(graph, key)
+        with time_phase("kg_snapshot"):
+            adj = build_numeric_adjacency(graph, key)
         cache.scoped[key] = adj
         if len(cache.scoped) > _MAX_SCOPED_SNAPSHOTS:
             cache.scoped.popitem(last=False)

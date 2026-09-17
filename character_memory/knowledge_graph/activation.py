@@ -32,7 +32,9 @@ from .nodes import Node
 # one-time snapshot build (~140 ms at that scale) is paid again only after
 # structural mutations (ingest/dedup), never on routine retrieval: the
 # Hebbian step's in-place co-occurrence bumps are patched row-wise instead.
-# Below these thresholds the scalar walker's first-query latency still wins.
+# Spreading cost scales with EDGES, not nodes — a small-but-dense graph
+# (few hundred nodes, tens of thousands of chat/co-occurrence edges) is the
+# scalar walker's worst case, so either threshold alone engages numeric.
 NUMERIC_MIN_NODES = 1_200
 NUMERIC_MIN_EDGES = 8_000
 
@@ -176,9 +178,12 @@ def _use_numeric(
     if type(graph) is not KnowledgeGraph:
         return False
     if engine != "numeric":
-        # Unfiltered sizes only: the snapshot cache keeps per-scope variants,
-        # so a privacy filter no longer changes which engine wins.
-        if len(graph.nodes) < NUMERIC_MIN_NODES or len(graph.edges) < NUMERIC_MIN_EDGES:
+        # Unfiltered sizes only, and either threshold suffices: edges drive
+        # spreading cost (dense-small graphs are the scalar worst case).
+        if (
+            len(graph.nodes) < NUMERIC_MIN_NODES
+            and len(graph.edges) < NUMERIC_MIN_EDGES
+        ):
             return False
     return True
 
