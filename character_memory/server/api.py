@@ -81,6 +81,7 @@ from .admin import build_jobs_router as build_jobs_router_impl
 # one key, every endpoint below requires it — see auth.py for the accepted
 # credential forms and the /gui public paths.
 from .auth import APIKeyMiddleware, parse_api_keys, read_api_keys
+from .meter import RequestMeterMiddleware
 # Background cache synchronizer: reloads in-RAM hybrid indexes + the KG graph
 # when another process (the Discord bot, the CLI, a second worker) writes to
 # the shared per-character save_directory.
@@ -309,6 +310,8 @@ app = FastAPI(title="CharacterMemory server")
 # With no key configured this is a pass-through; /gui and /gui/static stay
 # public so the (data-less) page shell can load and prompt for the key.
 app.add_middleware(APIKeyMiddleware, api_keys=API_KEYS)
+# Added last so timing also covers requests rejected by the API-key gate.
+app.add_middleware(RequestMeterMiddleware)
 
 # Mount the MCP (Model Context Protocol) JSON-RPC 2.0 endpoint. Reads reuse
 # ``adapters.read_memory`` (semantic search + lexical fallback + pagination)
@@ -773,6 +776,10 @@ def main() -> None:  # pragma: no cover - manual run helper / console script
         ),
     )
     parser.add_argument(
+        "--meter", action="store_true",
+        help="Print each HTTP request's elapsed time to the console (CM_METER=1).",
+    )
+    parser.add_argument(
         "--api-key", default=None, metavar="KEY",
         help=(
             "Require this API key on every endpoint (equivalent to setting "
@@ -781,6 +788,9 @@ def main() -> None:  # pragma: no cover - manual run helper / console script
         ),
     )
     args = parser.parse_args()
+
+    if args.meter:
+        os.environ["CM_METER"] = "1"
 
     if args.api_key is not None:
         # Bridge to a uvicorn worker subprocess (the --reload re-import path)

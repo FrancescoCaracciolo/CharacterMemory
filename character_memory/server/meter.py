@@ -1,0 +1,48 @@
+"""Optional console timing for complete HTTP requests, including streams."""
+
+from __future__ import annotations
+
+import os
+from time import perf_counter
+
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+
+class RequestMeterMiddleware:
+    """Time requests when CM_METER is enabled; leave other ASGI scopes alone."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Read at request time: the CLI runs after the app is imported, while
+        # reload workers inherit this setting through their environment.
+        if scope["type"] != "http" or os.environ.get("CM_METER", "").lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            await self.app(scope, receive, send)
+            return
+
+        started = perf_counter()
+        status = 500
+        failed = False
+
+        async def metered_send(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, metered_send)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            elapsed_ms = (perf_counter() - started) * 1000
+            # Omit query strings, which may contain API keys or user content.
+            print(
+                f"[meter] {scope['method']} {scope['path']} "
+                f"{status}{' ERROR' if failed else ''} {elapsed_ms:.2f} ms",
+                flush=True,
+            )
