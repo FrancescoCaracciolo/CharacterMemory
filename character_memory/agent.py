@@ -27,7 +27,7 @@ Prompt assembly and per-memory extraction are delegated to a
 
 import os
 import time
-from typing import Any, Callable, Iterable, Iterator, Optional, Union
+from typing import Any, Callable, Iterable, Iterator, Optional, Sequence, Union
 
 from .chat import Chat, _ChatBackend
 from .chunking.registry import get_chunker
@@ -965,6 +965,7 @@ class CharacterAgent:
     def recall(
         self, target: Target, *, user_id: str = "default",
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> ContextSnapshot:
         """Recall selected memories with rendered sections and token usage.
 
@@ -973,20 +974,24 @@ class CharacterAgent:
         """
         return self.build_context_snapshot(
             target, user_id=user_id, budget=budget, reranker=reranker,
+            memory_types=memory_types,
         )
 
     def build_context(
         self, target: Target, *, user_id: str = "default",
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> dict[str, str]:
         """Return ordered rendered memory sections and intermediate prompts."""
         return self.build_context_snapshot(
             target, user_id=user_id, budget=budget, reranker=reranker,
+            memory_types=memory_types,
         ).sections
 
     def build_context_snapshot(
         self, target: Target, *, user_id: str = "default",
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> ContextSnapshot:
         """Build context once and expose the exact recalls used to build it."""
         self._require_loaded()
@@ -1003,11 +1008,13 @@ class CharacterAgent:
             temporal_weight=self._temporal_weight(),
             budget=self._memory_budget(budget),
             reranker=reranker,
+            memory_types=memory_types,
         )
 
     def render_prompt(
         self, target: Target, *, user_id: str = "default",
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> str:
         """Full system-style context block (system line + all sections)."""
         self._require_loaded()
@@ -1024,6 +1031,7 @@ class CharacterAgent:
             temporal_weight=self._temporal_weight(),
             budget=self._memory_budget(budget),
             reranker=reranker,
+            memory_types=memory_types,
         )
 
     # Chat management
@@ -1056,6 +1064,7 @@ class CharacterAgent:
         *,
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> list[dict[str, str]]:
         assert self.character is not None
         system = self.character.render_prompt(
@@ -1067,6 +1076,7 @@ class CharacterAgent:
             temporal_weight=self._temporal_weight(),
             budget=self._memory_budget(budget),
             reranker=reranker,
+            memory_types=memory_types,
         )
         return [{"role": "system", "content": system}, *prior]
 
@@ -1100,6 +1110,7 @@ class CharacterAgent:
         auto_extract: bool = True,
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> Union[str, Iterator[Any]]:
         """Generate an assistant reply for `target`.
 
@@ -1143,6 +1154,7 @@ class CharacterAgent:
         ``budget`` and ``reranker`` control the memory portion of the system
         prompt. Omitted budget inherits ``config.memory.token_budget``;
         ``None`` removes the cap. History and tool messages are outside it.
+        ``memory_types`` restricts recall to only the specified memory names.
         """
         self._require_loaded()
         assert self.llm is not None
@@ -1157,6 +1169,7 @@ class CharacterAgent:
             temporal_resolution=temporal,
             budget=budget,
             reranker=reranker,
+            memory_types=memory_types,
         )
 
         chat: Optional[Chat] = None

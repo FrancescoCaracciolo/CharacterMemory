@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from http.client import HTTPResponse
-from typing import Any, Iterator, Mapping, Optional, Sequence
+from typing import Any, Iterator, Mapping, Optional, Sequence, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -678,6 +678,8 @@ class CharacterMemoryClient:
         chat_id: Optional[str] = None,
         occurred_at: Optional[float] = None,
         budget: Budget = UNSET,
+        memory_types: Union[Sequence[str], None, object] = UNSET,
+        memories: Union[Sequence[str], None, object] = UNSET,
     ) -> ContextResponse:
         """Persist a user turn and retrieve the character's memory context.
 
@@ -688,6 +690,10 @@ class CharacterMemoryClient:
         Omitted ``budget`` inherits the character configuration. ``None``
         removes the cap; ``0`` omits memories; a positive integer caps the
         rendered memory sections (excluding intermediate prompt blocks).
+
+        ``memory_types`` (or ``memories``) specifies an optional list of memory
+        names to recall (e.g. ``["user_facts", "episodic"]``). Non-specified
+        memories bypass retrieval to save latency.
         """
         if budget is not UNSET:
             validate_budget(budget)
@@ -702,6 +708,10 @@ class CharacterMemoryClient:
             body["occurred_at"] = occurred_at
         if budget is not UNSET:
             body["budget"] = budget
+        if memory_types is UNSET and memories is not UNSET:
+            memory_types = memories
+        if memory_types is not UNSET:
+            body["memory_types"] = list(memory_types) if memory_types is not None else None
         return ContextResponse.from_dict(self._request("POST", "/context", body))
 
     # Explicit verb alias for callers who prefer method names that distinguish

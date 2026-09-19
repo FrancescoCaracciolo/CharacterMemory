@@ -44,12 +44,12 @@ from __future__ import annotations
 
 import os
 import queue
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from character_memory import (
     CharacterAgent,
@@ -249,6 +249,32 @@ class ContextRequest(BaseModel):
             "0 omits memory sections."
         ),
     )
+    memory_types: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Optional list of memory system names to recall (e.g. ['user_facts', 'episodic']). "
+            "When specified, recall is only performed on these memories to save latency. "
+            "Omit or pass null to recall all enabled memories."
+        ),
+    )
+    memories: Optional[list[str]] = Field(
+        default=None,
+        description="Alias for memory_types.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_memory_types(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if data.get("memory_types") is None and data.get("memories") is not None:
+                data = dict(data)
+                data["memory_types"] = data.get("memories")
+            if isinstance(data.get("memory_types"), str):
+                data = dict(data)
+                data["memory_types"] = [
+                    s.strip() for s in data["memory_types"].split(",") if s.strip()
+                ]
+        return data
 
 
 class ContextResponse(BaseModel):
@@ -382,6 +408,10 @@ def context(req: ContextRequest) -> ContextResponse:
     # Missing and explicit null differ: only the latter removes the
     # character's configured cap.
     recall_options = {"budget": req.budget} if "budget" in req.model_fields_set else {}
+    if "memory_types" in req.model_fields_set or "memories" in req.model_fields_set:
+        recall_options["memory_types"] = (
+            req.memory_types if req.memory_types is not None else req.memories
+        )
     snapshot = agent.build_context_snapshot(chat, **recall_options)
     try:
         event = build_context_event(

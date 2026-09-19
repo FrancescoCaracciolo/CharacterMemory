@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from ._timing import time_memory
 from character_memory.llm.base import LLMClient
 from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX, PromptConfig
@@ -43,6 +43,7 @@ class ContextSnapshot:
     temporal_resolution: Optional[TemporalResolution] = None
     memory_token_count: int = 0
     memory_budget: Optional[int] = None
+    memory_types: Optional[list[str]] = None
 
 
 class Character:
@@ -73,6 +74,7 @@ class Character:
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
         temporal_resolution: Optional[TemporalResolution] = None,
         temporal_weight: float = 1.0,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> ContextSnapshot:
         """Select memories and return their items, sections and token usage.
 
@@ -88,7 +90,7 @@ class Character:
         return self.build_context_snapshot(
             query, user_id, limits=limits, participants=participants,
             temporal_resolution=temporal_resolution, temporal_weight=temporal_weight,
-            budget=budget, reranker=reranker,
+            budget=budget, reranker=reranker, memory_types=memory_types,
         )
 
     def _count_memory_tokens(self, text: str) -> int:
@@ -272,6 +274,7 @@ class Character:
         *,
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> ContextSnapshot:
         """Build the context and retain the exact items recalled by each memory.
 
@@ -289,6 +292,8 @@ class Character:
         separators, but excludes system instructions and intermediate prompts.
         Omitted budget inherits the constructor default; None is unlimited.
         Rerankers order/filter candidates; only selected items are reinforced.
+        ``memory_types`` restricts recall to only the specified memory names,
+        bypassing recall for omitted memories to save latency.
         """
         budget = self.budget if budget is UNSET else budget
         validate_budget(budget)
@@ -304,6 +309,12 @@ class Character:
         multi = bool(participants and len(participants) > 1)
         sections: dict[str, str] = {}
         recalls: dict[str, MemoryRecallSnapshot] = {}
+        allowed_memories = set(memory_types) if memory_types is not None else None
+        allowed_memories_lower = (
+            {m.lower() for m in allowed_memories if isinstance(m, str)}
+            if allowed_memories is not None
+            else None
+        )
         for name in order:
             if name.startswith(INTERMEDIATE_PROMPT_PREFIX):
                 prompt = intermediate_prompts.get(name, "")
@@ -313,6 +324,9 @@ class Character:
             mem = self._by_name.get(name)
             if mem is None or not mem.enabled:
                 continue
+            if allowed_memories is not None:
+                if name not in allowed_memories and name.lower() not in allowed_memories_lower:
+                    continue
             if selective:
                 mem.prepare_recall()
             if budget == 0:
@@ -417,6 +431,7 @@ class Character:
             temporal_resolution=temporal_resolution,
             memory_token_count=memory_tokens,
             memory_budget=budget,
+            memory_types=list(memory_types) if memory_types is not None else None,
         )
 
     def build_context(
@@ -430,6 +445,7 @@ class Character:
         *,
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> dict[str, str]:
         """Return ordered rendered memory sections and intermediate prompts."""
         return self.build_context_snapshot(
@@ -441,6 +457,7 @@ class Character:
             temporal_weight=temporal_weight,
             budget=budget,
             reranker=reranker,
+            memory_types=memory_types,
         ).sections
 
     def _header_for_multi(self, name: str) -> str:
@@ -463,6 +480,7 @@ class Character:
         *,
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
+        memory_types: Optional[Sequence[str]] = None,
     ) -> str:
         """Full system-style context block (system line + all sections)."""
         sections = self.build_context(
@@ -474,6 +492,7 @@ class Character:
             temporal_weight=temporal_weight,
             budget=budget,
             reranker=reranker,
+            memory_types=memory_types,
         )
         if self.prompts is None:
             parts = []
