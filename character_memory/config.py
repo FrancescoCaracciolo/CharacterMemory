@@ -155,7 +155,7 @@ class DedupConfig:
     - `candidate_pool`: per-item guard — how many RAG hits to re-rank.
     """
 
-    enabled: bool = False
+    enabled: bool = field(default_factory=lambda: _env_bool("CM_DEDUP_ENABLED", False))
     exact: bool = True
     similarity_threshold: Optional[float] = 0.92
     llm_judge: bool = False
@@ -163,8 +163,9 @@ class DedupConfig:
     per_user: bool = True
     candidate_pool: int = 10
     # A supplied client or configured provider opts into decision reconciliation.
-    decision_provider: Optional[str] = None
-    decision_model: Optional[str] = None
+    decision_provider: Optional[str] = field(default_factory=lambda: os.getenv("CM_DECISION_PROVIDER") or None)
+    decision_model: Optional[str] = field(default_factory=lambda: os.getenv("CM_DECISION_MODEL") or None)
+    decision_api_key: Optional[str] = None
     decision_timeout: float = 30.0
     decision_candidate_pool: int = 20
     decision_max_request_bytes: int = 24000

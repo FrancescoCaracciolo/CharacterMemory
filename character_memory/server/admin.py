@@ -170,7 +170,7 @@ def _patch_dedup(current: DedupConfig, patch: Any) -> DedupConfig:
         elif key == "decision_provider":
             if value not in (None, "typesafe", "openrouter", "llm"):
                 error = "must be null, typesafe, openrouter, or llm"
-        elif key == "decision_model":
+        elif key in ("decision_model", "decision_api_key"):
             if value is not None and not isinstance(value, str):
                 error = "must be a string or null"
             elif isinstance(value, str):

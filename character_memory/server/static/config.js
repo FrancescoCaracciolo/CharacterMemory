@@ -61,8 +61,9 @@ const DEDUP_FIELDS = [
   { key: "consolidate", label: "Consolidate duplicates", type: "checkbox", hint: "Use the LLM to merge duplicates instead of dropping the newer entry." },
   { key: "per_user", label: "Compare within each user", type: "checkbox" },
   { key: "candidate_pool", label: "Similarity candidate pool", type: "number", min: 1, step: 1 },
-  { key: "decision_provider", label: "Decision provider", type: "select", hint: "Native providers use TYPESAFE_API_KEY or OPENROUTER_API_KEY from the server environment." },
+  { key: "decision_provider", label: "Decision provider", type: "select", hint: "Choose a native decision provider or the configured LLM adapter." },
   { key: "decision_model", label: "Decision model", type: "text", hint: "Blank uses the provider default. The LLM adapter uses the already configured LLM." },
+  { key: "decision_api_key", label: "Decision API key", type: "password", hint: "Saved in this character’s config.yaml. Leave blank to use TYPESAFE_API_KEY or OPENROUTER_API_KEY from the server environment." },
   { key: "decision_timeout", label: "Decision timeout (seconds)", type: "number", min: 0.001, step: "any", hint: "Applies to native decision providers." },
   { key: "decision_candidate_pool", label: "Decision candidate pool", type: "number", min: 1, step: 1 },
   { key: "decision_max_request_bytes", label: "Maximum decision request (bytes)", type: "number", min: 1, step: 1 },
@@ -909,6 +910,7 @@ function renderDedup(config) {
     }
     if (field.type === "checkbox") input.checked = !!config[field.key];
     else input.value = config[field.key] ?? "";
+    if (field.type === "password") input.autocomplete = "new-password";
     if (field.type === "number") {
       input.min = field.min ?? 0;
       if (field.min == null) input.max = 1;
@@ -933,7 +935,7 @@ function refreshDedupControls() {
     const needsProvider = field.key.startsWith("decision_") && field.key !== "decision_provider"
       || ["duplicate_probability", "correction_probability"].includes(field.key);
     input.disabled = field.key !== "enabled" && (!enabled || (needsProvider && !provider));
-    if (provider === "llm" && ["decision_model", "decision_timeout"].includes(field.key)) input.disabled = true;
+    if (provider === "llm" && ["decision_model", "decision_api_key", "decision_timeout"].includes(field.key)) input.disabled = true;
   }
   $("cfg-dedup-decision_model").placeholder = provider === "typesafe" ? "jev-latest"
     : provider === "openrouter" ? "typesafe/jev-1.13" : "Configured LLM";

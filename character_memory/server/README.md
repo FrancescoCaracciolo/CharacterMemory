@@ -29,6 +29,15 @@ pip install charactermemory[server]
 
 ## Guided setup
 
+The decision-model step offers `none`, `typesafe`, `openrouter`, or `llm`.
+Native providers prompt for a model ID and API key; `llm` reuses the chat model
+and credentials. Selecting a provider enables deduplication by default via
+`CM_DEDUP_ENABLED=true`. Setup saves `CM_DECISION_PROVIDER` and
+`CM_DECISION_MODEL` in `.env`, plus `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY`
+when configured. Per-character `memory.dedup` settings take precedence.
+Selecting `none` clears the decision provider/model while preserving the
+existing deduplication toggle for legacy matching.
+
 Run the wizard from the directory where you intend to start the server:
 
 ```bash

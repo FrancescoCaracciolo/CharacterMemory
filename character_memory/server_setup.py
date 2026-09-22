@@ -15,7 +15,8 @@ from urllib.parse import urlsplit
 from ._dotenv import quote_value, read_text, read_values, update_text
 from .config import EmbeddingConfig, LLMConfig
 
-_SECRETS = {"OPENAI_API_KEY", "OPENAI_EMBEDDINGS_API_KEY", "CM_DATABASE_URL", "CM_API_KEY"}
+_SECRETS = {"OPENAI_API_KEY", "OPENAI_EMBEDDINGS_API_KEY", "CM_DATABASE_URL", "CM_API_KEY",
+            "TYPESAFE_API_KEY", "OPENROUTER_API_KEY"}
 
 
 def _single_line(value: str) -> str:
@@ -163,6 +164,8 @@ def _defaults() -> dict[str, str]:
         "CM_RETRIEVAL_BACKEND": "hybrid", "CM_ASSETS_DIR": "./assets",
         "CM_SAVE_DIR": "./.cm_servers", "CM_HOST": "0.0.0.0",
         "CM_PORT": "8000", "CM_API_KEY": "",
+        "CM_DECISION_PROVIDER": "", "CM_DECISION_MODEL": "",
+        "CM_DEDUP_ENABLED": "false",
     }
 
 
@@ -184,6 +187,27 @@ def collect_settings(current: dict[str, str]) -> dict[str, str | None]:
         _secret("Embedding API key", "OPENAI_EMBEDDINGS_API_KEY", current.get("OPENAI_EMBEDDINGS_API_KEY", ""))
         if mode == "separate" else None
     )
+
+    print("\nDecision model — optional reconciliation of duplicate or corrected memories.")
+    provider = _choice("Decision provider (CM_DECISION_PROVIDER)",
+                       ("none", "typesafe", "openrouter", "llm"),
+                       current.get("CM_DECISION_PROVIDER") or "none")
+    draft["CM_DECISION_PROVIDER"] = "" if provider == "none" else provider
+    draft["CM_DECISION_MODEL"] = ""
+    draft["CM_DEDUP_ENABLED"] = current.get("CM_DEDUP_ENABLED", "false")
+    if provider != "none":
+        draft["CM_DEDUP_ENABLED"] = "true"
+        if provider == "llm":
+            print("Uses the configured chat model and LLM API key above.")
+        else:
+            from .decisions.clients import TypeSafeDecisionClient, OpenRouterDecisionClient
+            client = TypeSafeDecisionClient if provider == "typesafe" else OpenRouterDecisionClient
+            model = (current.get("CM_DECISION_MODEL")
+                     if current.get("CM_DECISION_PROVIDER") == provider else None)
+            draft["CM_DECISION_MODEL"] = _ask("Decision model", "CM_DECISION_MODEL", model or client.default_model)
+            draft[client.key_env] = _secret("Decision API key", client.key_env,
+                                           current.get(client.key_env, ""))
+        print("Deduplication enabled by default. Existing per-character config.yaml settings take precedence.")
 
     print("\nDatabase — SQLite needs no database service; PostgreSQL uses an existing database.")
     backend = _choice("Storage (CM_STORAGE_BACKEND)", ("sqlite", "postgres"), current["CM_STORAGE_BACKEND"])

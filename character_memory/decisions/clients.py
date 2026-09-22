@@ -78,7 +78,8 @@ class LLMDecisionClient(DecisionClient):
 
 def configured_client(config, llm=None):
     provider = config.decision_provider
-    kwargs = dict(model=config.decision_model, timeout=config.decision_timeout)
+    kwargs = dict(model=config.decision_model, api_key=config.decision_api_key,
+                  timeout=config.decision_timeout)
     if provider == 'typesafe':
         return TypeSafeDecisionClient(**kwargs)
     if provider == 'openrouter':
