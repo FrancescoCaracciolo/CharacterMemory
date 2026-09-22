@@ -27,6 +27,50 @@ files; edit those under Workshop → Files and rebuild the indexes instead.
 pip install charactermemory[server]
 ```
 
+## Guided setup
+
+Run the wizard from the directory where you intend to start the server:
+
+```bash
+charactermemory-server-setup
+charactermemory-server
+```
+
+The wizard creates or updates `.env` in that directory. It configures:
+
+- LLM and embeddings base URLs (normally ending in `/v1`), models, and API keys.
+  Embeddings can share the LLM key or use `OPENAI_EMBEDDINGS_API_KEY`.
+- SQLite storage, or an existing PostgreSQL database via `CM_DATABASE_URL`.
+  PostgreSQL can use local FAISS/BM25 indexes or PostgreSQL search with
+  pgvector >= 0.8 installed in the database's `public` schema.
+- Character and saved-data directories, bind host/port, and optional server
+  authentication. The server key is separate from your provider API keys.
+
+Enter keeps a default. Credentials use hidden input; existing secrets can be
+kept, changed, or cleared, and a server key can be generated. The summary hides
+credentials, including database URLs. Generated keys are available in the
+saved `.env`. Saving uses an atomic replacement with owner-only permissions on
+POSIX; Ctrl-C or declining the save leaves your existing file intact. Rerunning
+the command preserves unrelated settings and comments.
+
+Connection tests are optional and skipped by default. Enabling them sends one
+small chat request and one embedding request, which may incur provider usage,
+plus read-only PostgreSQL queries when selected. Failures allow retrying,
+revising the configuration, or saving anyway. Tests do not create schemas or
+install extensions. They check the draft settings; a character's YAML may
+override those settings when the server starts.
+
+The wizard does not install dependencies, provision services, migrate existing
+data, create character folders, or start the server. Missing extras are reported
+with installation commands (PostgreSQL needs `pip install 'charactermemory[postgres]'`).
+Create characters in the GUI after startup, or put existing character folders
+under `CM_ASSETS_DIR`. The server creates saved-data directories when needed.
+
+Exported environment variables override `.env`; explicit server flags override
+`CM_HOST` and `CM_PORT`. Per-character `config.yaml` overrides the corresponding
+library defaults. Relative paths resolve from the server's working directory.
+Database namespaces are left automatic per character unless already configured.
+
 ## Run
 
 ```bash
@@ -42,9 +86,10 @@ listed below and also work when launching through uvicorn directly):
 
 | Flag                     | Default     | Purpose                                            |
 |--------------------------|-------------|----------------------------------------------------|
-| `--host HOST`            | `0.0.0.0`   | Bind host.                                         |
-| `--port PORT`            | `8000`      | Bind port.                                         |
+| `--host HOST`            | `CM_HOST` or `0.0.0.0` | Bind host.                                 |
+| `--port PORT`            | `CM_PORT` or `8000` | Bind port.                                    |
 | `--reload` / `--no-reload` | on        | Toggle uvicorn auto-reload.                        |
+| `--meter`                | off       | Print HTTP request and per-memory retrieval times. |
 | `--rebuild-kg [NAME…]`   | _unset_     | Rebuild a character's KG at startup (see below).   |
 | `--api-key KEY`          | _unset_     | Require this API key on every endpoint (see below).|
 
@@ -58,6 +103,13 @@ the rest of the library uses):
 | `OPENAI_MODEL`     | `gpt-5.4-mini`     | Model used for extraction.                               |
 | `OPENAI_EMBEDDINGS_BASE_URL` | OpenAI API | Embeddings endpoint.                             |
 | `OPENAI_EMBEDDINGS_MODEL`    | `text-embedding-ada-002` | Embeddings model.                         |
+| `OPENAI_EMBEDDINGS_API_KEY` | `OPENAI_API_KEY` | Separate embeddings credential; explicitly empty disables key sharing. |
+| `CM_STORAGE_BACKEND` | `sqlite` | `sqlite` or `postgres`. |
+| `CM_DATABASE_URL` | _empty_ | Connection URL for an existing PostgreSQL database. |
+| `CM_RETRIEVAL_BACKEND` | `hybrid` | Local FAISS/BM25 (`hybrid`) or PostgreSQL search (`postgres`, requires PostgreSQL storage and pgvector). |
+| `CM_HOST` | `0.0.0.0` | Console command bind host; overridden by `--host`. |
+| `CM_PORT` | `8000` | Console command bind port; overridden by `--port`. |
+| `CM_METER` | off | Set to `1` to print request timings to the console. |
 | `CM_TEMPORAL_RESOLUTION_ENABLED` | `true` | Enable automatic temporal recall.                 |
 | `CM_TEMPORAL_RESOLUTION_ENGINE` | `dateparser` | Local fast engine; set `llm` to opt into one model call. |
 | `CM_TEMPORAL_RESOLUTION_TIMEZONE` | `UTC` | IANA timezone for “yesterday”/calendar boundaries. |
@@ -71,6 +123,32 @@ the rest of the library uses):
 
 Both `CM_ASSETS_DIR` and `CM_SAVE_DIR` are relative to the **current working
 directory** (the server has no notion of a repo root once installed).
+`CM_HOST` and `CM_PORT` apply to `charactermemory-server`; when running uvicorn
+directly, use uvicorn's own host/port options.
+
+Run `charactermemory-server --meter` to print a line such as
+`[meter] POST /context 200 123.45 ms` for each completed HTTP request,
+including MCP and admin calls. Timings include the full streamed response and
+any in-process response background tasks; open event streams are logged when
+they close. Failed requests are logged too. Query strings are omitted.
+Metering works with both `--reload` and `--no-reload`.
+
+Context building also prints one line per memory retrieved, for example
+`[meter] POST /context character='Kurisu' memory='user_facts' 12.34 ms`.
+This measures each memory's recall and initial formatting, including all
+participants in a group chat. Empty results and failed retrievals are timed;
+disabled memories and retrievals skipped by a zero global budget are omitted.
+Shared temporal query resolution, global reranking, and final context assembly
+are included only in the overall request time. These per-memory lines apply to
+context building, including context previews and answer generation.
+
+Memory lines can carry a nested phase breakdown in brackets, e.g.
+`[meter] POST /context character='Kurisu' memory='knowledge_graph' 908.96 ms [activation=108.2ms embed=700.1ms]`.
+`embed` is wall time spent inside embedding-endpoint HTTP calls (nested
+inside the recall), `activation` the knowledge graph's spreading/BLL
+computation; the unlisted remainder is lexical/dense search CPU, rendering
+and budget selection. A line whose total is dominated by `embed` points at
+the embedding endpoint, not at the retriever.
 
 Per-character `config.yaml` can override the same feature under
 `temporal_resolution:`. The server enables the local `dateparser` engine by
@@ -205,12 +283,39 @@ user.
 
 **Request body**
 
-| Field       | Type     | Required | Notes                                                        |
-|-------------|----------|----------|--------------------------------------------------------------|
-| `character` | string   | yes      | A subfolder of `assets/` (e.g. `"Kurisu"`).                  |
-| `user`      | string   | yes      | The user this chat belongs to.                               |
-| `message`   | string   | yes      | The user's latest message.                                   |
-| `chat_id`   | string   | no       | Existing chat id. If absent or unknown, a new chat is created. |
+| Field          | Type             | Required | Notes                                                        |
+|----------------|------------------|----------|--------------------------------------------------------------|
+| `character`    | string           | yes      | A subfolder of `assets/` (e.g. `"Kurisu"`).                  |
+| `user`         | string           | yes      | The user this chat belongs to.                               |
+| `message`      | string           | yes      | The user's latest message.                                   |
+| `chat_id`      | string           | no       | Existing chat id. If absent or unknown, a new chat is created. |
+| `budget`       | integer or null  | no       | Global memory token cap. Omit to inherit configuration; `null` removes the cap; `0` omits memories. |
+| `memory_types` | list[str] or null| no       | Specific memory names to recall (e.g. `["user_facts", "episodic"]`). Omitted memories bypass recall to save latency. `memories` is accepted as an alias. |
+
+For example, this request selects whole memory items within 3000 tokens:
+
+```json
+{"character": "Kurisu", "user": "francesco", "message": "What did we discuss about robotics?", "budget": 3000}
+```
+
+Or to retrieve only specified memory types to save latency:
+
+```json
+{"character": "Kurisu", "user": "francesco", "message": "What did we discuss about robotics?", "memory_types": ["user_facts", "episodic"]}
+```
+
+The budget includes rendered memory headers, timestamps, speaker labels and
+separators. Intermediate `prompt:<id>` blocks are excluded. Existing per-memory
+retrieval limits still determine the candidates, and the override applies only
+to this request. Negative values, booleans, strings and floating-point numbers
+return HTTP `422` before a chat or message is written. The Python HTTP client
+also accepts `client.context(..., budget=3000, memory_types=["user_facts"])` (and its `get_context` alias).
+
+The server uses its configured/default reranker and tokenizer; these are
+Python injections, not JSON request fields. See the
+[memory budget guide](../../docs/memory_budget.md) for selection and token
+counting details. The HTTP response shape is unchanged: token usage fields
+are currently available only on the library's `ContextSnapshot`.
 
 **Response** `200` — `ContextResponse`
 ```json
@@ -335,7 +440,8 @@ curl -X POST http://localhost:8000/context \
   -d '{
         "character": "Kurisu",
         "user": "michael",
-        "message": "Hi, I am Michael, the new lab assistant."
+        "message": "Hi, I am Michael, the new lab assistant.",
+        "budget": 3000
       }'
 # -> {"chat_id": "9b3f1c2a...", "context": {...}}
 
@@ -361,7 +467,7 @@ chat_id = None
 
 def turn(message: str) -> str:
     global chat_id
-    body = {"character": "Kurisu", "user": "michael", "message": message}
+    body = {"character": "Kurisu", "user": "michael", "message": message, "budget": 3000}
     if chat_id:
         body["chat_id"] = chat_id
     ctx = requests.post(f"{base}/context", json=body).json()

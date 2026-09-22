@@ -1,4 +1,4 @@
-/* Character Memory Browser.
+/* CharacterMemory browser.
  *
  * Talks to three JSON endpoints on the API server:
  *   GET /                              -> { characters: [...] }
@@ -107,7 +107,7 @@ const icon = (name, cls = "") => {
   }
   if (!icon._warned) {
     icon._warned = true;
-    console.warn("[Mnemosyne] Lucide is not loaded — icons render as empty placeholders. " +
+    console.warn("[CharacterMemory] Lucide is not loaded — icons render as empty placeholders. " +
       "Check that /gui/static/vendor/lucide.min.js is served, then hard-reload (Ctrl+Shift+R).");
   }
   return el("i", { class: classes, "aria-hidden": "true" });
@@ -134,7 +134,7 @@ function applyTheme(theme, { persist = true } = {}) {
     toggle.setAttribute("aria-label", `Dark theme ${toggle.checked ? "on" : "off"}`);
   }
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.content = next === "dark" ? "#19162b" : "#fff8e8";
+  if (meta) meta.content = next === "dark" ? "#380b5b" : "#e3cefb";
   if (persist) {
     try { localStorage.setItem(THEME_KEY, next); } catch (error) { /* storage may be disabled */ }
   }
@@ -965,7 +965,7 @@ function renderSkeletons() {
 function renderEmpty(title, sub) {
   clear($("records"));
   $("records").appendChild(el("div", { class: "empty" }, [
-    el("div", { class: "big" }, icon("inbox")),
+    el("div", { class: "big" }, el("span", { class: "brand-mascot", "aria-hidden": "true" })),
     el("div", {}, title),
     sub ? el("div", { class: "text" }, sub) : null,
   ]));
@@ -1262,7 +1262,7 @@ function onSearchInput() {
 // "particles" flowing along edges, a continuously settling physics sim, and
 // pan / zoom / node-drag with neighbour highlighting on hover.
 // Names resolve through the theme's CSS custom properties.  Keeping the canvas
-// palette here as tokens lets the light/dark clubhouse themes stay in charge.
+// palette here as tokens lets the light/dark CharacterMemory themes stay in charge.
 const GRAPH_KIND_COLOR = {
   self: "graph-node-self", person: "graph-node-person", fact: "graph-node-fact",
   episode: "graph-node-episode", entity: "graph-node-entity",
@@ -3214,6 +3214,9 @@ async function init() {
 window.cmUtil = { $, el, clear, icon, setButtonContent, getJSON, markdown, esc, authHeaders, authQuery };
 
 function setTab(name, { history = true } = {}) {
+  const viewTitle = LIVE_GRAPH_EMBED ? "Knowledge graph"
+    : ({ browse: "Memories", configure: "Character studio", live: "Live recall" }[name] || "Memories");
+  document.title = `CharacterMemory — ${viewTitle}`;
   const browse = name === "browse";
   const configure = name === "configure";
   const live = name === "live";

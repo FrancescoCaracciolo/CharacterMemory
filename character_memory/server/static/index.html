@@ -3,8 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-  <meta name="theme-color" content="#fff8e8">
-  <title>Mnemosyne — Character Memory</title>
+  <meta name="theme-color" content="#e3cefb">
+  <title>CharacterMemory — Memories</title>
+  <meta name="application-name" content="CharacterMemory">
+  <meta name="description" content="Explore character memories, configure characters, and follow live recall in CharacterMemory.">
+  <link rel="icon" type="image/svg+xml" href="/gui/static/assets/favicon.svg">
   <script>
     (() => {
       const isEmbed = location.pathname.replace(/\/+$/, "") === "/gui/embed/knowledge-graph";
@@ -29,7 +32,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=mobile-2">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=cm-brand-1">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -38,11 +41,11 @@
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <span class="logo" aria-hidden="true">M<i data-lucide="sparkle" class="icon logo-sparkle"></i></span>
-        <span class="brand-copy"><b>Mnemosyne</b><small>character memory clubhouse</small></span>
+        <img class="brand-wordmark brand-wordmark-light" src="/gui/static/assets/wordmark-light.svg" alt="CharacterMemory" width="205" height="61">
+        <img class="brand-wordmark brand-wordmark-dark" src="/gui/static/assets/wordmark-dark.svg" alt="CharacterMemory" width="205" height="61">
       </div>
       <nav class="tabbar" role="tablist" aria-label="View">
-        <button id="tab-browse" class="tab active" role="tab" aria-selected="true"><span>01</span> Memory shelf</button>
+        <button id="tab-browse" class="tab active" role="tab" aria-selected="true"><span>01</span> Memories</button>
         <button id="tab-configure" class="tab" role="tab" aria-selected="false"><span>02</span> Character studio</button>
         <button id="tab-live" class="tab" role="tab" aria-selected="false"><span>03</span> Live recall</button>
       </nav>
@@ -72,7 +75,7 @@
           <i data-lucide="layers-3" class="icon"></i><span id="memory-picker-label">Choose memory</span><i data-lucide="chevron-down" class="icon picker-chevron"></i>
         </button>
         <div id="memory-picker-body" class="memory-picker-body">
-        <div class="side-label"><span><i data-lucide="sparkle" class="icon side-label-ico"></i>Memory drawers</span><span id="memory-total">—</span></div>
+        <div class="side-label"><span><i data-lucide="sparkle" class="icon side-label-ico"></i>Memory systems</span><span id="memory-total">—</span></div>
         <div class="side-head">
           <input id="memory-filter" class="filter-input" placeholder="Filter memories…" autocomplete="off">
         </div>
@@ -238,7 +241,7 @@
           <div class="live-panel-label"><span>Recent requests</span><span id="live-history-count">0 / 25</span></div>
           <div id="live-timeline" class="live-timeline" aria-label="Recent context requests"></div>
           <div id="live-timeline-empty" class="live-empty live-timeline-empty">
-            <span class="live-empty-mark"><i data-lucide="radar" class="icon"></i></span>
+            <span class="live-empty-mark"><span class="brand-mascot" aria-hidden="true"></span></span>
             <span>Waiting for a <code>POST /context</code> request…</span>
           </div>
         </aside>
@@ -246,7 +249,7 @@
           <div id="live-request" class="live-request hidden"></div>
           <div id="live-recalls" class="live-recalls"></div>
           <div id="live-empty" class="live-empty hidden">
-            <span class="live-empty-mark"><i data-lucide="radar" class="icon"></i></span>
+            <span class="live-empty-mark"><span class="brand-mascot" aria-hidden="true"></span></span>
             <strong>No context request yet</strong>
             <span>Keep this tab open while your client chats with the character.</span>
           </div>
@@ -368,7 +371,7 @@
       </aside>
 
       <section id="cfg-empty" class="cfg-empty">
-        <div class="cfg-empty-big"><i data-lucide="sparkles" class="icon"></i></div>
+        <div class="cfg-empty-big"><span class="brand-mascot" aria-hidden="true"></span></div>
         <div class="cfg-empty-text">Select a character — or tap <b>+ New</b> to build one.</div>
       </section>
 
@@ -627,7 +630,7 @@
     </div>
   </div>
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
-    onerror="console.error('[Mnemosyne] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
+    onerror="console.error('[CharacterMemory] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
   <script src="/gui/static/app.js?v=mobile-2"></script>
   <script src="/gui/static/config.js?v=k-zero-1"></script>
 </body>
