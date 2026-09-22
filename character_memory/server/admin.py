@@ -22,6 +22,7 @@ frontend via ``GET /api/jobs/{job_id}``.
 from __future__ import annotations
 
 import os
+import math
 import re
 import shutil
 import sqlite3
@@ -30,6 +31,7 @@ import time
 import uuid
 import warnings
 from contextlib import closing
+from dataclasses import asdict
 from typing import Any, Optional
 
 import yaml
@@ -57,6 +59,7 @@ from character_memory.character_config import (
     save_config,
 )
 from character_memory.manifest import MEMORY_NAMES
+from character_memory.config import DedupConfig
 from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX
 from .sync import MemorySync
 
@@ -152,6 +155,45 @@ class ConfigMemoryPatch(BaseModel):
     # Allow arbitrary enabled_<name> / <name>_k fields and the KG token budget
     # without modelling each one.
     model_config = {"extra": "allow"}
+
+
+def _patch_dedup(current: DedupConfig, patch: Any) -> DedupConfig:
+    """Validate a partial GUI patch without resetting unsubmitted settings."""
+    values = asdict(current)
+    defaults = asdict(DedupConfig())
+    if not isinstance(patch, dict):
+        raise HTTPException(422, "memory.dedup must be an object")
+    for key, value in patch.items():
+        error = None
+        if key not in defaults:
+            error = "unknown setting"
+        elif key == "decision_provider":
+            if value not in (None, "typesafe", "openrouter", "llm"):
+                error = "must be null, typesafe, openrouter, or llm"
+        elif key == "decision_model":
+            if value is not None and not isinstance(value, str):
+                error = "must be a string or null"
+            elif isinstance(value, str):
+                value = value.strip() or None
+        elif key == "similarity_threshold" and value is None:
+            pass
+        elif isinstance(defaults[key], bool):
+            if not isinstance(value, bool):
+                error = "must be a boolean"
+        elif isinstance(defaults[key], int):
+            if type(value) is not int or value < 1:
+                error = "must be a positive integer"
+        elif type(value) not in (int, float) or not math.isfinite(value):
+            error = "must be a finite number"
+        elif key == "decision_timeout":
+            if value <= 0:
+                error = "must be positive"
+        elif not 0 <= value <= 1:
+            error = "must be between 0 and 1"
+        if error:
+            raise HTTPException(422, f"memory.dedup.{key}: {error}")
+        values[key] = value
+    return DedupConfig(**values)
 
 
 class ConfigPatch(BaseModel):
@@ -644,6 +686,7 @@ def build_admin_router(
             if hasattr(mem, f"{m}_k"):
                 memory_view[f"{m}_k"] = getattr(mem, f"{m}_k")
         memory_view["knowledge_graph_token_budget"] = mem.knowledge_graph_token_budget
+        memory_view["dedup"] = asdict(mem.dedup)
         marker = os.path.join(_char_dir(name), ".knowledge_graph")
         return {
             "name": name,
@@ -714,7 +757,9 @@ def build_admin_router(
             mem = cfg.memory
             enabled_now: list[str] = []
             for key, val in patch.memory.items():
-                if key.startswith("enabled_") and key[len("enabled_"):] in MEMORY_NAMES:
+                if key == "dedup":
+                    mem.dedup = _patch_dedup(mem.dedup, val)
+                elif key.startswith("enabled_") and key[len("enabled_"):] in MEMORY_NAMES:
                     setattr(mem, key, bool(val))
                     if bool(val):
                         enabled_now.append(key[len("enabled_"):])

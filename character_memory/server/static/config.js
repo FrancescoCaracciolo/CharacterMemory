@@ -53,6 +53,25 @@ const SECTION_TITLES = Object.fromEntries([
 ]);
 const INTERMEDIATE_PROMPT_PREFIX = "prompt:";
 
+const DEDUP_FIELDS = [
+  { key: "enabled", label: "Enable deduplication", type: "checkbox" },
+  { key: "exact", label: "Exact matching", type: "checkbox", hint: "Ignore case and surrounding whitespace." },
+  { key: "similarity_threshold", label: "Similarity threshold", type: "number", nullable: true, hint: "Leave blank to disable similarity matching." },
+  { key: "llm_judge", label: "LLM judge", type: "checkbox", hint: "Confirm similarity candidates with the configured LLM." },
+  { key: "consolidate", label: "Consolidate duplicates", type: "checkbox", hint: "Use the LLM to merge duplicates instead of dropping the newer entry." },
+  { key: "per_user", label: "Compare within each user", type: "checkbox" },
+  { key: "candidate_pool", label: "Similarity candidate pool", type: "number", min: 1, step: 1 },
+  { key: "decision_provider", label: "Decision provider", type: "select", hint: "Native providers use TYPESAFE_API_KEY or OPENROUTER_API_KEY from the server environment." },
+  { key: "decision_model", label: "Decision model", type: "text", hint: "Blank uses the provider default. The LLM adapter uses the already configured LLM." },
+  { key: "decision_timeout", label: "Decision timeout (seconds)", type: "number", min: 0.001, step: "any", hint: "Applies to native decision providers." },
+  { key: "decision_candidate_pool", label: "Decision candidate pool", type: "number", min: 1, step: 1 },
+  { key: "decision_max_request_bytes", label: "Maximum decision request (bytes)", type: "number", min: 1, step: 1 },
+  { key: "duplicate_probability", label: "Duplicate probability", type: "number" },
+  { key: "correction_probability", label: "Correction probability", type: "number" },
+  { key: "decision_margin", label: "Decision confidence margin", type: "number" },
+  { key: "decision_llm_fallback", label: "LLM fallback", type: "checkbox", hint: "Fall back to the legacy LLM path when the decision is inconclusive or unavailable." },
+];
+
 const WORLD_FEATURES = ["locations", "activities", "routines", "hunger", "energy", "sleep", "autonomous_needs"];
 const WORLD_ACTIVITY_KINDS = ["idle", "work", "school", "travel", "eat", "sleep", "leisure", "social", "other"];
 const WORLD_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -826,6 +845,7 @@ function renderConfig() {
   const cfg = cfgState.config;
   $("cfg-persona").value = cfg.persona || "";
   renderMemoryList(cfg.memory || {});
+  renderDedup(cfg.memory?.dedup || {});
   $("cfg-kg").checked = !!cfg.kg_enabled;
   $("cfg-kg-token-budget").disabled = !cfg.kg_enabled;
   $("cfg-kg-token-budget").value = String(
@@ -871,6 +891,66 @@ function renderMemoryList(mem) {
       ]) : null,
     ]));
   }
+}
+
+function renderDedup(config) {
+  const box = $("cfg-dedup-fields"); clear(box);
+  for (const field of DEDUP_FIELDS) {
+    const id = `cfg-dedup-${field.key}`;
+    const input = el(field.type === "select" ? "select" : "input", {
+      id, type: field.type === "select" ? null : field.type,
+      class: field.type === "checkbox" ? "switch-input inline" : "cfg-dedup-input",
+      "data-dedup": field.key,
+    });
+    if (field.type === "select") {
+      for (const [value, label] of [["", "None · legacy deduplication"], ["typesafe", "TypeSafe"], ["openrouter", "OpenRouter"], ["llm", "Configured LLM adapter"]]) {
+        input.appendChild(el("option", { value }, label));
+      }
+    }
+    if (field.type === "checkbox") input.checked = !!config[field.key];
+    else input.value = config[field.key] ?? "";
+    if (field.type === "number") {
+      input.min = field.min ?? 0;
+      if (field.min == null) input.max = 1;
+      input.step = field.step ?? "any";
+      input.required = !field.nullable;
+    }
+    input.addEventListener("input", dirtyMemory);
+    input.addEventListener("change", () => { refreshDedupControls(); dirtyMemory(); });
+    box.appendChild(el("div", { class: "cfg-dedup-field" }, [
+      el("label", { for: id }, field.label), input,
+      field.hint ? el("small", { class: "cfg-hint" }, field.hint) : null,
+    ]));
+  }
+  refreshDedupControls();
+}
+
+function refreshDedupControls() {
+  const enabled = $("cfg-dedup-enabled").checked;
+  const provider = $("cfg-dedup-decision_provider").value;
+  for (const field of DEDUP_FIELDS) {
+    const input = $(`cfg-dedup-${field.key}`);
+    const needsProvider = field.key.startsWith("decision_") && field.key !== "decision_provider"
+      || ["duplicate_probability", "correction_probability"].includes(field.key);
+    input.disabled = field.key !== "enabled" && (!enabled || (needsProvider && !provider));
+    if (provider === "llm" && ["decision_model", "decision_timeout"].includes(field.key)) input.disabled = true;
+  }
+  $("cfg-dedup-decision_model").placeholder = provider === "typesafe" ? "jev-latest"
+    : provider === "openrouter" ? "typesafe/jev-1.13" : "Configured LLM";
+}
+
+function gatherDedup() {
+  const config = {};
+  for (const field of DEDUP_FIELDS) {
+    const input = $(`cfg-dedup-${field.key}`);
+    // Keep inactive settings intact for when the feature is enabled again.
+    if (input.disabled) continue;
+    if (!input.reportValidity()) throw new Error(`Check deduplication: ${field.label}.`);
+    config[field.key] = field.type === "checkbox" ? input.checked
+      : input.value.trim() === "" ? null
+      : field.type === "number" ? Number(input.value) : input.value.trim();
+  }
+  return config;
 }
 
 function sectionEnabled(name) {
@@ -1054,7 +1134,7 @@ function dirtyMemory() {
 }
 
 function gatherConfig() {
-  const mem = {};
+  const mem = { dedup: gatherDedup() };
   for (const m of MEMORIES) {
     const tog = document.querySelector(`.switch-input[data-mem="${m.name}"]`);
     if (tog) mem[`enabled_${m.name}`] = tog.checked;

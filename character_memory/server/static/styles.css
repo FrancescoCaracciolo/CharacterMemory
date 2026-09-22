@@ -1753,6 +1753,14 @@ select option { background: var(--input); color: var(--text); }
 .world-element-body { padding: 0 11px 12px; border-top: 1.5px dashed color-mix(in srgb, var(--outline) 65%, transparent); }
 .world-element-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 43px; }
 .world-element-tools .btn { border-width: 1.5px; border-radius: 8px; }
+.cfg-dedup-panel { margin-top: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 9px; }
+.cfg-dedup-panel > summary { cursor: pointer; }
+.cfg-dedup-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 16px; margin-top: 14px; }
+.cfg-dedup-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.cfg-dedup-field > label { font: 600 12px var(--sans); color: var(--text-dim); }
+.cfg-dedup-input { width: 100%; min-width: 0; padding: 8px 9px; color: var(--text); background: var(--input); border: 1px solid var(--outline); border-radius: 7px; font: 12px var(--sans); }
+.cfg-dedup-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cfg-dedup-input:disabled { opacity: .5; }
 .world-element-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px; }
 .world-field { display: flex; flex-direction: column; min-width: 0; gap: 5px; }
 .world-field.wide { grid-column: 1 / -1; }
