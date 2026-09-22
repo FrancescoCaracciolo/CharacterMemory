@@ -35,6 +35,7 @@ from typing import Any, Optional
 import numpy as np
 
 from ..config import ContradictionPolicy, DedupConfig
+from ..decisions import DecisionClient
 from ..llm.base import LLMClient
 from ..llm.embedding_base import EmbeddingProvider
 from ..prompts import PromptConfig
@@ -84,6 +85,12 @@ class DedupReport:
     resolved: int = 0         # contradictions: older text overwritten by newer
     removed_ids: list[int] = field(default_factory=list)
     updated_ids: list[int] = field(default_factory=list)
+    decisions: list[dict[str, Any]] = field(default_factory=list)
+    unresolved: int = 0
+    model_calls: int = 0
+    fallback_calls: int = 0
+    cache_hits: int = 0
+    dry_run: bool = False
 
 
 class Deduplicator:
@@ -106,10 +113,18 @@ class Deduplicator:
         llm: Optional[LLMClient] = None,
         config: Optional[DedupConfig] = None,
         prompts: Optional[PromptConfig] = None,
+        *,
+        decision_client: Optional[DecisionClient] = None,
     ) -> None:
         self.embedder = embedder
         self.llm = llm
         self.config = config or DedupConfig()
+        from ..decisions.clients import configured_client
+        self.decision_client = decision_client if decision_client is not None else configured_client(self.config, llm)
+        if self.config.decision_candidate_pool < 1 or self.config.decision_max_request_bytes < 1:
+            raise ValueError('Decision candidate pool and request budget must be positive')
+        if any(not 0 <= v <= 1 for v in (self.config.duplicate_probability, self.config.correction_probability, self.config.decision_margin)):
+            raise ValueError('Decision thresholds must be between zero and one')
         prompts = prompts or PromptConfig()
         self.judge_prompt = prompts.dedup_judge
         self.consolidate_prompt = prompts.dedup_consolidate
@@ -400,6 +415,10 @@ class Deduplicator:
         deleted (consolidation off). Index removals and survivor updates are
         applied incrementally at the end.
         """
+        if self.decision_client is not None:
+            from .reconciliation import ReconciliationPass
+            return ReconciliationPass(self, memory, DedupReport(), False, include_added=True).run(
+                memory.all_rows(), {int(item.metadata['id']) for item in items if item.metadata.get('id') is not None})
         report = DedupReport(checked=len(items))
         if not items:
             return report
@@ -425,7 +444,7 @@ class Deduplicator:
             text = str(current.get(text_col, ""))
             # Compare against all surviving rows; exclude_ids keeps the RAG
             # search from matching this item against itself in the index.
-            all_rows = list(rows_by_id.values())
+            all_rows = [r for r in rows_by_id.values() if r.get("user_id") == current.get("user_id")]
             dup_row, merged_text, reason = self._find_duplicate(
                 memory, text, user_id, all_rows,
                 exclude_ids={row_id},
@@ -466,6 +485,8 @@ class Deduplicator:
         self,
         memory: StructuredMemory,
         user_id: Optional[str] = None,
+        *,
+        dry_run: bool = False,
     ) -> DedupReport:
         """Compact a whole memory in place, merging/dropping duplicates.
 
@@ -474,8 +495,15 @@ class Deduplicator:
         otherwise all rows are compared together. Index deltas are applied once
         at the end.
         """
+        if self.decision_client is not None:
+            from .reconciliation import ReconciliationPass
+            rows = memory.all_rows(user_id)
+            return ReconciliationPass(self, memory, DedupReport(dry_run=dry_run), dry_run).run(
+                rows, {int(r['id']) for r in rows})
+        if dry_run:
+            memory = _PreviewMemory(memory)
         cfg = self.config
-        report = DedupReport()
+        report = DedupReport(dry_run=dry_run)
         if user_id is not None:
             groups: list[Optional[str]] = [user_id]
         else:
@@ -622,3 +650,25 @@ class Deduplicator:
                 continue
 
             survivors.append((row, vec))
+
+
+class _PreviewMemory:
+    """An isolated row overlay for previewing the legacy algorithm."""
+    def __init__(self, memory):
+        self.memory = memory
+        self.rows = {r['id']: dict(r) for r in memory.all_rows()}
+
+    def __getattr__(self, name):
+        return getattr(self.memory, name)
+
+    def all_rows(self, user_id=None):
+        return [dict(r) for r in self.rows.values() if user_id is None or r.get('user_id') == user_id]
+
+    def update_row(self, row):
+        self.rows[row['id']] = dict(row)
+
+    def delete_row(self, row_id):
+        self.rows.pop(row_id, None)
+
+    def apply_index_changes(self, **kwargs):
+        pass

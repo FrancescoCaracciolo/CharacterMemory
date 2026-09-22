@@ -700,6 +700,9 @@ class KnowledgeGraphRetriever:
                 self._remove_by_source(mem_name, rid)
             for rid in rep.updated_ids or []:
                 self._refresh_by_source(mem_name, rid)
+        if any(rep.updated_ids for rep in report.values()):
+            # Refresh writes stored nodes in place; invalidate numeric/visibility caches.
+            self.graph.bump_version()
         self._temporal_interval_cache.clear()
         if sync_index and any(
             rep.removed_ids or rep.updated_ids for rep in report.values()
@@ -751,10 +754,21 @@ class KnowledgeGraphRetriever:
         if not rows:
             return
         row = rows[0]
+        if not any(node.source == tag for node in self.graph.nodes.values()):
+            # A crash can commit reconciliation before the first graph snapshot
+            # containing the survivor. Recreate its typed source node without an LLM.
+            if isinstance(src, UserFactMemory):
+                ingest_facts(self.graph, src, rows=[row])
+            elif isinstance(src, EpisodicMemory):
+                ingest_episodes(self.graph, src, rows=[row])
+            elif isinstance(src, UserSummaryMemory):
+                ingest_summaries(self.graph, src)
         for node in list(self.graph.nodes.values()):
             if node.source != tag or not isinstance(node, Node):
                 continue
             # Refresh text + carried fields from the source row.
+            if hasattr(node, 'chat_id'):
+                node.chat_id = row.get('chat_id')
             try:
                 node.text = src.row_text(row)
             except Exception:
@@ -764,18 +778,20 @@ class KnowledgeGraphRetriever:
                 if owner:
                     self.graph.mark_user_scope(node, owner)
                 node.content = str(row.get("content") or getattr(node, "content", ""))  # type: ignore[attr-defined]
-                node.confidence = float(row.get("confidence") or 0.5)  # type: ignore[attr-defined]
-                node.importance = float(row.get("importance") or 0.5)  # type: ignore[attr-defined]
+                node.type = str(row.get("type") or "general")
+                node.confidence = float(row.get("confidence", 0.5))  # type: ignore[attr-defined]
+                node.importance = float(row.get("importance", 0.5))  # type: ignore[attr-defined]
             elif mem_name == "episodic":
                 owner = str(row.get("user_id") or "")
                 if owner:
                     self.graph.mark_user_scope(node, owner)
                 node.summary = str(row.get("summary") or getattr(node, "summary", ""))  # type: ignore[attr-defined]
+                node.timestamp = float(row.get("occurred_at") or row.get("created_at") or node.created_at)
                 node.emotional_shift = decode_emotion_vector(  # type: ignore[attr-defined]
                     row.get("emotional_shift", "{}"),
                     allowed_axes=getattr(src, "emotion_baseline", None),
                 )
-                node.importance = float(row.get("importance") or 0.5)  # type: ignore[attr-defined]
+                node.importance = float(row.get("importance", 0.5))  # type: ignore[attr-defined]
                 for edge in self.graph.edges.values():
                     if isinstance(edge, EpisodeEdge) and edge.dst == node.id:
                         edge.emotional_shift = dict(node.emotional_shift)  # type: ignore[attr-defined]

@@ -1,4 +1,4 @@
-"""Admin API: create / configure / delete characters and chat with them.
+"""Admin API: create / copy / configure / delete characters and chat with them.
 
 This is the write-side companion to :mod:`character_memory.server.adapters`
 (read side) and the GUI configurator at ``/gui`` (Configure tab). It backs
@@ -24,10 +24,12 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
 import warnings
+from contextlib import closing
 from typing import Any, Optional
 
 import yaml
@@ -133,6 +135,19 @@ class CreateCharacterRequest(BaseModel):
     name: str = Field(..., description="Character name (becomes the folder name).")
 
 
+class CopyCharacterRequest(BaseModel):
+    name: str = Field(..., description="Name for the copy (becomes the folder name).")
+    copy_memory: bool = Field(
+        default=False,
+        description=(
+            "Also snapshot the save directory (SQLite memory, chats, built "
+            "indexes, knowledge graph) for an exact, immediately-usable clone. "
+            "False copies only persona, config and source files — the copy "
+            "starts from a blank slate."
+        ),
+    )
+
+
 class ConfigMemoryPatch(BaseModel):
     # Allow arbitrary enabled_<name> / <name>_k fields and the KG token budget
     # without modelling each one.
@@ -181,6 +196,101 @@ class WorldAdvanceRequest(BaseModel):
 
 class WorldImportRequest(BaseModel):
     content: str
+
+
+# --------------------------------------------------------------------------- #
+# Character copy helpers.
+# --------------------------------------------------------------------------- #
+# Runtime state that may have leaked into a character directory (the CLI/demo
+# persists under <character>/.cm_data by default). A copy of the *character*
+# must not drag learned memory along with it — memory only travels when the
+# caller explicitly asks for it via ``copy_memory``.
+_RUNTIME_STATE_PATTERNS = shutil.ignore_patterns(
+    "memory.db", "memory.db-wal", "memory.db-shm", ".cm_data", ".cm_data_kg"
+)
+
+
+def _retarget_config(path: str, new_name: str) -> None:
+    """Point a copied ``config.yaml`` at its new character name.
+
+    Line surgery rather than a YAML round-trip, so comments, key order and
+    unknown (forward-compatible) keys survive the copy:
+
+    * the top-level ``name:`` key is replaced (inserted at the top when the
+      source had none);
+    * ``storage.namespace`` is dropped from postgres-backed configs so the
+      copy namespaces by its own save directory — keeping it would make the
+      copy silently share the source's remote memory.
+    """
+    with open(path, encoding="utf-8") as f:
+        lines = f.readlines()
+    try:
+        doc = yaml.safe_load("".join(lines)) or {}
+    except yaml.YAMLError:
+        doc = {}
+    strip_namespace = (
+        isinstance(doc, dict)
+        and isinstance(doc.get("storage"), dict)
+        and doc["storage"].get("backend") == "postgres"
+    )
+    out: list[str] = []
+    renamed = False
+    in_storage = False
+    for line in lines:
+        if re.match(r"^[A-Za-z_]", line):  # top-level key (not a comment/blank)
+            in_storage = line.startswith("storage:")
+            if line.startswith("name:"):
+                out.append(f"name: {new_name}\n")
+                renamed = True
+                continue
+        elif strip_namespace and in_storage and re.match(r"^\s+namespace:", line):
+            continue
+        out.append(line)
+    if not renamed:
+        out.insert(0, f"name: {new_name}\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(out)
+
+
+def _copy_save_state(
+    src_save: str, dst_save: str, *, source_name: str, copy_db: bool = True
+) -> None:
+    """Snapshot a character's save directory (memory.db + built indexes).
+
+    ``memory.db`` goes through sqlite's backup API: the source connection is
+    live (WAL) and a raw file copy could tear. The ``-wal``/``-shm`` sidecar
+    files are never copied — the fresh database builds its own. Index
+    directories (``info_index``, ``kg_index``, …) are copied verbatim; their
+    node metadata carries SQLite row ids, which the backup preserves.
+
+    Guards against a concurrent ``/rebuild`` of the source mid-persist with
+    the same per-character lock (and 2 s budget) the rebuild endpoint uses.
+    """
+    os.makedirs(dst_save, exist_ok=True)
+    lock = _rebuild_lock(source_name)
+    if not lock.acquire(timeout=2):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{source_name!r} is rebuilding; retry the copy once it finishes.",
+        )
+    try:
+        if copy_db and os.path.isfile(os.path.join(src_save, "memory.db")):
+            with (
+                closing(sqlite3.connect(os.path.join(src_save, "memory.db"))) as src,
+                closing(sqlite3.connect(os.path.join(dst_save, "memory.db"))) as dst,
+            ):
+                src.backup(dst)
+        for entry in os.listdir(src_save):
+            if entry == "memory.db" or entry.startswith("memory.db-"):
+                continue
+            src_path = os.path.join(src_save, entry)
+            dst_path = os.path.join(dst_save, entry)
+            if os.path.isdir(src_path):
+                shutil.copytree(src_path, dst_path)
+            elif os.path.isfile(src_path):
+                shutil.copy2(src_path, dst_path)
+    finally:
+        lock.release()
 
 
 # --------------------------------------------------------------------------- #
@@ -399,6 +509,128 @@ def build_admin_router(
         if os.path.isdir(save_dir):
             shutil.rmtree(save_dir)
         return {"ok": True, "deleted": name}
+
+    @router.post("/characters/{name}/copy", status_code=201)
+    def copy_character(name: str, req: CopyCharacterRequest) -> dict:
+        """Duplicate a character under a new name.
+
+        Always copies the character directory — persona, ``config.yaml``,
+        ``Information/`` + ``Dialogues/``, the KG marker, the world seed —
+        minus any runtime state that leaked into it. With
+        ``copy_memory=true`` the save directory is snapshotted too (SQLite
+        memory via the backup API, built indexes verbatim): an exact clone
+        that is immediately usable. Without it the copy starts from a blank
+        slate; its first build re-indexes the copied files and, when the KG
+        marker is present, re-runs graph extraction (an LLM pass), so that
+        build runs as a background job — poll ``GET /api/jobs/{job_id}``.
+
+        Remote (postgres) state is never copied: the copy's ``storage``
+        loses its pinned ``namespace`` and namespaces by its own save
+        directory, i.e. it starts from an empty remote schema.
+        """
+        _require_existing(name)
+        new_name = req.name.strip()
+        _require_name(new_name)
+        if new_name == name:
+            raise HTTPException(
+                status_code=400,
+                detail="The copy must have a different name from the source character.",
+            )
+        if os.path.exists(_char_dir(new_name)) or os.path.isdir(_save_dir(new_name)):
+            raise HTTPException(
+                status_code=409,
+                detail=f"A character named {new_name!r} already exists.",
+            )
+        src_save = _save_dir(name)
+        if req.copy_memory and not os.path.isfile(os.path.join(src_save, "memory.db")):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{name!r} has no built memory to copy.",
+            )
+
+        # Best-effort atomicity: a failure anywhere below removes the
+        # half-written copy so a retry doesn't collide with leftover folders.
+        def _cleanup_partial() -> None:
+            for path in (_char_dir(new_name), _save_dir(new_name)):
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+
+        try:
+            shutil.copytree(
+                _char_dir(name), _char_dir(new_name), ignore=_RUNTIME_STATE_PATTERNS
+            )
+            config_path = config_path_for(_char_dir(new_name))
+            if os.path.isfile(config_path):
+                _retarget_config(config_path, new_name)
+            if req.copy_memory:
+                storage = load_config(_char_dir(name)).config.storage
+                _copy_save_state(
+                    src_save,
+                    _save_dir(new_name),
+                    source_name=name,
+                    copy_db=storage.backend != "postgres",
+                )
+        except HTTPException:
+            _cleanup_partial()
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            _cleanup_partial()
+            raise HTTPException(
+                status_code=500, detail=f"Copy failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if req.copy_memory:
+            # Every index is already on disk, so loading is cheap and the
+            # copy can be registered synchronously — same contract as
+            # create. A load failure here (e.g. the embedding server is
+            # briefly down) doesn't invalidate the on-disk copy, so fall
+            # through to the background job instead of failing: it retries
+            # the load and reports through the poller.
+            try:
+                _reload_agent(new_name)
+                return {**_scan_character(new_name), "job_id": None}
+            except Exception:  # noqa: BLE001 - retried by the job below
+                pass
+
+        # Fresh-memory copy still needs a (possibly expensive) build, so it
+        # runs on the job runner like the /rebuild endpoint.
+        job_id = uuid.uuid4().hex[:16]
+        job = _Job(job_id, new_name)
+        with _JOBS_LOCK:
+            JOBS[job_id] = job
+
+        def _work() -> None:
+            lock = _rebuild_lock(new_name)
+            acquired = lock.acquire(timeout=2)
+            if not acquired:
+                job.state = "error"
+                job.stage = "busy"
+                job.detail = "Another rebuild is already running for this character."
+                job.ended = time.time()
+                return
+            try:
+                job.state = "running"
+                job.stage = "loading"
+                job.progress = 0.1
+                if os.path.isfile(os.path.join(_char_dir(new_name), ".knowledge_graph")):
+                    job.detail = "Building indexes + knowledge graph (LLM extraction; slow)."
+                else:
+                    job.detail = "Building indexes."
+                _reload_agent(new_name)
+                job.state = "done"
+                job.stage = "done"
+                job.progress = 1.0
+                job.detail = "Character copied."
+            except Exception as exc:  # noqa: BLE001 - surface to the poller
+                job.state = "error"
+                job.stage = "failed"
+                job.detail = f"{type(exc).__name__}: {exc}"
+            finally:
+                job.ended = time.time()
+                lock.release()
+
+        threading.Thread(target=_work, daemon=True).start()
+        return {**_scan_character(new_name), "job_id": job_id}
 
     # ----------------------------- config (persona + memories) ----------------------------- #
     @router.get("/characters/{name}/config")

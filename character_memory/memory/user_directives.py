@@ -26,6 +26,7 @@ class UserDirectiveMemory(StructuredMemory):
         "source_message_ids": "TEXT NOT NULL DEFAULT '[]'",
     }
     text_column = "content"
+    supports_state_transitions = True
 
     def add_directive(
         self,
@@ -110,18 +111,16 @@ class UserDirectiveMemory(StructuredMemory):
         for d in value or []:
             content = (d.get("content") or "").strip()
             source_message_ids = d.get("source_message_ids") or []
+            uid = str(d.get("user_id") or user_id)
             if (
                 not content
                 or not source_message_ids
-                or self._has_text(user_id, content, "content")
+                or self._has_text(uid, content, "content")
             ):
                 continue
             keywords = d.get("keywords") or []
             # Multi-user: attribute to the participant the LLM named, else the
             # caller's default user (the chat owner / current speaker).
-            uid = str(d.get("user_id") or user_id)
-            if uid != user_id and self._has_text(uid, content, "content"):
-                continue
             row_id = self.add_directive(
                 uid,
                 content,

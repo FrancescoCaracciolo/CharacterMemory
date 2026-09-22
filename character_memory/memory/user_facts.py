@@ -33,6 +33,7 @@ class UserFactMemory(StructuredMemory):
         "source_message_ids": "TEXT NOT NULL DEFAULT '[]'",
     }
     text_column = "content"
+    supports_state_transitions = True
 
     def add_fact(
         self,
@@ -109,17 +110,15 @@ class UserFactMemory(StructuredMemory):
         for f in value or []:
             content = (f.get("content") or "").strip()
             source_message_ids = f.get("source_message_ids") or []
+            uid = str(f.get("user_id") or user_id)
             if (
                 not content
                 or not source_message_ids
-                or self._has_text(user_id, content, "content")
+                or self._has_text(uid, content, "content")
             ):
                 continue
             # Multi-user: attribute to the participant the LLM named, else the
             # caller's default user (the chat owner / current speaker).
-            uid = str(f.get("user_id") or user_id)
-            if uid != user_id and self._has_text(uid, content, "content"):
-                continue
             row_id = self.add_fact(
                 uid,
                 content,

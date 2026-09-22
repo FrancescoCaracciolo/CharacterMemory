@@ -50,6 +50,8 @@ class StructuredMemory(Memory):
     # now part of every candidate's bounded score instead of an alternate sort.
     rank_by_relevance: bool = False
     supports_temporal_resolution: bool = True
+    # Current-state memories opt in; dated episodes remain independently recallable.
+    supports_state_transitions: bool = False
 
     def __init__(
         self,
@@ -63,6 +65,7 @@ class StructuredMemory(Memory):
         name: Optional[str] = None,
     ) -> None:
         super().__init__(enabled=enabled, name=name)
+        self._reconciliation_index_applied: set[int] = set()
         self.store = store
         self.hybrid = hybrid
         self.half_life = half_life
@@ -102,6 +105,7 @@ class StructuredMemory(Memory):
         return self.hybrid.persist(path)
 
     def load(self, path: str) -> None:
+        self._reconciliation_index_applied.clear()
         return self.hybrid.load(path)
     
     # MAPPING UTILITIES
@@ -541,6 +545,31 @@ class StructuredMemory(Memory):
     def delete_row(self, row_id: int) -> None:
         """Delete a row by id. Does not touch the index."""
         self.store.delete(self.table, {"id": row_id})
+
+    def revisions(self, row_id: int) -> list[dict[str, Any]]:
+        """Previous assertions and evidence, excluded from ordinary recall."""
+        from .revisions import history
+        return history(self, row_id)
+
+    def pending_reconciliations(self) -> list[dict[str, Any]]:
+        from .revisions import pending
+        return pending(self)
+
+    def sync_reconciliation_index(self) -> None:
+        """Replay unapplied durable deltas once per live index instance."""
+        pending = [r for r in self.pending_reconciliations()
+                   if r['id'] not in self._reconciliation_index_applied]
+        if not pending:
+            return
+        self.apply_index_changes(
+            removed_ids={r['removed_id'] for r in pending},
+            updated_ids={r['updated_id'] for r in pending if r['updated_id'] is not None})
+        self._reconciliation_index_applied.update(r['id'] for r in pending)
+
+    def apply_reconciliation(self, existing, incoming, replacement, *, evidence, reason, model) -> bool:
+        """Commit an action only while both source snapshots still match."""
+        from .revisions import apply
+        return apply(self, existing, incoming, replacement, evidence, reason, model)
 
     # Contradiction resolution policy — see character_memory.memory.dedup.
     def contradiction_policy(self) -> ContradictionPolicy:

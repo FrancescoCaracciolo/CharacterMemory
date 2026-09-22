@@ -47,6 +47,7 @@ from .reranking import Budget, UNSET, MemoryReranker, TokenCounter
 from .memory.character_base import CharacterInfoMemory, DialogueStyleMemory
 from .memory.conversation_events import ConversationEventMemory
 from .memory.dedup import Deduplicator, DedupReport
+from .decisions import DecisionClient
 from .memory.emotion import EmotionStatus
 from .memory.episodic import EpisodicMemory
 from .memory.heartbeat import HeartbeatJournal
@@ -154,7 +155,9 @@ class CharacterAgent:
         store: Optional[Store] = None,
         reranker: Optional[MemoryReranker] = None,
         token_counter: Optional[TokenCounter] = None,
+        decision_client: Optional[DecisionClient] = None,
     ) -> None:
+        self.decision_client = decision_client
         self.reranker = reranker
         self.token_counter = token_counter
         self.character_dir = directory
@@ -401,7 +404,7 @@ class CharacterAgent:
         # items each memory reports having added. Its LLM prompts come from the
         # agent's PromptConfig so they are overridable like every other prompt.
         self.deduplicator: Optional[Deduplicator] = (
-            Deduplicator(self.embedder, self.llm, m.dedup, prompts=self.prompts)
+            Deduplicator(self.embedder, self.llm, m.dedup, prompts=self.prompts, decision_client=self.decision_client)
             if m.dedup.enabled
             else None
         )
@@ -712,6 +715,7 @@ class CharacterAgent:
                     on_node_added=on_node_added,
                     on_llm_progress=on_llm_progress,
                 )
+        self._recover_reconciliations()
         self._built = True
         return self
 
@@ -782,18 +786,44 @@ class CharacterAgent:
         )
         return self
 
+    def _pending_reconciliation_reports(self):
+        reports, pending = {}, []
+        for name, mem in self.memories.items():
+            if not isinstance(mem, StructuredMemory):
+                continue
+            rows = mem.pending_reconciliations()
+            if rows:
+                pending.extend(r['id'] for r in rows)
+                reports[name] = DedupReport(
+                    removed_ids=list({r['removed_id'] for r in rows}),
+                    updated_ids=list({r['updated_id'] for r in rows if r['updated_id'] is not None}))
+        return reports, pending
+
+    def _recover_reconciliations(self):
+        _, pending = self._pending_reconciliation_reports()
+        if pending:
+            self.persist_structured()
+
     def persist_structured(self) -> None:
-        """Persist the structured-memory indexes (call after learning)."""
+        """Publish derived indexes and acknowledge durable reconciliation work."""
+        reports, pending = self._pending_reconciliation_reports()
+        for name in reports:
+            self.memories[name].sync_reconciliation_index()
+        kg = self.memories.get(_KG_MEMORY)
+        if isinstance(kg, KnowledgeGraphMemory) and reports:
+            kg.retriever.apply_deduplication(reports, sync_index=False)
         for name in _STRUCTURED_MEMORIES:
             mem = self.memories.get(name)
-            if mem is None:
-                continue
-            mem.persist(os.path.join(self.save_directory, f"{name}_index"))
-        # The knowledge graph changes whenever its source memories change, so
-        # it is persisted alongside them after learning.
-        kg = self.memories.get(_KG_MEMORY)
+            if mem is not None:
+                mem.persist(os.path.join(self.save_directory, f"{name}_index"))
         if isinstance(kg, KnowledgeGraphMemory):
             kg.persist(os.path.join(self.save_directory, "kg_index"))
+        if pending:
+            placeholders = ','.join('?' for _ in pending)
+            self.store.execute(f'DELETE FROM memory_reconciliation_pending WHERE id IN ({placeholders})', pending)
+            for mem in self.memories.values():
+                if isinstance(mem, StructuredMemory):
+                    mem._reconciliation_index_applied.difference_update(pending)
 
     def reconcile_knowledge_graph_sources(self) -> dict[str, dict[str, int]]:
         """Reconcile registered KG projectors and durably publish the result."""
@@ -1653,13 +1683,15 @@ class CharacterAgent:
         # Mirror the dedup mutations into the knowledge graph so stale nodes
         # are removed/refreshed in lockstep with their source rows.
         kg = self.memories.get(_KG_MEMORY)
-        if isinstance(kg, KnowledgeGraphMemory) and reports:
+        if isinstance(kg, KnowledgeGraphMemory) and reports and self.deduplicator.decision_client is None:
             kg.retriever.apply_deduplication(reports, sync_index=False)
 
     def dedup(
         self,
         memory_name: Optional[str] = None,
         user_id: Optional[str] = None,
+        *,
+        dry_run: bool = False,
     ) -> dict[str, DedupReport]:
         """Sweep one or all structured memories for duplicates and compact them.
 
@@ -1667,6 +1699,7 @@ class CharacterAgent:
           memory (``user_facts``, ``user_directives``, ``episodic``, ``heartbeat``,
           ``user_summary``).
         - `user_id`: sweep a single user's rows only.
+        - `dry_run`: report proposed changes without changing rows or indexes.
 
         Returns a ``{memory_name: DedupReport}`` mapping. Uses the agent's
         `Deduplicator` if configured; otherwise uses the `Deduplicator` when dedup is
@@ -1676,14 +1709,21 @@ class CharacterAgent:
         self._require_loaded()
         assert self.embedder is not None
         dedup = self.deduplicator or Deduplicator(
-            self.embedder, self.llm, prompts=self.prompts
+            self.embedder, self.llm,
+            self.config.memory.dedup if self.config else None,
+            prompts=self.prompts, decision_client=self.decision_client
         )
         names = (memory_name,) if memory_name else _DEDUP_MEMORIES
         reports: dict[str, DedupReport] = {}
         for name in names:
             mem = self.memories.get(name)
             if isinstance(mem, StructuredMemory):
-                reports[name] = dedup.sweep(mem, user_id=user_id)
+                reports[name] = dedup.sweep(mem, user_id=user_id, dry_run=dry_run)
+        if not dry_run:
+            kg = self.memories.get(_KG_MEMORY)
+            if isinstance(kg, KnowledgeGraphMemory) and dedup.decision_client is None:
+                kg.retriever.apply_deduplication(reports, sync_index=False)
+            self.persist_structured()
         return reports
 
     def extract(self, target: Optional[Union[Chat, str]] = None) -> None:

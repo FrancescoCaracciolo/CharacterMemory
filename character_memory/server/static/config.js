@@ -3,6 +3,7 @@
  * Talks to the admin endpoints under /api/admin/*:
  *   GET    /api/admin/characters                       -> list
  *   POST   /api/admin/characters                       -> create
+ *   POST   /api/admin/characters/{name}/copy           -> duplicate (async job unless memory is copied)
  *   DELETE /api/admin/characters/{name}                -> delete
  *   GET    /api/admin/characters/{name}/config         -> merged config
  *   PUT    /api/admin/characters/{name}/config         -> save config
@@ -766,6 +767,53 @@ async function deleteCharacter() {
   } catch (e) { showError(e.message); }
 }
 
+// --------------------------------------------------------------- copy / duplicate
+function uniqueCharacterName(base) {
+  const used = new Set(cfgState.characters.map((c) => c.name));
+  if (!used.has(base)) return base;
+  let suffix = 2;
+  while (used.has(`${base} ${suffix}`)) suffix++;
+  return `${base} ${suffix}`;
+}
+
+async function copyCharacter() {
+  if (!cfgState.active) return;
+  const suggested = uniqueCharacterName(`${cfgState.active} copy`);
+  const name = prompt(`Copy "${cfgState.active}" to a new character named:`, suggested);
+  if (!name || !name.trim()) return;
+  const newName = name.trim();
+  const kgNote = cfgState.config && cfgState.config.kg_enabled
+    ? " The knowledge graph will be re-extracted on first build."
+    : "";
+  const keepMemory = confirm(
+    `Also copy learned memory, chats and the knowledge graph?\n\n` +
+    `OK = exact clone.\nCancel = same persona, files and settings, fresh memory.${kgNote}`
+  );
+  const btn = $("cfg-copy");
+  const label = flashLabel(btn);
+  btn.disabled = true; label.textContent = "Copying…";
+  try {
+    const data = await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/copy`, {
+      body: { name: newName, copy_memory: keepMemory },
+    });
+    if (data.job_id) {
+      await pollJob(data.job_id, (snap) => {
+        const pct = Math.round((snap.progress || 0) * 100);
+        label.textContent = `Copying… ${pct}%`;
+      });
+    }
+    flash(btn, "Copied", true);
+    await loadCharacters();
+    await selectCharacter(newName);
+  } catch (e) {
+    showError(e.message); flash(btn, "Failed", false);
+  } finally {
+    btn.disabled = false;
+    label.textContent = "Copy";
+    if (btn.dataset.label) btn.dataset.label = "Copy";
+  }
+}
+
 // --------------------------------------------------------------- config (persona + memories)
 async function loadConfig() {
   try {
@@ -1180,7 +1228,7 @@ async function rebuild() {
       label.textContent = `Rebuilding… ${pct}%`;
       if (status) {
         clear(status);
-        const line = el("div", { class: "build-line" }, `${snap.cfgState} · ${snap.stage}${snap.detail ? " — " + snap.detail : ""}`);
+        const line = el("div", { class: "build-line" }, `${snap.state} · ${snap.stage}${snap.detail ? " — " + snap.detail : ""}`);
         const bar = el("div", { class: "build-bar" }, [el("div", { class: "build-bar-fill", style: `width:${pct}%` })]);
         status.append(bar, line);
       }
@@ -1198,11 +1246,11 @@ async function rebuild() {
   }
 }
 
-// Poll a rebuild job until it reaches a terminal cfgState. `onUpdate` is called
+// Poll a rebuild job until it reaches a terminal state. `onUpdate` is called
 // for every snapshot (including the final one). Throws if the job errored.
 async function pollJob(jobId, onUpdate) {
-  let snap = { cfgState: "pending", stage: "queued", progress: 0, detail: "" };
-  while (snap.cfgState !== "done" && snap.cfgState !== "error") {
+  let snap = { state: "pending", stage: "queued", progress: 0, detail: "" };
+  while (snap.state !== "done" && snap.state !== "error") {
     await new Promise((r) => setTimeout(r, 700));
     let r;
     try {
@@ -1217,7 +1265,7 @@ async function pollJob(jobId, onUpdate) {
     snap = await r.json();
     onUpdate(snap || {});
   }
-  if (snap.cfgState === "error") throw new Error(snap.detail || "Build failed.");
+  if (snap.state === "error") throw new Error(snap.detail || "Build failed.");
   return snap;
 }
 
@@ -1508,6 +1556,7 @@ async function uploadWizBucket(name, bucket, files) {
 function wire() {
   $("cfg-new").addEventListener("click", newCharacter);
   $("cfg-delete").addEventListener("click", deleteCharacter);
+  $("cfg-copy").addEventListener("click", copyCharacter);
 
   $("cfg-save-persona").addEventListener("click", savePersona);
   $("cfg-save-memory").addEventListener("click", saveMemory);

@@ -187,15 +187,23 @@ class PostgresHybridSearch(RAGSystem):
     def refresh(self):
         return bool(self._refresh_callback and self._refresh_callback())
 
-    def search(self, query, k=5, where=None, allowed_ids=None, *, exact=False):
+    def search_snapshot(self, query, k=5, where=None):
+        return self.search(query, k=k, where=where, read_only=True)
+
+    def search(self, query, k=5, where=None, allowed_ids=None, *, exact=False, read_only=False):
         queries = [(q, w) for q, w in as_queries(query) if w > 0]
         if k <= 0 or not queries:
             return []
-        self.refresh()
+        if not read_only:
+            self.refresh()
         vectors = self._vectors([q for q, _ in queries], query=True)
         documents, candidates = {}, []
         with self._lock:
-            state = self._ensure(vectors.shape[1])
+            state = self._state() if read_only else self._ensure(vectors.shape[1])
+            if read_only and (state is None or state['dimension'] != vectors.shape[1]
+                              or state['fingerprint'] != self._fingerprint()
+                              or state['lexical_config'] != self.text_search_config):
+                raise RuntimeError('Read-only search requires a current index generation')
             table = identifier(state['active_table'])
             filters, params = ['metadata @> %s::jsonb'], [json.dumps({key: value for key, value in (where or {}).items() if value is not None})]
             for field, value in (where or {}).items():

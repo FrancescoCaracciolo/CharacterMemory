@@ -297,3 +297,12 @@ __all__ += ["Store", "PostgresStore"]
 from .config import StorageConfig, RetrievalConfig
 from .rag.postgres import PostgresHybridSearch
 __all__ += ["StorageConfig", "RetrievalConfig", "PostgresHybridSearch"]
+
+from .decisions import (
+    DecisionClient, DecisionError, DecisionRequest, DecisionResponse,
+    BooleanQuestion, ChoiceQuestion, ScoreQuestion,
+    BooleanAnswer, ChoiceAnswer, ScoreAnswer, ProbabilityOrigin,
+    TypeSafeDecisionClient, OpenRouterDecisionClient, LLMDecisionClient,
+)
+from .decisions import __all__ as _decision_exports
+__all__ += _decision_exports

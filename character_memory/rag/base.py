@@ -105,6 +105,12 @@ class RAGSystem(ABC):
         metadata equality (e.g. `{"user_id": "alice"}`).
         """
 
+    def search_snapshot(self, query: Query, k: int = 5, where: dict | None = None) -> list[Hit]:
+        """Search without durable repairs, for previews. Remote backends opt in."""
+        if self.remote:
+            raise NotImplementedError('Remote backend does not support read-only search')
+        return self.search(query, k=k, where=where)
+
     @abstractmethod
     def persist(self, path: str) -> None:
         """Write the index to `path` (a directory)."""

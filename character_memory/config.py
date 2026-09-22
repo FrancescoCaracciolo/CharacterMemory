@@ -162,6 +162,16 @@ class DedupConfig:
     consolidate: bool = False
     per_user: bool = True
     candidate_pool: int = 10
+    # A supplied client or configured provider opts into decision reconciliation.
+    decision_provider: Optional[str] = None
+    decision_model: Optional[str] = None
+    decision_timeout: float = 30.0
+    decision_candidate_pool: int = 20
+    decision_max_request_bytes: int = 24000
+    duplicate_probability: float = 0.98
+    correction_probability: float = 0.99
+    decision_margin: float = 0.20
+    decision_llm_fallback: bool = True
 
 
 @dataclass
