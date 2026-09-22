@@ -73,4 +73,4 @@ exclude = ["examples*", "tests*", "assets*"]
 # `vendor/*.js` carries the vendored Lucide icon bundle — subdirectory files
 # are NOT matched by the top-level `*.js` glob, so it needs its own entry.
 [tool.setuptools.package-data]
-"character_memory.server.static" = ["*.html", "*.js", "*.css", "*.json", "vendor/*.js"]
+"character_memory.server.static" = ["*.html", "*.js", "*.css", "*.json", "vendor/*.js", "assets/*.svg"]

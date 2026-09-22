@@ -14,3 +14,8 @@ tiktoken>=0.13
 
 # Multilingual, zero-network temporal expression resolution
 dateparser>=1.4.2,<2
+
+# Install this checkout and the optional FastAPI server/WebUI dependencies.
+# This keeps `pip install -r requirements.txt` equivalent to the documented
+# local development setup.
+-e .[server]
