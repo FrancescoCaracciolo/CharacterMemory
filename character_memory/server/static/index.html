@@ -32,7 +32,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=cm-brand-1">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=cm-brand-2">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -45,9 +45,9 @@
         <img class="brand-wordmark brand-wordmark-dark" src="/gui/static/assets/wordmark-dark.svg" alt="CharacterMemory" width="205" height="61">
       </div>
       <nav class="tabbar" role="tablist" aria-label="View">
-        <button id="tab-browse" class="tab active" role="tab" aria-selected="true"><span>01</span> Memories</button>
-        <button id="tab-configure" class="tab" role="tab" aria-selected="false"><span>02</span> Character studio</button>
-        <button id="tab-live" class="tab" role="tab" aria-selected="false"><span>03</span> Live recall</button>
+        <button id="tab-browse" class="tab active" role="tab" aria-selected="true"><i data-lucide="layers-3" class="icon tab-icon" aria-hidden="true"></i> Memories</button>
+        <button id="tab-configure" class="tab" role="tab" aria-selected="false"><i data-lucide="user-round-pen" class="icon tab-icon" aria-hidden="true"></i> Character studio</button>
+        <button id="tab-live" class="tab" role="tab" aria-selected="false"><i data-lucide="radar" class="icon tab-icon" aria-hidden="true"></i> Live recall</button>
       </nav>
       <div class="topbar-actions">
         <label class="char-picker">

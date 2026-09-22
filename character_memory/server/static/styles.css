@@ -1177,8 +1177,8 @@ body {
   font: 900 14px/1 var(--sans); transition: opacity .2s ease; display: flex;
 }
 .theme-sun .icon, .theme-moon .icon { display: block; }
-.theme-sun { left: 8px; color: #d47700; }
-.theme-moon { right: 8px; color: #fff1b8; opacity: .35; }
+.theme-sun { left: 8px; color: var(--accent); }
+.theme-moon { right: 8px; color: var(--text); opacity: 1; }
 .theme-knob {
   position: absolute; z-index: 2; top: 3px; left: 4px; width: 22px; height: 22px;
   background: #fff9e9; border: 2px solid var(--outline); border-radius: 50%;
@@ -1186,7 +1186,7 @@ body {
 }
 .theme-switch input:checked + .theme-track { background: #4a4075; }
 .theme-switch input:checked + .theme-track .theme-knob { transform: translateX(26px) rotate(180deg); background: var(--accent-2); }
-.theme-switch input:checked + .theme-track .theme-sun { opacity: .3; }
+.theme-switch input:checked + .theme-track .theme-sun { opacity: 1; }
 .theme-switch input:checked + .theme-track .theme-moon { opacity: 1; }
 .theme-switch input:focus-visible + .theme-track { outline: 3px solid var(--info); outline-offset: 3px; }
 .theme-switch:hover .theme-knob { transform: rotate(-10deg); }
@@ -2338,4 +2338,11 @@ body { background: radial-gradient(ellipse at 100% 0, var(--accent-soft), transp
   .brand { min-width: 32px; width: 32px; }
   .brand-wordmark { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
   .brand::before { content: ""; width: 32px; height: 30px; background: var(--brand-ink); mask: url('/gui/static/assets/mascot.svg') center / contain no-repeat; }
+}
+
+/* Navigation icons stay visible in the mobile bottom bar. */
+.tab { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+.tab-icon { width: 16px; height: 16px; }
+@media (max-width: 820px) {
+  .tab { flex-direction: column; gap: 4px; }
 }
