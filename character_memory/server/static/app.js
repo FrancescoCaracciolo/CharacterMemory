@@ -756,7 +756,7 @@ function renderUserFilter(users) {
   sel.value = prev && (users || []).includes(prev) ? prev : "";
   state.user = sel.value;
   // Keep the graph view's user picker in sync with the main one.
-  if (state.graph._wired) syncGraphUserPicker(users);
+  syncGraphUserPicker(users);
 }
 
 function renderExtra(extra) {
@@ -790,6 +790,10 @@ function renderPage(data) {
   // instead of the card list. Toggle the two views.
   const isGraph = data.memory === "knowledge_graph" || data.kind === "graph";
   const isCalendar = data.memory === "calendar" || data.kind === "calendar";
+  // The graph view has its own query box and user picker; the generic
+  // record toolbar would be a second, conflicting search.
+  $("memory-toolbar").classList.toggle("hidden", isGraph);
+  document.querySelector('.content-head > .mobile-tools-toggle').classList.toggle("hidden", isGraph);
   $("graph-view").classList.toggle("hidden", !isGraph);
   $("records").classList.toggle("hidden", isGraph);
   $("paginator").classList.toggle("hidden", isGraph || isCalendar);
@@ -2157,7 +2161,7 @@ async function renderGraphView() {
   $("graph-q").value = state.graph.q || "";
   $("graph-q-clear").classList.toggle("hidden", !state.graph.q);
   $("graph-full").classList.toggle("graph-freeze-on", !!state.graph.full);
-  setButtonContent($("graph-full"), state.graph.full ? "circle-dot" : "circle-dashed", "full graph");
+  setButtonContent($("graph-full"), state.graph.full ? "circle-dot" : "circle-dashed", "Full graph");
 
   let data;
   try {
@@ -2272,12 +2276,12 @@ function wireGraphControls() {
     if (!state.graph._gv) return;
     const frozen = state.graph._gv.relayout();
     $("graph-freeze").classList.toggle("graph-freeze-on", frozen);
-    setButtonContent($("graph-freeze"), frozen ? "play" : "pause", frozen ? "resume" : "freeze");
+    setButtonContent($("graph-freeze"), frozen ? "play" : "pause", frozen ? "Resume" : "Freeze");
   });
   $("graph-full").addEventListener("click", () => {
     state.graph.full = !state.graph.full;
     $("graph-full").classList.toggle("graph-freeze-on", state.graph.full);
-    setButtonContent($("graph-full"), state.graph.full ? "circle-dot" : "circle-dashed", "full graph");
+    setButtonContent($("graph-full"), state.graph.full ? "circle-dot" : "circle-dashed", "Full graph");
     // Full mode shows the whole graph by default; bump the caps so the slider
     // still lets the user dial it back down.
     if (state.graph.full) { syncSlider("gs-nodes", "nodeLimit", 6000); syncSlider("gs-edges", "edgeLimit", 9000); }
@@ -2325,7 +2329,7 @@ function wireGraphControls() {
     if (!state.graph._gv) return;
     const f = state.graph._gv.freeze();
     $("graph-freeze").classList.toggle("graph-freeze-on", f);
-    setButtonContent($("graph-freeze"), f ? "play" : "pause", f ? "resume" : "freeze");
+    setButtonContent($("graph-freeze"), f ? "play" : "pause", f ? "Resume" : "Freeze");
   });
   // Space toggles the physics freeze while the graph is on screen.
   document.addEventListener("keydown", (e) => {
@@ -2335,7 +2339,7 @@ function wireGraphControls() {
     if (!state.graph._gv) return;
     const f = state.graph._gv.freeze();
     $("graph-freeze").classList.toggle("graph-freeze-on", f);
-    setButtonContent($("graph-freeze"), f ? "play" : "pause", f ? "resume" : "freeze");
+    setButtonContent($("graph-freeze"), f ? "play" : "pause", f ? "Resume" : "Freeze");
   });
 }
 
@@ -3170,12 +3174,14 @@ async function init() {
   });
   // keyboard: "/" focuses search, Esc clears.
   document.addEventListener("keydown", (e) => {
-    if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
-      e.preventDefault(); $("q").focus();
+    const graphOpen = !$("graph-view").classList.contains("hidden");
+    if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT" && document.activeElement.tagName !== "TEXTAREA") {
+      e.preventDefault(); $(graphOpen ? "graph-q" : "q").focus();
     } else if (e.key === "Escape") {
       if (!$("api-key-overlay").classList.contains("hidden")) closeApiKeyDialog();
       else if (!$("memory-editor").classList.contains("hidden")) closeMemoryEditor();
-      else if ($("q").value) { $("q").value = ""; onSearchInput(); }
+      else if (graphOpen && $("graph-q").value) $("graph-q-clear").click();
+      else if (!graphOpen && $("q").value) { $("q").value = ""; onSearchInput(); }
     }
   });
   // Refit the canvas renderer when the window resizes (the viz also watches

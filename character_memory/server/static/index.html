@@ -32,7 +32,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=cm-brand-2">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=cm-brand-4">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -113,13 +113,13 @@
               <button id="graph-q-clear" class="q-clear hidden" title="Clear" aria-label="Clear activation query"><i data-lucide="x" class="icon"></i></button>
             </div>
             <select id="graph-user" class="user-filter" title="Bias a user's PersonNode"></select>
-            <button id="graph-full" class="btn ghost" title="Show the whole graph and highlight retrieved nodes"><i data-lucide="circle-dashed" class="icon"></i><span class="btn-label">full graph</span></button>
+            <button id="graph-full" class="btn ghost" title="Show the whole graph and highlight retrieved nodes"><i data-lucide="circle-dashed" class="icon"></i><span class="btn-label">Full graph</span></button>
             <span id="graph-meta" class="graph-meta"></span>
             <div class="graph-ctl-spacer"></div>
-            <button id="graph-freeze" class="btn ghost" title="Pause / resume physics (space)"><i data-lucide="pause" class="icon"></i><span class="btn-label">freeze</span></button>
-            <button id="graph-fit" class="btn ghost" title="Fit graph to view"><i data-lucide="maximize" class="icon"></i><span class="btn-label">fit</span></button>
-            <button id="graph-repel" class="btn ghost" title="Re-run layout"><i data-lucide="refresh-ccw" class="icon"></i><span class="btn-label">relayout</span></button>
-            <button id="graph-settings-btn" class="btn ghost" type="button" title="Graph settings" aria-controls="graph-settings" aria-expanded="false"><i data-lucide="settings" class="icon"></i><span class="btn-label">settings</span></button>
+            <button id="graph-freeze" class="btn ghost" title="Pause / resume physics (space)"><i data-lucide="pause" class="icon"></i><span class="btn-label">Freeze</span></button>
+            <button id="graph-fit" class="btn ghost" title="Fit graph to view"><i data-lucide="maximize" class="icon"></i><span class="btn-label">Fit</span></button>
+            <button id="graph-repel" class="btn ghost" title="Re-run layout"><i data-lucide="refresh-ccw" class="icon"></i><span class="btn-label">Relayout</span></button>
+            <button id="graph-settings-btn" class="btn ghost" type="button" title="Graph settings" aria-controls="graph-settings" aria-expanded="false"><i data-lucide="settings" class="icon"></i><span class="btn-label">Settings</span></button>
           </div>
           <div class="graph-split">
             <div class="graph-canvas-wrap">
@@ -174,7 +174,7 @@
                   <input type="checkbox" id="gs-hide-epfact">
                   <span class="gs-label">Hide all episode/fact</span>
                 </label>
-                <button id="gs-reset" class="gs-reset" title="Restore defaults">reset defaults</button>
+                <button id="gs-reset" class="gs-reset" title="Restore defaults">Reset defaults</button>
               </div>
             </div>
             <aside id="graph-side" class="graph-side">
@@ -537,7 +537,7 @@
                 <button id="cfg-delete-file" class="btn danger ghost tight">Delete</button>
               </div>
               <textarea id="cfg-file-content" class="cfg-file-content" spellcheck="false"
-                placeholder="# Section\n\nMarkdown for the character's wiki or dialogue transcript."></textarea>
+                placeholder="# Section&#10;&#10;Markdown for the character's wiki or dialogue transcript."></textarea>
             </div>
           </div>
         </div>
@@ -636,7 +636,7 @@
   </div>
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[CharacterMemory] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
-  <script src="/gui/static/app.js?v=mobile-2"></script>
+  <script src="/gui/static/app.js?v=mobile-3"></script>
   <script src="/gui/static/config.js?v=k-zero-1"></script>
 </body>
 </html>
