@@ -725,7 +725,7 @@ class CharacterMemoryClient:
         *,
         occurred_at: Optional[float] = None,
     ) -> SaveResponse:
-        """Persist an assistant answer and run server-side extraction."""
+        """Persist an assistant answer; extraction runs on the server's interval."""
         body: dict[str, Any] = {"chat_id": chat_id, "answer": answer}
         if occurred_at is not None:
             body["occurred_at"] = occurred_at

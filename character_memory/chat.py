@@ -213,6 +213,21 @@ class Chat:
             order_by="id ASC",
         )
 
+    def turns_since_extraction(self) -> int:
+        """User turns persisted after this chat's latest extracted message.
+
+        This is the automatic-extraction counter: any extraction pass (scheduled
+        or forced) resets it. Rows older than the latest extracted one are not
+        counted, because an extraction window can leave them behind forever.
+        """
+        rows = self.store.execute(
+            "SELECT COUNT(*) AS n FROM messages "
+            "WHERE chat_id=? AND role='user' AND extracted=0 AND id > COALESCE("
+            "(SELECT MAX(id) FROM messages WHERE chat_id=? AND extracted=1), 0)",
+            [self.id, self.id],
+        )
+        return int(rows[0]["n"]) if rows else 0
+
     def __len__(self) -> int:
         rows = self.store.execute(
             "SELECT COUNT(*) AS n FROM messages WHERE chat_id=?",

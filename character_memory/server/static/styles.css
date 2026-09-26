@@ -1753,6 +1753,7 @@ select option { background: var(--input); color: var(--text); }
 .world-element-body { padding: 0 11px 12px; border-top: 1.5px dashed color-mix(in srgb, var(--outline) 65%, transparent); }
 .world-element-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 43px; }
 .world-element-tools .btn { border-width: 1.5px; border-radius: 8px; }
+.cfg-extract-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-top: 16px; }
 .cfg-dedup-panel { margin-top: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 9px; }
 .cfg-dedup-panel > summary { cursor: pointer; }
 .cfg-dedup-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 16px; margin-top: 14px; }

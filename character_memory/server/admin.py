@@ -686,6 +686,7 @@ def build_admin_router(
             if hasattr(mem, f"{m}_k"):
                 memory_view[f"{m}_k"] = getattr(mem, f"{m}_k")
         memory_view["knowledge_graph_token_budget"] = mem.knowledge_graph_token_budget
+        memory_view["extract_interval"] = mem.extract_interval
         memory_view["dedup"] = asdict(mem.dedup)
         marker = os.path.join(_char_dir(name), ".knowledge_graph")
         return {
@@ -775,6 +776,11 @@ def build_admin_router(
                 elif key == "knowledge_graph_token_budget":
                     try:
                         mem.knowledge_graph_token_budget = max(0, int(val))
+                    except (TypeError, ValueError):
+                        pass
+                elif key == "extract_interval":
+                    try:
+                        mem.extract_interval = max(1, int(val))
                     except (TypeError, ValueError):
                         pass
             # Older GUI/API clients do not submit ``section_order``. Keep an
@@ -1099,7 +1105,7 @@ def build_admin_router(
             # Extraction is idempotent (processed rows are flagged), so a
             # thread failure or a duplicated run is harmless.
             try:
-                ag._maybe_auto_extract(ch)
+                ag.maybe_extract(ch)
             except Exception as exc:  # noqa: BLE001 - never crash on bg work
                 warnings.warn(
                     f"[charactermemory] background extraction failed for "

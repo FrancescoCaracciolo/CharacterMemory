@@ -5,8 +5,10 @@ two-step "thin client" chat flow:
 
 1. **`POST /context`** — load (or create) a chat for a character + user,
    store the user's message, and return the assembled memory context.
-2. **`POST /save`** — store the assistant answer the client generated and run
-   memory extraction so the character learns from the exchange.
+2. **`POST /save`** — store the assistant answer the client generated,
+   completing the exchange `/context` started. Memory extraction runs
+   automatically every `memory.extract_interval` user turns of the chat.
+3. **`POST /extract`** (optional) — force extraction over the chat now.
 
 This lets a client use its own LLM/model and only rely on the server for
 memory recall and learning. The core library does **not** depend on FastAPI;
@@ -384,16 +386,52 @@ not appear in `memories` because they are authored prompt text, not retrievals.
 
 ### `POST /save`
 
-Persist the assistant answer for a chat and run memory extraction over it.
+Append the assistant answer to the chat. `/context` stored the user turn;
+`/save` completes it, so the chat holds the full conversation.
 
 **Request body**
 
-| Field     | Type   | Required | Notes                                                |
-|-----------|--------|----------|------------------------------------------------------|
-| `chat_id` | string | yes      | The chat id returned by `/context`.                  |
-| `answer`  | string | yes      | The assistant answer to persist.                     |
+| Field         | Type   | Required | Notes                                            |
+|---------------|--------|----------|--------------------------------------------------|
+| `chat_id`     | string | yes      | The chat id returned by `/context`.              |
+| `answer`      | string | yes      | The assistant answer to persist.                 |
+| `occurred_at` | number | no       | Unix timestamp of when the answer was given.     |
 
 **Response** `200` — `SaveResponse`
+```json
+{
+  "ok": true,
+  "chat_id": "9b3f1c2a4d5e6f708192...",
+  "extracted": false
+}
+```
+
+`/save` never forces extraction. Each chat keeps a counter of user turns
+since its last extraction; once it reaches the character's
+`memory.extract_interval` (set in `config.yaml` or in the GUI under
+Workshop → Configure → Automatic extraction), the save runs extraction and
+the counter restarts. `extracted` reports whether that happened on this call.
+
+**Errors**
+
+| Status | When                                       |
+|--------|--------------------------------------------|
+| `404`  | `chat_id` is unknown to any character.     |
+
+---
+
+### `POST /extract`
+
+Force memory extraction over a chat's not-yet-extracted messages without
+waiting for the interval. This also restarts the chat's extraction counter.
+
+**Request body**
+
+| Field     | Type   | Required | Notes                               |
+|-----------|--------|----------|-------------------------------------|
+| `chat_id` | string | yes      | The chat id returned by `/context`. |
+
+**Response** `200` — `ExtractResponse`
 ```json
 {
   "ok": true,
@@ -402,10 +440,7 @@ Persist the assistant answer for a chat and run memory extraction over it.
 }
 ```
 
-`extracted` reports whether memory extraction actually fired for this turn
-(the agent throttles extraction by `MemoryConfig.extract_interval`, so a
-single turn may not always trigger learning). Forcing the client's answer
-through this endpoint is what makes the character remember the exchange.
+`extracted` is `false` when the chat had nothing new to learn from.
 
 **Errors**
 
@@ -435,7 +470,7 @@ through this endpoint is what makes the character remember the exchange.
     │  POST /save                    │
     │  {chat_id, answer}             │
     │────────────────────────────────>│  persist assistant turn,
-    │                                │  run extraction
+    │                                │  extract every N user turns
     │  {ok, chat_id, extracted}      │
     │<────────────────────────────────│
 ```
@@ -456,13 +491,19 @@ curl -X POST http://localhost:8000/context \
 
 # 2. (Client generates its own answer using `context`.)
 
-# 3. Save the answer so the character learns from it.
+# 3. Save the answer to complete the turn.
 curl -X POST http://localhost:8000/save \
   -H 'Content-Type: application/json' \
   -d '{
         "chat_id": "9b3f1c2a...",
         "answer": "Welcome, Michael. Daru mentioned you would be joining."
       }'
+# -> {"ok": true, "chat_id": "9b3f1c2a...", "extracted": false}
+
+# 4. Optional: learn from the chat now instead of waiting for the interval.
+curl -X POST http://localhost:8000/extract \
+  -H 'Content-Type: application/json' \
+  -d '{"chat_id": "9b3f1c2a..."}'
 # -> {"ok": true, "chat_id": "9b3f1c2a...", "extracted": true}
 ```
 
@@ -492,7 +533,7 @@ def turn(message: str) -> str:
 
 ## Notes
 
-- **Chat ids are globally unique** UUIDs, so `/save` does not require the
+- **Chat ids are globally unique** UUIDs, so `/save` and `/extract` do not require the
   character name — it locates the chat across all loaded characters.
 - **Persistence:** the user message is stored by `/context` and the
   assistant answer by `/save`, so the chat history is durable across

@@ -442,6 +442,15 @@
               <button id="cfg-save-memory" class="btn primary">Save memories &amp; order</button>
             </div>
             <div id="cfg-memory-list" class="cfg-memory-list"></div>
+            <div class="cfg-extract-row">
+              <label class="cfg-label" for="cfg-extract-interval">Automatic extraction</label>
+              <span class="k-wrap">
+                <span class="k-label">every</span>
+                <input id="cfg-extract-interval" type="number" min="1" step="1" class="k-input">
+                <span class="k-label">user turns</span>
+              </span>
+            </div>
+            <div class="cfg-hint">Learning runs once a chat has this many new user turns since its last extraction. <code>POST /extract</code> forces it early.</div>
             <details class="cfg-dedup-panel">
               <summary class="cfg-label">Deduplication &amp; decision model</summary>
               <p class="cfg-hint">Reconcile duplicate structured memories after extraction. Save with “Save memories &amp; order” above. When disabled, the legacy exact-match guard still applies.</p>
@@ -669,7 +678,7 @@
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[CharacterMemory] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
   <script src="/gui/static/app.js?v=extractions-1"></script>
-  <script src="/gui/static/config.js?v=k-zero-1"></script>
+  <script src="/gui/static/config.js?v=extract-interval-1"></script>
   <script src="/gui/static/extractions.js?v=extractions-1"></script>
 </body>
 </html>

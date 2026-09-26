@@ -854,6 +854,9 @@ function renderConfig() {
       ? cfg.memory.knowledge_graph_token_budget
       : 1000
   );
+  $("cfg-extract-interval").value = String(
+    cfg.memory && cfg.memory.extract_interval != null ? cfg.memory.extract_interval : 5
+  );
   renderSectionOrder(
     cfg.section_order || DEFAULT_SECTION_ORDER,
     cfg.intermediate_prompts || {},
@@ -1149,6 +1152,10 @@ function gatherConfig() {
   const kgTokenBudget = parseInt($("cfg-kg-token-budget").value, 10);
   if (!Number.isNaN(kgTokenBudget)) {
     mem.knowledge_graph_token_budget = Math.max(0, kgTokenBudget);
+  }
+  const extractInterval = parseInt($("cfg-extract-interval").value, 10);
+  if (!Number.isNaN(extractInterval)) {
+    mem.extract_interval = Math.max(1, extractInterval);
   }
   const sectionOrder = [...document.querySelectorAll("#cfg-section-order .cfg-section-row")]
     .filter((row) => row.querySelector("[data-section-include]").checked)
@@ -1650,6 +1657,7 @@ function wire() {
     dirtyMemory();
   });
   $("cfg-kg-token-budget").addEventListener("input", dirtyMemory);
+  $("cfg-extract-interval").addEventListener("input", dirtyMemory);
 
   document.querySelectorAll(".editor-tabs .etab").forEach((b) => {
     b.addEventListener("click", () => setEditTab(b.dataset.edit));

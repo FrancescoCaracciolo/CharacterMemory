@@ -19,8 +19,12 @@ The flow it implements is the typical "thin client" pattern:
    LLM call.
 
 2. ``POST /save``  — the client comes back with the assistant answer it
-   generated; this endpoint persists the assistant turn and runs memory
-   extraction so the character learns from the exchange.
+   generated; this endpoint appends the assistant turn, completing the
+   exchange ``/context`` started. Memory extraction runs automatically every
+   ``memory.extract_interval`` user turns of the chat.
+
+3. ``POST /extract`` — optional: force extraction over the chat now instead
+   of waiting for the interval.
 
 The ``user`` field is the **current speaker**. A chat can host several
 speakers (a group chat): any caller holding the chat id may post as any
@@ -310,7 +314,23 @@ class SaveResponse(BaseModel):
     ok: bool = True
     chat_id: str
     extracted: bool = Field(
-        ..., description="Whether memory extraction fired for this turn."
+        ...,
+        description=(
+            "Whether this save reached the character's extract_interval and "
+            "triggered automatic memory extraction."
+        ),
+    )
+
+
+class ExtractRequest(BaseModel):
+    chat_id: str = Field(..., description="The chat id returned by /context.")
+
+
+class ExtractResponse(BaseModel):
+    ok: bool = True
+    chat_id: str
+    extracted: bool = Field(
+        ..., description="Whether any unprocessed messages were extracted."
     )
 
 
@@ -486,30 +506,46 @@ def context_events(
     )
 
 
+def _find_chat(chat_id: str) -> tuple[CharacterAgent, Any]:
+    """Locate a chat across every character; a chat id is globally unique."""
+    for agent in AGENTS.values():
+        chat = agent.load_chat(chat_id)
+        if chat is not None:
+            return agent, chat
+    raise HTTPException(status_code=404, detail=f"Unknown chat_id {chat_id!r}.")
+
+
 @app.post("/save", response_model=SaveResponse)
 def save(req: SaveRequest) -> SaveResponse:
-    """Persist the assistant answer and run memory extraction over the chat.
+    """Append the assistant answer to the chat opened by ``/context``.
 
-    Returns ``extracted`` so the client knows whether learning fired this turn
-    (extraction is throttled by the agent's ``extract_interval``)."""
-    # Locate the chat across every character; a chat id is globally unique.
-    chat = None
-    owner: Optional[CharacterAgent] = None
-    for agent in AGENTS.values():
-        chat = agent.load_chat(req.chat_id)
-        if chat is not None:
-            owner = agent
-            break
-    if chat is None or owner is None:
-        raise HTTPException(status_code=404, detail=f"Unknown chat_id {req.chat_id!r}.")
-
-    before = len(chat.unextracted())
+    ``/context`` stores the user turn; ``/save`` completes it with the answer,
+    so the chat holds the whole conversation. Extraction is not forced: it
+    runs automatically once the chat has accumulated the character's
+    ``memory.extract_interval`` user turns since its last extraction.
+    ``extracted`` reports whether that happened on this call. Use
+    ``POST /extract`` to learn from the chat immediately.
+    """
+    owner, chat = _find_chat(req.chat_id)
     chat.add_message("assistant", req.answer, occurred_at=req.occurred_at)
-    # Force extraction over the chat: anything new gets learned + flagged.
-    owner.extract(chat)
-    after = len(chat.unextracted())
+    extracted = owner.maybe_extract(chat)
+    return SaveResponse(chat_id=chat.id, extracted=extracted)
 
-    return SaveResponse(chat_id=chat.id, extracted=before != after)
+
+@app.post("/extract", response_model=ExtractResponse)
+def force_extract(req: ExtractRequest) -> ExtractResponse:
+    """Force memory extraction over a chat's not-yet-extracted messages.
+
+    Resets the chat's automatic-extraction counter. ``extracted`` is false when
+    there was nothing new to learn from.
+    """
+    owner, chat = _find_chat(req.chat_id)
+    before = len(chat.unextracted())
+    if before:
+        owner.extract(chat)
+    return ExtractResponse(
+        chat_id=chat.id, extracted=bool(before) and len(chat.unextracted()) != before
+    )
 
 
 # --------------------------------------------------------------------------- #

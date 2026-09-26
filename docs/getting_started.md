@@ -395,7 +395,7 @@ sequenceDiagram
     S->>C: {chat_id, context}
     Note over C: call your own LLM with context
     C->>S: POST /save  {chat_id, answer}
-    Note over S: persist assistant turn, run extraction
+    Note over S: persist assistant turn, extract every extract_interval user turns
     S->>C: {ok, chat_id, extracted}
 ```
 
@@ -414,8 +414,18 @@ curl -X POST http://localhost:8000/context \
 curl -X POST http://localhost:8000/save \
   -H 'Content-Type: application/json' \
   -d '{"chat_id":"9b3f1c2a...","answer":"Welcome, Alice. Let us explore the observatory."}'
+# -> {"ok":true,"chat_id":"9b3f1c2a...","extracted":false}
+
+# 4. Optional: force learning now instead of waiting for extract_interval.
+curl -X POST http://localhost:8000/extract \
+  -H 'Content-Type: application/json' \
+  -d '{"chat_id":"9b3f1c2a..."}'
 # -> {"ok":true,"chat_id":"9b3f1c2a...","extracted":true}
 ```
+
+`/save` only stores the answer. Extraction runs automatically once the chat
+has `memory.extract_interval` user turns since its last extraction; change the
+interval in `config.yaml` or in the WebUI's Configure tab.
 
 For `/context`, omit `budget` to inherit the character configuration, send
 `null` for unlimited, or `0` to omit memories. A positive integer caps rendered

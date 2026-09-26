@@ -1126,21 +1126,36 @@ class CharacterAgent:
         )
         return [{"role": "system", "content": system}, *prior]
 
-    def _maybe_auto_extract(self, chat: Chat) -> None:
-        """If the chat hit the extract interval, run extraction on it."""
-        interval = max(
+    def _extract_interval(self) -> int:
+        return max(
             1,
             self.config.memory.extract_interval if self.config is not None else 5,
         )
-        # Count user turns already persisted.
-        user_turns = self.store.select(  # type: ignore[union-attr]
-            "messages",
-            where={"chat_id": chat.id, "role": "user"},
-        )
-        if len(user_turns) % interval == 0:
-            # generate_answer already owns the turn lock. This separate path
-            # also permits streaming consumers to resume on another thread.
-            self._extract_chat_unlocked(chat)
+
+    def _maybe_auto_extract(self, chat: Chat) -> bool:
+        """Run extraction once the chat has `extract_interval` new user turns.
+
+        Returns whether extraction ran. The caller must already hold the
+        chat lock (generate_answer does); use :meth:`maybe_extract` otherwise.
+        """
+        if chat.turns_since_extraction() < self._extract_interval():
+            return False
+        self._extract_chat_unlocked(chat)
+        return True
+
+    @chat_serialized
+    def maybe_extract(self, target: Union[Chat, str]) -> bool:
+        """Extract `target` if its counter reached `extract_interval`.
+
+        The counter is the number of user turns since the chat's last
+        extraction (scheduled or forced via :meth:`extract`). Returns whether
+        extraction ran; an unknown chat id returns False.
+        """
+        self._require_loaded()
+        chat = self._as_chat(target)
+        if chat is None:
+            return False
+        return self._maybe_auto_extract(chat)
 
     @chat_serialized
     def generate_answer(
@@ -1713,11 +1728,7 @@ class CharacterAgent:
         self._extract_chat_unlocked(chat)
 
     def _extract_chat_unlocked(self, chat: Chat) -> None:
-        interval = max(
-            1,
-            self.config.memory.extract_interval if self.config is not None else 5,
-        )
-        window = max(interval * 2, 4)
+        window = max(self._extract_interval() * 2, 4)
         rows = chat.unextracted()
         if not rows:
             return

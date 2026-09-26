@@ -184,4 +184,4 @@ See [Tools](tools.md).
 | `llm/base.py` | `LLMClient` / `LLMResponse` / tool-calling methods |
 | `tools/` | `Tool` ABC, `@tool`, `ToolRegistry`, memory self-tools |
 | `knowledge_graph/` | Spreading-activation retriever (see [Knowledge graph](knowledge_graph.md)) |
-| `server/` | Optional FastAPI app: `/context`, `/save`, `/gui`, `/mcp` |
+| `server/` | Optional FastAPI app: `/context`, `/save`, `/extract`, `/gui`, `/mcp` |

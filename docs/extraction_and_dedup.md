@@ -102,7 +102,10 @@ agent.extract()          # extract every unprocessed turn across all chats
 ```
 
 Both are safe to call repeatedly. The HTTP `/save` endpoint calls
-`agent.extract(chat)` after persisting the assistant turn.
+`agent.maybe_extract(chat)` after persisting the assistant turn: it extracts
+only once the chat has `extract_interval` user turns since its last
+extraction (`chat.turns_since_extraction()`). `POST /extract` calls
+`agent.extract(chat)` to force a pass, which also restarts that counter.
 
 ### Opting out / in
 
