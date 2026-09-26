@@ -13,6 +13,8 @@
 
 const API = "";
 const SIZE = 25;
+// Top-level views; each has a `tab-<name>` button (see setTab).
+const VIEW_TABS = ["browse", "configure", "live", "extractions"];
 const LIVE_GRAPH_EMBED_PATH = "/gui/embed/knowledge-graph";
 const LIVE_GRAPH_EMBED = location.pathname.replace(/\/+$/, "") === LIVE_GRAPH_EMBED_PATH;
 
@@ -529,7 +531,7 @@ async function getJSON(url, signal) {
   if (r.status === 401) promptApiKey();
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detail.detail || `HTTP ${r.status}`);
+    throw Object.assign(new Error(detail.detail || `HTTP ${r.status}`), { status: r.status });
   }
   return r.json();
 }
@@ -2444,8 +2446,7 @@ function updateLiveEmbedLink() {
 
 function updateViewUrl({ replace = false } = {}) {
   const params = new URLSearchParams(location.search);
-  const active = $("tab-live").classList.contains("active")
-    ? "live" : $("tab-configure").classList.contains("active") ? "configure" : "browse";
+  const active = VIEW_TABS.find((tab) => $(`tab-${tab}`) && $(`tab-${tab}`).classList.contains("active")) || "browse";
   if (active === "browse") params.delete("tab"); else params.set("tab", active);
   if (state.character) params.set("character", state.character);
   const url = `${location.pathname}${params.toString() ? "?" + params.toString() : ""}${location.hash || ""}`;
@@ -3164,6 +3165,7 @@ async function init() {
     updateViewUrl();
     resetCharacterView();
     if (state.live._active) connectLiveStream();
+    if (window.cmExtractions) window.cmExtractions.setCharacter(state.character);
     loadOverview();
   });
   $("memory-filter").addEventListener("input", renderSidebar);
@@ -3200,7 +3202,7 @@ async function init() {
         setTab("live", { history: false });
       } else {
         await loadOverview();
-        const initialTab = ["browse", "configure", "live"].includes(new URLSearchParams(location.search).get("tab"))
+        const initialTab = VIEW_TABS.includes(new URLSearchParams(location.search).get("tab"))
           ? new URLSearchParams(location.search).get("tab") : "browse";
         setTab(initialTab, { history: false });
       }
@@ -3217,29 +3219,37 @@ async function init() {
 // Share DOM helpers with config.js (the Configure tab) through `window.cmUtil`
 // so the configurator never duplicates el()/clear()/$()/markdown()/getJSON().
 // authHeaders/authQuery carry the optional API key on config.js's own fetches.
-window.cmUtil = { $, el, clear, icon, setButtonContent, getJSON, markdown, esc, authHeaders, authQuery };
+window.cmUtil = { $, el, clear, icon, setButtonContent, getJSON, markdown, esc, authHeaders, authQuery, relTime, absTime };
 
 function setTab(name, { history = true } = {}) {
   const viewTitle = LIVE_GRAPH_EMBED ? "Knowledge graph"
-    : ({ browse: "Memories", configure: "Character studio", live: "Live recall" }[name] || "Memories");
+    : ({ browse: "Memories", configure: "Character studio", live: "Live recall", extractions: "Extractions" }[name] || "Memories");
   document.title = `CharacterMemory — ${viewTitle}`;
   const browse = name === "browse";
   const configure = name === "configure";
   const live = name === "live";
+  const extractions = name === "extractions";
   $("tab-browse").classList.toggle("active", browse);
   $("tab-browse").setAttribute("aria-selected", browse ? "true" : "false");
   $("tab-configure").classList.toggle("active", configure);
   $("tab-configure").setAttribute("aria-selected", configure ? "true" : "false");
   $("tab-live").classList.toggle("active", live);
   $("tab-live").setAttribute("aria-selected", live ? "true" : "false");
+  $("tab-extractions").classList.toggle("active", extractions);
+  $("tab-extractions").setAttribute("aria-selected", extractions ? "true" : "false");
   const main = document.querySelector(".app > .main");
   const cfg = $("cfg-pane");
   if (main) main.classList.toggle("hidden", !browse);
   if (cfg) cfg.classList.toggle("hidden", !configure);
   $("live-pane").classList.toggle("hidden", !live);
+  $("ex-pane").classList.toggle("hidden", !extractions);
   if (live) activateLive(); else deactivateLive();
   if (configure && window.cmConfig && typeof window.cmConfig.activate === "function") {
     window.cmConfig.activate();
+  }
+  if (window.cmExtractions) {
+    if (extractions) window.cmExtractions.activate(state.character);
+    else window.cmExtractions.deactivate();
   }
   if (history) updateViewUrl();
   if (!LIVE_GRAPH_EMBED && matchMedia("(max-width: 820px)").matches) window.scrollTo({ top: 0 });
@@ -3249,6 +3259,7 @@ function wireTabs() {
   $("tab-browse").addEventListener("click", () => setTab("browse"));
   $("tab-configure").addEventListener("click", () => setTab("configure"));
   $("tab-live").addEventListener("click", () => setTab("live"));
+  $("tab-extractions").addEventListener("click", () => setTab("extractions"));
   window.addEventListener("popstate", async () => {
     const requestedCharacter = new URLSearchParams(location.search).get("character");
     if (requestedCharacter && state.characters.includes(requestedCharacter) && requestedCharacter !== state.character) {
@@ -3257,10 +3268,11 @@ function wireTabs() {
       updateLiveEmbedLink();
       resetCharacterView();
       if (state.live._active) connectLiveStream();
+      if (window.cmExtractions) window.cmExtractions.setCharacter(state.character);
       if (!LIVE_GRAPH_EMBED) await loadOverview();
     }
     const tab = new URLSearchParams(location.search).get("tab");
-    setTab(LIVE_GRAPH_EMBED ? "live" : (["browse", "configure", "live"].includes(tab) ? tab : "browse"), { history: false });
+    setTab(LIVE_GRAPH_EMBED ? "live" : (VIEW_TABS.includes(tab) ? tab : "browse"), { history: false });
   });
 }
 wireTabs();

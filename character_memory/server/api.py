@@ -764,6 +764,50 @@ def read_graph(
         raise HTTPException(status_code=404, detail="knowledge_graph memory not built.")
 
 
+def _extraction_log_for(character: str):
+    agent = _get_agent(character)
+    if agent.extraction_log is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Extraction logging is disabled (memory.extraction_log_limit = 0).",
+        )
+    return agent.extraction_log
+
+
+@app.get("/api/extractions/{character}")
+def list_extractions(
+    character: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user: Optional[str] = Query(None, description="Only runs where this user took part."),
+) -> dict:
+    """Newest-first extraction passes with per-section change counts.
+
+    Rows are read straight from the store, so passes run by another process
+    (Discord bot, CLI) appear without waiting for a cache sync.
+    """
+    log = _extraction_log_for(character)
+    runs, total = log.list_runs(limit=limit, offset=offset, user_id=user)
+    return {
+        "character": character,
+        "runs": runs,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "users": log.users(),
+        "retention": log.limit,
+    }
+
+
+@app.get("/api/extractions/{character}/{run_id}")
+def read_extraction(character: str, run_id: int) -> dict:
+    """One extraction pass: source messages, new rows, summary/emotion deltas, new KG nodes."""
+    run = _extraction_log_for(character).get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Unknown extraction run {run_id}.")
+    return run
+
+
 def main() -> None:  # pragma: no cover - manual run helper / console script
     """Console-script entry point: run the server with uvicorn.
 

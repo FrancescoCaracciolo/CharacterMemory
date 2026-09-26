@@ -27,6 +27,7 @@ Prompt assembly and per-memory extraction are delegated to a
 
 import os
 import time
+import warnings
 from typing import Any, Callable, Iterable, Iterator, Optional, Sequence, Union
 
 from .chat import Chat, _ChatBackend
@@ -50,6 +51,7 @@ from .memory.dedup import Deduplicator, DedupReport
 from .decisions import DecisionClient
 from .memory.emotion import EmotionStatus
 from .memory.episodic import EpisodicMemory
+from .memory.extraction_log import ExtractionLog, ExtractionRecorder
 from .memory.heartbeat import HeartbeatJournal
 from .memory.knowledge_graph_memory import KnowledgeGraphMemory
 from .memory.store import SQLiteStore
@@ -199,6 +201,9 @@ class CharacterAgent:
         # Per-memory recall bounds: top-k counts, except KG prompt tokens.
         self._limits: dict[str, int] = {}
         self._chats: Optional[_ChatBackend] = None
+        #: Per-pass extraction changelog (``extraction_runs`` table). None when
+        #: disabled via ``MemoryConfig.extraction_log_limit = 0``.
+        self.extraction_log: Optional[ExtractionLog] = None
         self._built = False
 
     def _configure_temporal_resolution(
@@ -317,6 +322,7 @@ class CharacterAgent:
             self._build_memories(full.memory)
             self._wire_character()
             self._chats = _ChatBackend(self.store)
+            self._open_extraction_log()
         except BaseException:
             self.character = None
             if self._owns_store:
@@ -346,7 +352,17 @@ class CharacterAgent:
         self.memories = {m.name: m for m in memories}
         self._wire_character()
         self._chats = _ChatBackend(self.store)
+        self._open_extraction_log()
         return self
+
+    def _open_extraction_log(self) -> None:
+        assert self.store is not None
+        limit = (
+            self.config.memory.extraction_log_limit
+            if self.config is not None
+            else MemoryConfig.extraction_log_limit
+        )
+        self.extraction_log = ExtractionLog(self.store, limit=limit) if limit > 0 else None
 
     def _open_store(self) -> None:
         os.makedirs(self.save_directory, exist_ok=True)
@@ -1576,6 +1592,7 @@ class CharacterAgent:
         assert self.character is not None
         if not rows:
             return
+        recorder = self._start_extraction_recorder(user_id, participants)
         event_memory = self.memories.get("conversation_events")
         events_changed = False
         if (
@@ -1604,6 +1621,8 @@ class CharacterAgent:
         result = self.character.extract(
             turns, user_id=user_id, participants=participants, chat_id=chat_id
         )
+        added: dict[str, list] = {}
+        dedup_reports: dict[str, DedupReport] = {}
         if result is not None:
             added = result.pop("__added__", {})
             if isinstance(event_memory, ConversationEventMemory) and event_memory.enabled:
@@ -1614,7 +1633,7 @@ class CharacterAgent:
             # Post-extraction dedup: compact the freshly-added items against
             # each memory's existing rows, then mirror the mutations into
             # the knowledge graph.
-            self._dedup_added(added)
+            dedup_reports = self._dedup_added(added)
             kg = self.memories.get(_KG_MEMORY)
             if isinstance(kg, KnowledgeGraphMemory):
                 # Ingest and dedup both mutate the graph first; synchronize
@@ -1633,6 +1652,61 @@ class CharacterAgent:
         self.store.execute(
             f"UPDATE messages SET extracted=1 WHERE id IN ({qs})", ids
         )
+        if recorder is not None and result is not None:
+            self._record_extraction(
+                recorder, rows, result, added, dedup_reports, chat_id=chat_id
+            )
+
+    def _start_extraction_recorder(
+        self, user_id: str, participants: Optional[list[str]]
+    ) -> Optional[ExtractionRecorder]:
+        if self.extraction_log is None:
+            return None
+        try:
+            return ExtractionRecorder(
+                self.memories,
+                user_id=user_id,
+                participants=participants,
+                character_name=self.character_name,
+            ).capture_before()
+        except Exception as exc:  # noqa: BLE001 - the changelog is best-effort
+            warnings.warn(
+                f"[charactermemory] extraction log snapshot failed: {type(exc).__name__}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+
+    def _record_extraction(
+        self,
+        recorder: ExtractionRecorder,
+        rows: list[dict[str, Any]],
+        raw: dict[str, Any],
+        added: dict[str, list],
+        dedup_reports: dict[str, DedupReport],
+        *,
+        chat_id: Optional[str],
+    ) -> None:
+        """Persist what this pass changed; never fails the extraction itself."""
+        assert self.extraction_log is not None
+        try:
+            report = recorder.build_report(
+                rows=rows, raw=raw, added=added, dedup_reports=dedup_reports
+            )
+            self.extraction_log.record(
+                report,
+                chat_id=chat_id,
+                user_id=recorder.user_id,
+                participants=recorder.users,
+                created_at=recorder.started,
+                duration_ms=(time.time() - recorder.started) * 1000.0,
+            )
+        except Exception as exc:  # noqa: BLE001 - the changelog is best-effort
+            warnings.warn(
+                f"[charactermemory] extraction log write failed: {type(exc).__name__}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     @chat_serialized
     def _extract_chat(self, chat: Chat) -> None:
@@ -1665,16 +1739,17 @@ class CharacterAgent:
         # `KnowledgeGraphRetriever.update` ignores the rest.
         kg.retriever.update(added, sync_index=False)
 
-    def _dedup_added(self, added: dict[str, list]) -> None:
+    def _dedup_added(self, added: dict[str, list]) -> dict[str, DedupReport]:
         """Post-extraction step: compact freshly-added items per memory.
 
         ``added`` maps memory name -> the items that memory's
         ``apply_extraction`` reported as newly added. Only runs when a
         `Deduplicator` is configured. Any mutations are mirrored into the
-        knowledge graph via `apply_deduplication`.
+        knowledge graph via `apply_deduplication`. Returns the per-memory
+        reports (empty when dedup is off).
         """
         if not self.deduplicator:
-            return
+            return {}
         reports: dict[str, DedupReport] = {}
         for name, items in added.items():
             mem = self.memories.get(name)
@@ -1685,6 +1760,7 @@ class CharacterAgent:
         kg = self.memories.get(_KG_MEMORY)
         if isinstance(kg, KnowledgeGraphMemory) and reports and self.deduplicator.decision_client is None:
             kg.retriever.apply_deduplication(reports, sync_index=False)
+        return reports
 
     def dedup(
         self,

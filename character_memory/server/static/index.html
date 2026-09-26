@@ -32,7 +32,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=cm-brand-4">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=extractions-1">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -48,6 +48,7 @@
         <button id="tab-browse" class="tab active" role="tab" aria-selected="true"><i data-lucide="layers-3" class="icon tab-icon" aria-hidden="true"></i> Memories</button>
         <button id="tab-configure" class="tab" role="tab" aria-selected="false"><i data-lucide="user-round-pen" class="icon tab-icon" aria-hidden="true"></i> Character studio</button>
         <button id="tab-live" class="tab" role="tab" aria-selected="false"><i data-lucide="radar" class="icon tab-icon" aria-hidden="true"></i> Live recall</button>
+        <button id="tab-extractions" class="tab" role="tab" aria-selected="false"><i data-lucide="sparkles" class="icon tab-icon" aria-hidden="true"></i> Extractions</button>
       </nav>
       <div class="topbar-actions">
         <label class="char-picker">
@@ -312,6 +313,37 @@
           <span>The latest request will appear here automatically.</span>
         </div>
       </aside>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- Extractions: what each extraction pass learned (extractions.js).  -->
+    <!-- ================================================================ -->
+    <div id="ex-pane" class="ex-pane hidden">
+      <header class="live-head ex-head">
+        <div class="live-title-wrap">
+          <div class="live-eyebrow"><span id="ex-status-dot" class="live-status-dot connecting"></span><span id="ex-status">Loading…</span></div>
+          <h2>Extractions</h2>
+          <p>What the character learned after each conversation: new memories, profile updates, knowledge-graph links and mood shifts.</p>
+        </div>
+        <button class="btn mobile-tools-toggle" type="button" aria-expanded="false" aria-controls="ex-toolbar">Filters</button>
+        <div id="ex-toolbar" class="live-head-actions mobile-toolbar">
+          <select id="ex-user" class="user-filter" title="Only passes where this user took part"></select>
+          <label class="ex-check" title="Hide passes that did not change anything">
+            <input id="ex-hide-empty" type="checkbox">
+            <span>Hide empty passes</span>
+          </label>
+          <button id="ex-follow" class="btn ghost" type="button" aria-pressed="true" title="Automatically open the newest pass when it arrives"><i data-lucide="arrow-up-to-line" class="icon"></i><span class="btn-label">Follow latest</span></button>
+          <button id="ex-refresh" class="btn ghost icon-btn" type="button" title="Reload" aria-label="Reload extraction passes"><i data-lucide="refresh-cw" class="icon"></i></button>
+        </div>
+      </header>
+      <div class="live-layout ex-layout">
+        <aside class="live-timeline-panel ex-runs-panel">
+          <div class="live-panel-label"><span>Extraction passes</span><span id="ex-count">0</span></div>
+          <div id="ex-runs" class="live-timeline ex-runs" aria-label="Extraction passes"></div>
+          <button id="ex-more" class="btn ghost ex-more hidden" type="button">Load older passes</button>
+        </aside>
+        <main id="ex-detail" class="live-main ex-detail" aria-live="polite"></main>
+      </div>
     </div>
 
     <!-- Schema-driven editor for structured memories and emotion state. -->
@@ -636,7 +668,8 @@
   </div>
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[CharacterMemory] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
-  <script src="/gui/static/app.js?v=mobile-3"></script>
+  <script src="/gui/static/app.js?v=extractions-1"></script>
   <script src="/gui/static/config.js?v=k-zero-1"></script>
+  <script src="/gui/static/extractions.js?v=extractions-1"></script>
 </body>
 </html>

@@ -468,12 +468,21 @@ class Deduplicator:
                     report.merged += 1
                 report.updated_ids.append(dup_id)
                 report.removed_ids.append(row_id)
+                report.decisions.append({
+                    "incoming_id": row_id, "survivor_id": dup_id,
+                    "action": "resolve" if reason == "contradict" else "merge",
+                    "reason": reason,
+                })
             else:
                 # Drop the newer row (this item); keep the existing one.
                 memory.delete_row(row_id)
                 del rows_by_id[row_id]
                 report.skipped += 1
                 report.removed_ids.append(row_id)
+                report.decisions.append({
+                    "incoming_id": row_id, "survivor_id": dup_id,
+                    "action": "discard", "reason": reason,
+                })
 
         memory.apply_index_changes(
             removed_ids=report.removed_ids,

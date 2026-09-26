@@ -378,6 +378,9 @@ class MemoryConfig:
     sticky_threshold: float = 0.95
     # Extraction of facts/directives/episodes runs every N turns.
     extract_interval: int = 5
+    # How many recent extraction passes to keep in the `extraction_runs`
+    # changelog (what each pass added / changed). 0 disables recording.
+    extraction_log_limit: int = 200
     # Decay half-life (seconds). Used by facts/episodic/heartbeat.
     decay_half_life: float = 60 * 60 * 24 * 3 # Three days
     # How recalled items are timestamped in the prompt: "none", "absolute"
