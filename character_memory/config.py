@@ -336,6 +336,8 @@ class MemoryConfig:
 
     # Toggles
     enabled_character_info: bool = True
+    enabled_character_self: bool = True
+    enabled_prospective: bool = True
     enabled_dialogue_style: bool = True
     enabled_user_facts: bool = True
     enabled_user_directives: bool = True
@@ -357,6 +359,8 @@ class MemoryConfig:
     # in length (short entities versus full facts/episodes). ``0`` disables
     # automatic prompt retrieval for that memory; MCP and tools still work.
     character_info_k: int = 4
+    character_self_k: int = 4
+    prospective_k: int = 2
     dialogue_style_k: int = 4
     user_facts_k: int = 5
     user_directives_k: int = 4
@@ -383,6 +387,9 @@ class MemoryConfig:
     extraction_log_limit: int = 200
     # Decay half-life (seconds). Used by facts/episodic/heartbeat.
     decay_half_life: float = 60 * 60 * 24 * 3 # Three days
+    # Minimum interval between unsolicited reminders of the same open thread.
+    # Direct semantic matches can still recall it during this interval.
+    prospective_follow_up_interval: float = 60 * 60 * 24
     # How recalled items are timestamped in the prompt: "none", "absolute"
     # (short local date+time, e.g. [2026-08-14 09:30]), "relative" (humanized
     # age, e.g. [2 days ago]) or "both" (e.g. [2026-08-12 16:33 (2 days ago)]).
@@ -431,6 +438,10 @@ class MemoryConfig:
         from .reranking import validate_budget
 
         validate_budget(self.token_budget)
+        import math
+        if (not math.isfinite(self.prospective_follow_up_interval)
+                or self.prospective_follow_up_interval < 0):
+            raise ValueError("prospective_follow_up_interval must be finite and nonnegative")
 
     def is_enabled(self, name: str) -> bool:
         return bool(getattr(self, f"enabled_{name}", False))

@@ -1,5 +1,7 @@
 from .base import Memory, MemoryItem, MemoryScope, ExtractionSpec, RecallResult
 from .character_base import CharacterInfoMemory, DialogueStyleMemory, RAGMemory
+from .character_self import CharacterSelfMemory
+from .prospective import ProspectiveMemory
 from .conversation_events import ConversationEventMemory
 from .dedup import DedupReport, Deduplicator
 from .emotion import EmotionStatus
@@ -40,6 +42,8 @@ __all__ = [
     "ExtractionSpec",
     "RAGMemory",
     "CharacterInfoMemory",
+    "CharacterSelfMemory",
+    "ProspectiveMemory",
     "DialogueStyleMemory",
     "ConversationEventMemory",
     "UserFactMemory",

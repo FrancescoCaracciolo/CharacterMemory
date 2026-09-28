@@ -292,6 +292,12 @@ class StructuredMemory(Memory):
             if float(row["importance"]) >= self.sticky_threshold
         ]
 
+    def _filter_recall_rows(
+        self, rows: list[dict[str, Any]], audience: list[str]
+    ) -> list[dict[str, Any]]:
+        """Filter authoritative rows before ranking or recall telemetry."""
+        return rows
+
     def _additional_relevance(
         self,
         query: Query,
@@ -397,12 +403,14 @@ class StructuredMemory(Memory):
         temporal_resolution: bool | "TemporalResolution" | None = None,
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: float = 1.0,
+        audience: Optional[list[str]] = None,
     ) -> list[MemoryItem]:
         if limit <= 0:
             return []
 
         where = self._recall_where(user_id)
-        rows = self.store.select(self.table, where)
+        stored_rows = self.store.select(self.table, where)
+        rows = self._filter_recall_rows(stored_rows, audience or [user_id])
         rows_by_id = {int(r["id"]): r for r in rows}
         if not rows_by_id:
             return []
@@ -413,7 +421,8 @@ class StructuredMemory(Memory):
         candidate_pool = int(getattr(self.hybrid, "candidate_pool", max(limit, 30)))
         hits = self.hybrid.search(
             query,
-            k=max(limit, candidate_pool),
+            # Audience-hidden rows must not consume the visible candidate pool.
+            k=max(limit, candidate_pool) + len(stored_rows) - len(rows),
             where=where,
         )
         relevance_by_id = {

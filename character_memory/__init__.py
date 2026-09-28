@@ -55,6 +55,8 @@ from .llm import (
 from .llm.base import LLMResponse
 from .memory import (
     CharacterInfoMemory,
+    CharacterSelfMemory,
+    ProspectiveMemory,
     ConversationEventMemory,
     DialogueStyleMemory,
     DedupReport,
@@ -254,6 +256,8 @@ __all__ = [
     "ExtractionSpec",
     "StructuredMemory",
     "CharacterInfoMemory",
+    "CharacterSelfMemory",
+    "ProspectiveMemory",
     "ConversationEventMemory",
     "DialogueStyleMemory",
     "UserFactMemory",

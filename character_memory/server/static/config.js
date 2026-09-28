@@ -30,6 +30,8 @@ const API = "";
 // `k` flags whether the memory has a retrieval-size number input.
 const MEMORIES = [
   { name: "character_info", title: "Character info", k: true },
+  { name: "character_self", title: "Character statements", k: true },
+  { name: "prospective", title: "Open threads", k: true },
   { name: "dialogue_style", title: "Dialogue style", k: true },
   { name: "user_facts", title: "User facts", k: true },
   { name: "user_directives", title: "User directives", k: true },
@@ -43,7 +45,7 @@ const MEMORIES = [
 ];
 
 const DEFAULT_SECTION_ORDER = [
-  "character_info", "emotion", "world", "calendar", "user_directives", "user_facts",
+  "character_info", "character_self", "emotion", "world", "calendar", "prospective", "user_directives", "user_facts",
   "episodic", "conversation_events", "heartbeat", "user_summary",
   "knowledge_graph", "dialogue_style",
 ];

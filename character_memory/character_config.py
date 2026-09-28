@@ -311,6 +311,16 @@ def build_full_config(data: dict[str, Any]) -> tuple[CharacterMemoryConfig, Prom
         retrieval=_build_subconfig(RetrievalConfig, data.get("retrieval")),
     )
     prompts = _build_prompt_config(data.get("prompts"))
+    # Older saved layouts predate these default-on memories. Extend them once
+    # while retaining the user's relative order. Once the toggle is explicitly
+    # present, an omitted section remains an intentional configuration choice.
+    raw_memory = data.get("memory") or {}
+    for name, anchor in (("character_self", "character_info"), ("prospective", "calendar")):
+        if (prompts.section_order and name not in prompts.section_order
+                and f"enabled_{name}" not in raw_memory and full.memory.is_enabled(name)):
+            position = (prompts.section_order.index(anchor) + 1
+                        if anchor in prompts.section_order else len(prompts.section_order))
+            prompts.section_order.insert(position, name)
     return full, prompts
 
 

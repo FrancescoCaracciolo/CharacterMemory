@@ -38,8 +38,8 @@ from .base import ExtractionSpec
 _DEFAULT_EXTRACTION_HEADER = (
     "You are the memory extractor for {character_name}, a role-play character"
     "{persona_clause}. Analyze the recent conversation and extract durable, "
-    "reusable information about {user_name} and about events {character_name} "
-    "experienced.\n"
+    "reusable information about {user_name}, {character_name}'s own statements "
+    "and experiences, and unresolved matters worth following up.\n"
 )
 _DEFAULT_SENTENCE_RULE = (
     "Each extracted item must be a self-contained full sentence that uses the "
@@ -68,7 +68,7 @@ _DEFAULT_MULTI_NOTE = (
 )
 
 _PROVENANCE_NOTE = (
-    "Every extracted fact, directive, and episode must include "
+    "Every extracted fact, directive, episode, character statement, and thread update must include "
     "`source_message_ids`: the IDs of the transcript messages that directly "
     "support it. Cite only IDs shown in the transcript."
 )
@@ -88,8 +88,8 @@ _SNAPSHOT_NOTE = (
 # Legacy header/footer kept for the no-context path (backward compatibility).
 _INSTRUCTION_HEADER = (
     "You are a memory extractor for a role-play character. Analyze the recent "
-    "conversation and extract durable, reusable information about the USER and "
-    "about events.\n"
+    "conversation and extract durable, reusable information about the USER, "
+    "the character's own statements and experiences, and unresolved matters.\n"
 )
 _INSTRUCTION_FOOTER = _DEFAULT_EXTRACTION_FOOTER
 
@@ -115,6 +115,8 @@ class ExtractionContext:
     persona: str = ""
     known_facts: list[str] = field(default_factory=list)
     participants: list[str] = field(default_factory=list)
+    # Evidence available to context-aware memories when applying an update.
+    turns: list[dict[str, Any]] = field(default_factory=list)
     # Prompt templates (override via PromptConfig); interpolated at build time.
     header: str = _DEFAULT_EXTRACTION_HEADER
     sentence_rule: str = _DEFAULT_SENTENCE_RULE

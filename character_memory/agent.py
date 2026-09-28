@@ -61,6 +61,8 @@ from .rag.base import RAGSystem
 from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
 from .memory.user_facts import UserFactMemory
+from .memory.character_self import CharacterSelfMemory
+from .memory.prospective import ProspectiveMemory
 from .memory.user_summary import UserSummaryMemory
 from .memory.world import WorldMemory, WorldSnapshot
 from .memory.calendar import CalendarMemory
@@ -96,6 +98,8 @@ _DIALOGUE_GLOB = "Dialogues"
 # Names of the two RAG memories populated from the character directory and of
 # the structured memories whose hybrid index is rebuilt from SQLite rows.
 _STRUCTURED_MEMORIES = (
+    "character_self",
+    "prospective",
     "user_facts",
     "user_directives",
     "episodic",
@@ -389,7 +393,7 @@ class CharacterAgent:
             self.store = SQLiteStore(os.path.join(self.save_directory, "memory.db"))
 
     def _build_memories(self, m: MemoryConfig) -> None:
-        """Construct the seven standard memories (config-driven path)."""
+        """Construct the standard memories (config-driven path)."""
         self.memories = {}
         half = m.decay_half_life
         sticky = m.sticky_threshold
@@ -430,6 +434,15 @@ class CharacterAgent:
         )
         self.memories["dialogue_style"] = DialogueStyleMemory(
             hybrid("dialogue_style"), enabled=m.is_enabled("dialogue_style")
+        )
+        self.memories["character_self"] = CharacterSelfMemory(
+            self.store, hybrid("character_self"), enabled=m.is_enabled("character_self"),
+            half_life=half, sticky_threshold=sticky,
+        )
+        self.memories["prospective"] = ProspectiveMemory(
+            self.store, hybrid("prospective"), enabled=m.is_enabled("prospective"),
+            half_life=half, sticky_threshold=sticky,
+            follow_up_interval=m.prospective_follow_up_interval,
         )
         self.memories["user_facts"] = UserFactMemory(
             self.store, hybrid("user_facts"), enabled=m.is_enabled("user_facts"),

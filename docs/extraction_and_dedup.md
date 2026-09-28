@@ -15,7 +15,7 @@ For each enabled memory that returns a non-None ExtractionSpec:
 Combine every spec into ONE JSON schema + ONE instruction
 Run a single chat_structured call over the labelled transcript
 For each (memory, spec):
-    items = memory.apply_extraction(extracted[spec.field], user_id, chat_id=chat_id)
+    items = memory.apply_extraction_with_context(extracted[spec.field], context, chat_id=chat_id)
 Track freshly-added items in extracted["__added__"]
 Persist structured indexes
 Feed added items to the knowledge graph (incremental update)
@@ -25,8 +25,14 @@ Flag the processed messages extracted=1
 
 The combined-schema trick is the heart of it: even if five memories want to
 learn, **one** LLM call produces facts + directives + episodes + emotion
-deltas + user summaries in a single JSON object. Each memory then consumes
+deltas + user summaries + character statements + open threads in a single JSON object. Each memory then consumes
 its slice.
+
+The context-aware apply hook defaults to the existing `apply_extraction`
+method, so custom memories need no changes. Context includes the transcript
+turns with message IDs. Character statements require assistant-message
+evidence; prospective updates require evidence from the current transcript.
+See [Conversational continuity](continuity.md) for their lifecycle and scope.
 
 ### World-memory boundary
 

@@ -32,6 +32,9 @@ class PromptConfig:
     section_template: str = "## {title}\n{body}"
 
     character_info_header: str = "Character Information"
+    character_self_header: str = "Your established statements and disclosures"
+    prospective_header: str = "Open threads to follow up with this user"
+    prospective_header_multi: str = "Open threads to follow up with these users"
     dialogue_style_header: str = "Example Exchanges (style reference)"
     user_facts_header: str = "What you remember about this user"
     user_directives_header: str = "Standing instructions from this user"
@@ -63,8 +66,8 @@ class PromptConfig:
     extraction_header: str = (
         "You are the memory extractor for {character_name}, a role-play character"
         "{persona_clause}. Analyze the recent conversation and extract durable, "
-        "reusable information about {user_name} and about events {character_name} "
-        "experienced.\n"
+        "reusable information about {user_name}, {character_name}'s own statements "
+        "and experiences, and unresolved matters worth following up.\n"
     )
     extraction_sentence_rule: str = (
         "Each extracted item must be a self-contained full sentence that uses the "
@@ -130,9 +133,11 @@ class PromptConfig:
     section_order: list[str] = field(
         default_factory=lambda: [
             "character_info",
+            "character_self",
             "emotion",
             "world",
             "calendar",
+            "prospective",
             "user_directives",
             "user_facts",
             "episodic",

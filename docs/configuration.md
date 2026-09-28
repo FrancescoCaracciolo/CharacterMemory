@@ -129,6 +129,11 @@ memory API, and custom-engine seam.
 | Field | Default | Notes |
 |---|---|---|
 | `enabled_character_info` | `True` | and one `enabled_*` per memory |
+| `enabled_character_self` | `True` | Learned character statements and disclosure audience |
+| `enabled_prospective` | `True` | Undated concerns, promises and unresolved threads |
+| `character_self_k` | `4` | Maximum recalled character statements |
+| `prospective_k` | `2` | Maximum recalled open threads per participant |
+| `prospective_follow_up_interval` | `86400` | Seconds between unsolicited reminders; relevant queries can still recall a thread |
 | `enabled_knowledge_graph` | `False` | KG is opt-in |
 | `enabled_calendar` | `False` | Dated events and weekly routines |
 | `enabled_world` | `False` | Exact private-world state, routines, needs, and facts |
@@ -148,6 +153,13 @@ memory API, and custom-engine seam.
 | `calendar` | `CalendarConfig()` | timezone, nearby recall window, world-routine import, extraction |
 
 Helpers: `MemoryConfig.is_enabled(name)` and `MemoryConfig.k_for(name)`.
+
+See [Conversational continuity](continuity.md) for extraction, disclosure rules,
+thread completion and direct library APIs. Older saved prompt orders gain
+`character_self` and `prospective` when their new toggle fields are absent.
+Explicit toggle fields preserve an intentionally omitted section; an empty
+section order remains empty. Python-created `PromptConfig(section_order=...)`
+objects retain exactly the supplied order.
 
 Set `memory.token_budget: 3000` in YAML or use
 `MemoryConfig(token_budget=3000)` in Python. Per-call `budget` overrides apply

@@ -239,6 +239,7 @@ class Character:
             raise ValueError("No LLM specified. Character.extract needs a LLM configured")
         parts = participants if participants else None
         context = self._extraction_context(user_id, participants=parts)
+        context.turns = turns
         # Only enabled memories that opt into extraction.
         participating = [
             (mem, spec)
@@ -255,7 +256,9 @@ class Character:
         for mem, spec in participating:
             from .concurrency import object_lock
             with object_lock(mem):
-                items = mem.apply_extraction(extracted.get(spec.field), user_id, chat_id=chat_id)
+                items = mem.apply_extraction_with_context(
+                    extracted.get(spec.field), context, chat_id=chat_id
+                )
             if items:
                 added[mem.name] = items
         # Carry the freshly-added items so the caller (e.g. a deduplicator)

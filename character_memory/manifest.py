@@ -42,6 +42,8 @@ from .prompts import PromptConfig
 # with MemoryConfig's enabled_* / *_k fields and PromptConfig.section_order.
 MEMORY_NAMES: tuple[str, ...] = (
     "character_info",
+    "character_self",
+    "prospective",
     "dialogue_style",
     "user_facts",
     "user_directives",

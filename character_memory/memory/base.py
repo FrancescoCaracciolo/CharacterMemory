@@ -570,6 +570,12 @@ class Memory(ABC):
         """
         return None
 
+    def apply_extraction_with_context(
+        self, value: Any, context: "ExtractionContext", *, chat_id: Optional[str] = None
+    ) -> list[MemoryItem]:
+        """Apply with identity/evidence available; legacy subclasses need no changes."""
+        return self.apply_extraction(value, context.user_name, chat_id=chat_id)
+
     def apply_extraction(
         self, value: Any, user_id: str, *, chat_id: Optional[str] = None
     ) -> list[MemoryItem]:
