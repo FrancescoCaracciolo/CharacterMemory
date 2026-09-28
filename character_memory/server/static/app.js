@@ -1483,6 +1483,7 @@ function createGraphViz(canvas, opts) {
   const overlay = (opts && opts.overlay) || document.getElementById("graph-overlay");
   const visibility = opts && opts.visibility;
   const settings = (opts && opts.settings) || GRAPH_SETTINGS;
+  const tipDetail = opts && opts.tipDetail;
   const ctx = canvas.getContext("2d");
   const dpr = () => window.devicePixelRatio || 1;
 
@@ -1969,7 +1970,7 @@ function createGraphViz(canvas, opts) {
     if (n) {
       tip.innerHTML = `<div class="tt-kind">${GRAPH_KIND_LABEL[n.kind] || n.kind}</div>` +
         `<div>${esc(n.label)}</div>` +
-        `<div class="tt-act">activation ${Math.round(n.act * 100)}%</div>`;
+        `<div class="tt-act">${esc(tipDetail ? tipDetail(n) : `activation ${Math.round(n.act * 100)}%`)}</div>`;
       const s = toScreen(n.x, n.y);
       tip.style.left = clamp(s.x + 14, 4, view.w - tip.offsetWidth - 4) + "px";
       tip.style.top = clamp(s.y + 14, 4, view.h - tip.offsetHeight - 4) + "px";
@@ -3219,7 +3220,10 @@ async function init() {
 // Share DOM helpers with config.js (the Configure tab) through `window.cmUtil`
 // so the configurator never duplicates el()/clear()/$()/markdown()/getJSON().
 // authHeaders/authQuery carry the optional API key on config.js's own fetches.
-window.cmUtil = { $, el, clear, icon, setButtonContent, getJSON, markdown, esc, authHeaders, authQuery, relTime, absTime };
+window.cmUtil = {
+  $, el, clear, icon, setButtonContent, getJSON, markdown, esc, authHeaders, authQuery, relTime, absTime,
+  createGraphViz, GRAPH_SETTINGS_DEFAULTS,
+};
 
 function setTab(name, { history = true } = {}) {
   const viewTitle = LIVE_GRAPH_EMBED ? "Knowledge graph"

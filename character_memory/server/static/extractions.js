@@ -52,6 +52,10 @@ const DIRECTION_HINT = {
   both: "Two-way link",
 };
 const KNOWN_KINDS = new Set(["self", "person", "fact", "episode", "entity"]);
+// Chat and co-occurrence links are incidental bookkeeping, not learned
+// structure; they would drown the graph of what the pass actually added.
+const HIDDEN_EDGE_KINDS = new Set(["co_occurrence", "chat"]);
+const GRAPH_LABELS_ALWAYS_MAX = 25;
 
 const S = {
   character: null,
@@ -73,7 +77,19 @@ const S = {
   error: "",
   lastPoll: 0,
   wired: false,
+  graphViz: null,
 };
+
+// The graph renderer runs its own animation loop; it must be torn down
+// whenever its canvas leaves the page.
+function disposeGraph() {
+  if (S.graphViz) S.graphViz.destroy();
+  S.graphViz = null;
+}
+function resetDetail(box) {
+  disposeGraph();
+  clear(box);
+}
 
 function readFlag(key, fallback) {
   try {
@@ -415,7 +431,7 @@ async function renderDetail() {
   const seq = ++S.detailSeq;
   const placeholder = detailPlaceholder();
   if (placeholder) {
-    clear(box);
+    resetDetail(box);
     box.dataset.shown = "";
     box.classList.remove("is-loading");
     box.appendChild(placeholder);
@@ -431,13 +447,15 @@ async function renderDetail() {
     const run = cached || await loadRun(id);
     if (seq !== S.detailSeq) return;
     const keepScroll = box.dataset.shown === `${S.character}|${id}` ? box.scrollTop : 0;
-    clear(box);
-    box.appendChild(renderReport(run));
+    resetDetail(box);
+    const mounts = [];
+    box.appendChild(renderReport(run, mounts));
     box.dataset.shown = `${S.character}|${id}`;
     box.scrollTop = keepScroll;
+    for (const mount of mounts) mount();
   } catch (e) {
     if (seq !== S.detailSeq) return;
-    clear(box);
+    resetDetail(box);
     box.dataset.shown = "";
     box.appendChild(emptyState("triangle-alert", `Could not load pass #${id}`, e.message || String(e)));
   } finally {
@@ -445,12 +463,14 @@ async function renderDetail() {
   }
 }
 
-function renderReport(run) {
+// `mounts` collects callbacks that need the report attached to the document
+// (the graph canvas measures itself on creation).
+function renderReport(run, mounts = []) {
   const report = run.report || {};
   const names = nameMap(report);
   const c = run.counts || {};
   const multi = (run.participants || []).length > 1;
-  const ctx = { names, multi };
+  const ctx = { names, multi, mounts };
 
   const sections = [];
   const memSection = renderMemories(report.memories || {}, ctx);
@@ -728,8 +748,11 @@ function renderGraph(kg, ctx) {
   const links = kg.new_links || [];
   if (!kg.enabled || (!nodes.length && !links.length && !kg.removed_nodes)) return null;
   const body = [];
-  if (nodes.length) {
-    body.push(el("div", { class: "ex-nodes" }, nodes.map((n) => nodeCard(n, ctx))));
+  const cards = nodes.length ? el("div", { class: "ex-nodes" }, nodes.map((n) => nodeCard(n, ctx))) : null;
+  const graph = graphPanel(kg, cards, ctx);
+  if (graph) body.push(graph);
+  if (cards) {
+    body.push(cards);
     const more = (kg.new_nodes_total || nodes.length) - nodes.length;
     if (more > 0) body.push(el("p", { class: "ex-more-note" }, `…and ${plural(more, "more new node")} not listed.`));
   }
@@ -753,6 +776,111 @@ function renderGraph(kg, ctx) {
     { hint: `New nodes and what they connect to${kg.new_edge_count ? ` · ${plural(kg.new_edge_count, "new link")} in total` : ""}.` });
 }
 
+// Nodes/edges for the canvas renderer: every new node, the nodes it links to,
+// and new links between existing nodes — minus chat / co-occurrence edges.
+function graphData(kg) {
+  const nodes = new Map();
+  const edges = new Map();
+  const addNode = (n, isNew) => {
+    if (!n || !n.id) return;
+    const known = nodes.get(n.id);
+    if (known) { known.is_new = known.is_new || isNew; return; }
+    const label = n.label || n.id;
+    // The renderer picks its label field by kind (name / content / summary).
+    nodes.set(n.id, { id: n.id, kind: n.kind, name: label, content: label, summary: label, text: n.text || label, is_new: isNew });
+  };
+  const addEdge = (src, dst, kind, weight) => {
+    if (HIDDEN_EDGE_KINDS.has(kind) || src === dst) return false;
+    const key = [kind, ...[src, dst].sort()].join("\u0000");
+    if (!edges.has(key)) edges.set(key, { src, dst, kind, weight: Number(weight) || 0 });
+    return true;
+  };
+  for (const n of kg.new_nodes || []) {
+    addNode(n, true);
+    for (const nb of n.neighbors || []) {
+      const [src, dst] = nb.direction === "in" ? [nb.id, n.id] : [n.id, nb.id];
+      if (addEdge(src, dst, nb.edge_kind, nb.edge_weight)) addNode(nb, !!nb.is_new);
+    }
+  }
+  for (const l of kg.new_links || []) {
+    if (!l.src || !l.dst || !addEdge(l.src.id, l.dst.id, l.kind, l.weight)) continue;
+    addNode(l.src, false);
+    addNode(l.dst, false);
+  }
+  const list = [...nodes.values()].map((n) => ({ ...n, activation_norm: n.is_new ? 1 : 0.15 }));
+  return { nodes: list, edges: [...edges.values()] };
+}
+
+function graphPanel(kg, cards, ctx) {
+  const data = graphData(kg);
+  if (!data.nodes.length) return null;
+  const newCount = data.nodes.filter((n) => n.is_new).length;
+  const canvas = el("canvas", {
+    class: "graph-cy ex-graph-cy",
+    tabindex: "0",
+    "aria-label": "Graph of the nodes added in this pass and what they connect to. Drag to pan, scroll to zoom, click a node for details.",
+  });
+  const overlay = el("div", { class: "graph-overlay" });
+  const caption = el("div", { class: "ex-graph-caption" });
+  let gv = null;
+  const navBtn = (iconName, title, action) => el("button", {
+    type: "button", class: "graph-nav-btn", title, "aria-label": title,
+    onclick: () => { if (gv) action(gv); },
+  }, [icon(iconName)]);
+
+  const showCaption = (n) => {
+    clear(caption);
+    if (cards) {
+      for (const card of cards.querySelectorAll(".ex-node.is-focus")) card.classList.remove("is-focus");
+    }
+    if (!n) {
+      caption.appendChild(el("span", { class: "ex-graph-caption-hint" },
+        `${plural(newCount, "new node")} (large, glowing) · ${plural(data.nodes.length - newCount, "connected existing node")} · ${plural(data.edges.length, "link")}. Click a node for details.`));
+      return;
+    }
+    const raw = n.raw || {};
+    caption.append(...[
+      kindDot(raw.kind),
+      el("strong", {}, raw.name || raw.id),
+      el("span", { class: "ex-node-kind" }, raw.kind || ""),
+      raw.is_new ? el("span", { class: "ex-badge b-new" }, "new node") : el("span", { class: "ex-badge b-old" }, "existing node"),
+      raw.text && raw.text !== raw.name ? el("span", { class: "ex-graph-caption-text" }, raw.text) : null,
+    ].filter(Boolean));
+    const card = cards && cards.querySelector(`.ex-node[data-node-id="${CSS.escape(raw.id)}"]`);
+    if (card) card.classList.add("is-focus");
+  };
+  showCaption(null);
+
+  ctx.mounts.push(() => {
+    const settings = {
+      ...U.GRAPH_SETTINGS_DEFAULTS,
+      labelZoom: data.nodes.length <= GRAPH_LABELS_ALWAYS_MAX ? 0 : U.GRAPH_SETTINGS_DEFAULTS.labelZoom,
+    };
+    gv = U.createGraphViz(canvas, {
+      settings,
+      overlay,
+      onSelect: showCaption,
+      tipDetail: (n) => (n.raw && n.raw.is_new ? "new in this pass" : "existing node"),
+    });
+    S.graphViz = gv;
+    gv.setData(data);
+    requestAnimationFrame(() => gv.resize());
+  });
+
+  return el("div", { class: "ex-graph" }, [
+    el("div", { class: "ex-graph-canvas" }, [
+      canvas,
+      overlay,
+      el("div", { class: "graph-nav ex-graph-nav", role: "group", "aria-label": "Graph zoom controls" }, [
+        navBtn("plus", "Zoom in", (g) => g.zoomIn()),
+        navBtn("minus", "Zoom out", (g) => g.zoomOut()),
+        navBtn("maximize", "Fit to view", (g) => g.fit()),
+      ]),
+    ]),
+    caption,
+  ]);
+}
+
 function kindDot(kind) {
   return el("span", { class: `ex-dot dot-${kindClass(kind)}`, title: kind });
 }
@@ -768,7 +896,7 @@ function nodeCard(n, ctx) {
   const neighbors = n.neighbors || [];
   const kindLabel = n.kind_label || n.type || "";
   const hiddenCount = (n.neighbor_total || neighbors.length) - neighbors.length;
-  return el("div", { class: `ex-node kind-${kindClass(n.kind)}` }, [
+  return el("div", { class: `ex-node kind-${kindClass(n.kind)}`, "data-node-id": n.id }, [
     el("div", { class: "ex-node-head" }, [
       kindDot(n.kind),
       el("strong", { class: "ex-node-label" }, n.label || n.id),
@@ -944,6 +1072,8 @@ function activate(character) {
 function deactivate() {
   S.active = false;
   stopTimer();
+  // activate() re-renders the detail, which rebuilds the graph.
+  disposeGraph();
 }
 
 function setCharacter(name) {

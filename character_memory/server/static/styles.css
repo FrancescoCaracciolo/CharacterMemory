@@ -2710,6 +2710,20 @@ select, .user-filter, .filter-input, .search input, .chat-user, .chat-input, .cf
 .ex-links { display: flex; flex-direction: column; gap: 6px; }
 .ex-link { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 9px; padding: 7px 10px; font-size: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-2); }
 .ex-legend { padding: 0; }
+.ex-graph { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; background: var(--bg-2); }
+.ex-graph-canvas { position: relative; height: 360px; min-width: 0; overflow: hidden; }
+.ex-graph-canvas .graph-cy { min-height: 0; height: 100%; }
+.ex-graph-nav { left: 10px; bottom: 10px; }
+.ex-graph-nav .graph-nav-btn { width: 32px; height: 32px; }
+.ex-graph-caption {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 5px 8px; min-height: 36px;
+  padding: 8px 12px; font-size: 12px; border-top: 1px solid var(--border);
+}
+.ex-graph-caption .ex-node-kind { flex-basis: auto; padding-left: 0; }
+.ex-graph-caption-hint { color: var(--text-faint); }
+.ex-graph-caption-text { flex-basis: 100%; color: var(--text-dim); line-height: 1.45; overflow-wrap: anywhere; }
+.ex-node.is-focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+@media (max-width: 760px) { .ex-graph-canvas { height: 300px; } }
 
 /* Emotion bars: fill = value after the pass, marker = value before. */
 .ex-emo-block { display: flex; flex-direction: column; gap: 8px; }
