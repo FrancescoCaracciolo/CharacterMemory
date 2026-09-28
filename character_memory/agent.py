@@ -1038,11 +1038,21 @@ class CharacterAgent:
         self, target: Target, *, user_id: str = "default",
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        message: Optional[str] = None,
+        occurred_at: Optional[float] = None,
     ) -> ContextSnapshot:
-        """Build context once and expose the exact recalls used to build it."""
+        """Build context once, optionally using a temporary message for retrieval.
+
+        The temporary message retains the target's history and participants
+        without modifying the conversation.
+        """
         self._require_loaded()
         assert self.character is not None
         last_user_msg, uid, prior, participants, reference = self._resolve_target(target, user_id)
+        if message is not None:
+            last_user_msg = message
+            prior = [*prior, {"role": "user", "content": message}]
+            reference = occurred_at if occurred_at is not None else time.time()
         query = self._weighted_query(last_user_msg, prior)
         temporal = self._resolve_temporal(query, reference)
         return self.character.build_context_snapshot(

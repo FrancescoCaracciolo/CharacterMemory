@@ -288,7 +288,7 @@ List available characters.
 
 ### `POST /context`
 
-Resolve the chat (creating it if `chat_id` is missing or unknown), persist
+Resolve the chat (creating it if `chat_id` is missing), persist
 the user turn, and return the assembled memory context for the character +
 user.
 
@@ -299,7 +299,8 @@ user.
 | `character`    | string           | yes      | A subfolder of `assets/` (e.g. `"Kurisu"`).                  |
 | `user`         | string           | yes      | The user this chat belongs to.                               |
 | `message`      | string           | yes      | The user's latest message.                                   |
-| `chat_id`      | string           | no       | Existing chat id. If absent or unknown, a new chat is created. |
+| `chat_id`      | string           | no       | Existing chat id. Required when `save=false`; unknown ids return `404`. |
+| `save`         | boolean          | no       | Defaults to `true`. With `false`, use `message` only for retrieval without adding a message or creating a chat. Missing `chat_id` returns `422`. |
 | `budget`       | integer or null  | no       | Global memory token cap. Omit to inherit configuration; `null` removes the cap; `0` omits memories. |
 | `memory_types` | list[str] or null| no       | Specific memory names to recall (e.g. `["user_facts", "episodic"]`). Omitted memories bypass recall to save latency. `memories` is accepted as an alias. |
 

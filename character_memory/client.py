@@ -676,6 +676,7 @@ class CharacterMemoryClient:
         message: str,
         *,
         chat_id: Optional[str] = None,
+        save: bool = True,
         occurred_at: Optional[float] = None,
         budget: Budget = UNSET,
         memory_types: Union[Sequence[str], None, object] = UNSET,
@@ -687,6 +688,9 @@ class CharacterMemoryClient:
         returned :attr:`ContextResponse.chat_id` should be passed on later
         turns and to :meth:`save`.
 
+        With ``save=False``, an existing ``chat_id`` is required and ``message``
+        is temporary retrieval input; no chat or conversation message is created.
+
         Omitted ``budget`` inherits the character configuration. ``None``
         removes the cap; ``0`` omits memories; a positive integer caps the
         rendered memory sections (excluding intermediate prompt blocks).
@@ -697,6 +701,8 @@ class CharacterMemoryClient:
         """
         if budget is not UNSET:
             validate_budget(budget)
+        if not save and not chat_id:
+            raise ValueError("save=False requires an existing chat_id")
         body: dict[str, Any] = {
             "character": character,
             "user": user,
@@ -704,6 +710,8 @@ class CharacterMemoryClient:
         }
         if chat_id is not None:
             body["chat_id"] = chat_id
+        if not save:
+            body["save"] = False
         if occurred_at is not None:
             body["occurred_at"] = occurred_at
         if budget is not UNSET:

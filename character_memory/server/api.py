@@ -235,9 +235,10 @@ class ContextRequest(BaseModel):
     character: str = Field(..., description="Character name (a subfolder of assets/).")
     user: str = Field(..., description="User id of the current speaker for this turn.")
     message: str = Field(..., description="The user's latest message.")
+    save: bool = Field(default=True, description="Save the user turn. False requires an existing chat_id and only retrieves context.")
     chat_id: Optional[str] = Field(
         default=None,
-        description="Existing chat id. If absent or unknown, a new chat is created.",
+        description="Existing chat id. If absent, a new chat is created only when save is true.",
     )
     occurred_at: Optional[float] = Field(
         default=None,
@@ -402,12 +403,17 @@ def context(req: ContextRequest) -> ContextResponse:
     by `req.user`, and return the assembled memory context for the character +
     conversation participants.
 
+    With save=false, require an existing chat and use the message only as
+    temporary retrieval input.
+
     A chat id is an unguessable room key: any caller holding it may post as
     any speaker, which is what enables group chats. The chat owner is whoever
     created it; subsequent speakers are recorded via the per-turn `user_id`.
     """
     agent = _get_agent(req.character)
 
+    if not req.save and not req.chat_id:
+        raise HTTPException(status_code=422, detail="save=false requires an existing chat_id.")
     chat = None
     if req.chat_id:
         chat = agent.load_chat(req.chat_id)
@@ -421,13 +427,16 @@ def context(req: ContextRequest) -> ContextResponse:
 
     # Persist the user turn attributed to the current speaker. For a group
     # chat this is what makes each participant's messages attributable.
-    chat.add_message(
-        "user", req.message, user_id=req.user, occurred_at=req.occurred_at
-    )
+    if req.save:
+        chat.add_message(
+            "user", req.message, user_id=req.user, occurred_at=req.occurred_at
+        )
 
     # Missing and explicit null differ: only the latter removes the
     # character's configured cap.
     recall_options = {"budget": req.budget} if "budget" in req.model_fields_set else {}
+    if not req.save:
+        recall_options.update(message=req.message, occurred_at=req.occurred_at)
     if "memory_types" in req.model_fields_set or "memories" in req.model_fields_set:
         recall_options["memory_types"] = (
             req.memory_types if req.memory_types is not None else req.memories
