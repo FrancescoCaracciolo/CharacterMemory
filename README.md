@@ -8,9 +8,11 @@
 > [!WARNING]
 > This library is still in early release and under active documentation. APIs may change at any time prior to a stable release.
 
-<img width="927" height="339" alt="Screenshot 2026-09-02 alle 23 19 44" src="https://github.com/user-attachments/assets/d825da4e-d747-4942-819c-7627ec180ebf" />
-
-
+<picture>
+  <source srcset="https://github.com/user-attachments/assets/5648e15a-256d-4435-8a35-3d9864a78eab" media="(prefers-color-scheme: light)">
+  <source srcset="https://github.com/user-attachments/assets/e77809e6-699f-4929-9397-9025df744ac0" media="(prefers-color-scheme: dark)">
+  <img width="100%" alt="Banner character memory" src="https://github.com/user-attachments/assets/5648e15a-256d-4435-8a35-3d9864a78eab" />
+</picture>
 
 **AI Characters that live, remember and forget**
 
