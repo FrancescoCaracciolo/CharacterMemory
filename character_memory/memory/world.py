@@ -1206,6 +1206,20 @@ class WorldMemory(Memory):
         if indexed != current:
             self.records.rebuild_index()
 
+    @synchronized
+    def reset(self) -> None:
+        """Restore the authored seed and discard learned world state."""
+        self.records.reset()
+        # World state is more than the searchable records: clear the exact
+        # simulation tables too, then let the authored YAML seed recreate its
+        # locations, actors, routines, and initial state.
+        for table in (
+            "world_meta", "world_locations", "world_actors", "world_actor_state",
+            "world_routines", "world_scheduled_actions",
+        ):
+            self.store.execute(f'DELETE FROM "{table}"')
+        self.load_seed(scaffold=False)
+
     @property
     def observer_id(self) -> str:
         return self.state_store.observer_id

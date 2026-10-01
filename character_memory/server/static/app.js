@@ -747,6 +747,9 @@ function renderHeader() {
   $("mem-count").textContent = m.count != null ? `${m.count} records` : "";
   $("mem-disabled").classList.toggle("hidden", m.enabled !== false);
   $("add-memory").classList.toggle("hidden", !(state.editor && state.editor.editable));
+  const reset = $("reset-memory");
+  reset.classList.toggle("hidden", !m.resettable);
+  reset.disabled = !m.resettable;
 }
 
 function renderUserFilter(users) {
@@ -1215,6 +1218,28 @@ async function removeMemory(rec) {
     state.page = 1;
     await loadOverview();
   } catch (e) { toast(e.message, true); }
+}
+
+async function resetMemory() {
+  const memory = state.memories.find((item) => item.name === state.memory);
+  if (!memory || !memory.resettable) return;
+  const title = memory.title || memory.name;
+  if (!confirm(`Reset “${title}”? This permanently removes every record in this memory.`)) return;
+  const button = $("reset-memory");
+  button.disabled = true;
+  try {
+    await sendJSON(`${API}/api/memories/${encodeURIComponent(state.character)}/${encodeURIComponent(state.memory)}/reset`, { method: "POST" });
+    state.page = 1;
+    state.cache.clear();
+    state.q = "";
+    $("q").value = "";
+    toast(`${title} reset`);
+    await loadOverview();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 // The mobile picker is an inline disclosure, so it never covers content or
@@ -3155,6 +3180,7 @@ async function init() {
   wireApiKeyDialog();
   $("refresh").addEventListener("click", () => loadOverview());
   $("add-memory").addEventListener("click", () => openMemoryEditor());
+  $("reset-memory").addEventListener("click", resetMemory);
   $("memory-form").addEventListener("submit", saveMemory);
   $("memory-editor-close").addEventListener("click", closeMemoryEditor);
   $("memory-editor-cancel").addEventListener("click", closeMemoryEditor);

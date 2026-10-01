@@ -62,7 +62,7 @@ from character_memory import (
     MemoryConfig,
 )
 from character_memory.memory.calendar import CalendarMemory, SELF_OWNER, _parse_iso
-from character_memory.memory.base import MemoryItem
+from character_memory.memory.base import Memory, MemoryItem
 
 # Read-side memory browser: normalises each memory backend into paged,
 # searchable records and powers the GUI served at /gui.
@@ -625,6 +625,41 @@ def read_memories(
                 f"Available: {sorted(agent.memories)}."
             ),
         )
+
+
+def _persist_memory_reset(agent: CharacterAgent, memory: Memory) -> None:
+    """Publish a reset index using the same layout as ``CharacterAgent``."""
+    index_name = {
+        "character_info": "info_index",
+        "dialogue_style": "dialogue_index",
+        "knowledge_graph": "kg_index",
+    }.get(memory.name, f"{memory.name}_index")
+    memory.persist(os.path.join(agent.save_directory, index_name))
+
+
+@app.post("/api/memories/{character}/{memory}/reset")
+def reset_memory(character: str, memory: str) -> dict:
+    """Reset one memory and publish its empty/default state."""
+    agent = _get_agent(character)
+    mem = agent.memories.get(memory)
+    if mem is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown memory {memory!r} for {character!r}.",
+        )
+    if type(mem).reset is Memory.reset:
+        raise HTTPException(
+            status_code=405,
+            detail=f"Memory {memory!r} does not support resetting.",
+        )
+    try:
+        mem.reset()
+        _persist_memory_reset(agent, mem)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=405, detail=str(exc)) from exc
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not reset memory: {exc}") from exc
+    return {"ok": True, "character": character, "memory": memory}
 
 
 def _memory_for_edit(character: str, memory: str):

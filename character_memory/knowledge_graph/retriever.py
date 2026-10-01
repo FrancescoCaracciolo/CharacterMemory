@@ -180,6 +180,10 @@ class KnowledgeGraphRetriever:
         # once loaded or saved, routine extraction persists as a merge so a
         # stale worker cannot erase wiki rows written by another process.
         self._replace_on_next_save = True
+        # Explicit user resets publish an empty graph as-is.  The normal save
+        # path reconciles derived source projections, which would otherwise
+        # repopulate a graph immediately after the reset request.
+        self._skip_reconcile_on_next_save = False
         self._now = clock or _default_clock
         # user_ids the graph currently knows about (drives person resolution
         # and the SelfNode relation edges). Refreshed on every ingest.
@@ -328,6 +332,8 @@ class KnowledgeGraphRetriever:
                 pk="projector",
             )
         self._pending_projection_meta.clear()
+        self._last_projection_report.clear()
+        self._last_temporal_matches.clear()
 
     # --------------------------------------------------------------- ingestion
     @synchronized
@@ -1733,7 +1739,9 @@ class KnowledgeGraphRetriever:
     def save(self, path: str) -> "KnowledgeGraphRetriever":
         if self.hybrid is None or self.store is None:
             return self
-        self.reconcile_sources(sync_index=False)
+        skip_reconcile = self._skip_reconcile_on_next_save
+        if not skip_reconcile:
+            self.reconcile_sources(sync_index=False)
         self._ensure_privacy_scopes()
         self.graph = save_graph(
             self.graph,
@@ -1743,6 +1751,7 @@ class KnowledgeGraphRetriever:
             replace=self._replace_on_next_save,
         )
         self._replace_on_next_save = False
+        self._skip_reconcile_on_next_save = False
         self._commit_projection_meta()
         self._known_users = self._graph_user_ids()
         # The reload replaced the graph (dropping its attached caches); the
@@ -1792,7 +1801,14 @@ class KnowledgeGraphRetriever:
         self.graph = KnowledgeGraph()
         self._known_users = []
         self._replace_on_next_save = True
+        self._skip_reconcile_on_next_save = True
         self._pending_projection_meta.clear()
+        if self.store is not None:
+            try:
+                self.store.execute(f'DELETE FROM "{_PROJECTION_META_TABLE}"')
+            except self.store.operational_errors:
+                # The table is created lazily by source projection.
+                pass
         self._temporal_interval_cache.clear()
         return self
 

@@ -53,6 +53,11 @@ class ConversationEventMemory(StructuredMemory):
             self.store.track_table(self._KEY_TABLE, key="event_id", collection=self.hybrid.collection)
         self._backfill_occurrence_times()
 
+    def reset(self) -> None:
+        """Clear source events and their searchable extraction aliases."""
+        super().reset()
+        self.store.execute(f'DELETE FROM "{self._KEY_TABLE}"')
+
     def temporal_interval(
         self, row: dict[str, Any]
     ) -> tuple[float, Optional[float]] | None:

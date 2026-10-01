@@ -66,6 +66,10 @@ class RAGMemory(Memory):
     def load(self, path: str) -> None:
         return self.hybrid.load(path)
 
+    def reset(self) -> None:
+        """Drop every indexed chunk held by this memory."""
+        self.hybrid.build([])
+
 class CharacterInfoMemory(RAGMemory):
     """BM25 + similarity search over the character's wiki/story markdown."""
 

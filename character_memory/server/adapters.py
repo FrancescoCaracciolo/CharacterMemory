@@ -840,6 +840,10 @@ def overview(agent) -> list[dict[str, Any]]:
                 "enabled": bool(getattr(mem, "enabled", True)),
                 "count": _safe(adapter.count, default=0) or 0,
                 "users": _safe(adapter.users, default=[]) or [],
+                # Keep this separate from ``editable``: a memory may be
+                # immutable record-by-record while still supporting a full
+                # reset (for example a RAG corpus or conversation journal).
+                "resettable": type(mem).reset is not Memory.reset,
             }
         )
     return out

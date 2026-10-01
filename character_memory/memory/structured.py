@@ -24,7 +24,7 @@ from .decay import (
     intrinsic_score,
     relevance_repaired_score,
 )
-from .store_base import Store
+from .store_base import Store, identifier
 
 if TYPE_CHECKING:
     from ..temporal import TemporalMatch, TemporalResolution, TemporalResolutionEngine
@@ -107,6 +107,16 @@ class StructuredMemory(Memory):
     def load(self, path: str) -> None:
         self._reconciliation_index_applied.clear()
         return self.hybrid.load(path)
+
+    def reset(self) -> None:
+        """Delete all rows and rebuild this memory's retrieval index empty."""
+        # ``Store.delete`` deliberately rejects an empty filter.  The table
+        # name is owned by the memory class and validated by the store's SQL
+        # identifier helper, so a scoped DELETE is safe here and works for
+        # both SQLite and PostgreSQL-compatible stores.
+        self.store.execute(f"DELETE FROM {identifier(self.table)}")
+        self._reconciliation_index_applied.clear()
+        self.hybrid.build([])
     
     # MAPPING UTILITIES
     def row_text(self, row: dict[str, Any]) -> str:

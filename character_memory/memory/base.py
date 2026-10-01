@@ -192,6 +192,19 @@ class Memory(ABC):
         if name is not None:
             self.name = name
 
+    def reset(self) -> None:
+        """Reset this memory to an empty/default state.
+
+        The method is intentionally concrete so existing third-party memory
+        subclasses remain source-compatible when the lifecycle API grows.
+        Built-in memories override it with their storage/index specific
+        implementation; callers should treat ``NotImplementedError`` as an
+        unsupported reset operation.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support resetting"
+        )
+
     def resolve_temporal(
         self,
         query: Query,

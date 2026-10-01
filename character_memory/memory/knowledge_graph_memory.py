@@ -340,6 +340,10 @@ class KnowledgeGraphMemory(Memory):
     def load(self, path: str) -> None:
         self.retriever.load_persisted(path)
 
+    def reset(self) -> None:
+        """Wipe graph nodes, edges, activation, and recall counters."""
+        self.retriever.reset()
+
     @property
     def has_persisted(self) -> bool:
         # Delegated to the retriever once it knows the index path; the agent

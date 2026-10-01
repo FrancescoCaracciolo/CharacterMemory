@@ -169,6 +169,13 @@ with JSON `null` for unlimited. Existing per-memory limits still determine
 the candidates. Rerankers and token counters are Python constructor/callable
 injections, not YAML fields. See [Memory budget & reranking](memory_budget.md).
 
+In **Character studio → Persona & memories**, the **Global memory token budget**
+field sets this shared cap. Leave it blank for unlimited or enter `0` to omit
+memory sections. **Emotion defaults** edits the baseline mood (`0..1`) and
+initial relationship dimensions (`-1..1`). These defaults preserve the current
+learned mood and existing users' stored relationship values. Both controls save
+with **Save memories & order**.
+
 ### `WorldConfig` and `world.yaml`
 
 World time is resolved from the actor's current location, walking through its
@@ -181,6 +188,13 @@ required). `WorldMemory.add_fact(..., valid_until=...)`, the world editor, and
 the `upsert_world_fact` MCP tool use the same model. Expired temporary facts
 remain in the ledger as history but are excluded from current-state prompts,
 search, and knowledge-graph projection.
+
+In the WebUI's **Memories → World** view, use **Add memory**, **Edit**, and
+**Delete** to manage authored and learned world facts, including visibility,
+importance, and optional expiry. Editing or deleting an authored fact also
+updates `world.yaml`, so reloading the world preserves the change. World events
+remain immutable. The **Character studio → World** editor also manages authored
+facts alongside locations, actors, and routines.
 
 ### `DedupConfig`
 
@@ -202,8 +216,15 @@ Returned by `StructuredMemory.contradiction_policy()`. `enabled` (default
 
 ### `KnowledgeGraphConfig`
 
+In the web UI, open **Character studio → Persona & memories → Knowledge graph**
+to select a privacy policy, then click **Save memories & order**. The policy is
+saved as `memory.knowledge_graph.privacy` and takes effect in the running agent.
+It applies to recall with identified users; requests without user IDs retain
+unrestricted administrative access.
+
 | Field | Default | Notes |
 |---|---|---|
+| `privacy` | `none` | `none`: shared recall; `exclude`: hide other users' memories from results while allowing their retrieval influence; `private`: restrict both results and retrieval influence to the active participants' visible graph |
 | `decay` | `0.5` | ACT-R BLL decay parameter (d) |
 | `decay_half_life` | `604800` (1 week) | extra exponential recency factor on top of BLL |
 | `gain` | `0.35` | spreading-activation gain |

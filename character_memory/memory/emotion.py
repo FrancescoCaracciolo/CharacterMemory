@@ -259,6 +259,12 @@ class EmotionStatus(Memory):
     def persist(self, path: str) -> None:
         return None
 
+    def reset(self) -> None:
+        """Restore the configured mood baseline and forget user states."""
+        self.store.execute(f'DELETE FROM "{self.table}"')
+        self.store.execute(f'DELETE FROM "{self.state_table}"')
+        self.set_current_mood(self.baseline)
+
     # Extraction ----------------------------------------------------------
     # The relationship `comment` (colleague / friend / conflicting / …) is a
     # coarse label, not a delta. To avoid the extractor rewriting it every

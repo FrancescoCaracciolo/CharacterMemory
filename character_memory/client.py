@@ -176,6 +176,7 @@ class MemoryOverview:
     count: int
     users: list[str] = field(default_factory=list)
     editable: bool = False
+    resettable: bool = False
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "MemoryOverview":
@@ -192,6 +193,7 @@ class MemoryOverview:
                 count=int(payload.get("count", 0)),
                 users=[str(user) for user in raw_users],
                 editable=bool(payload.get("editable", False)),
+                resettable=bool(payload.get("resettable", False)),
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise CharacterMemoryClientError(
@@ -439,7 +441,7 @@ class CharacterMemoryClient:
         """Return every memory system configured for ``character``.
 
         Each summary includes its record count, known user ids, backend kind,
-        enabled state, and whether the server permits direct record edits.
+        enabled state, and whether the server permits direct edits or reset.
         """
         payload = self._request(
             "GET", self._path("api", "memories", character)
@@ -455,6 +457,12 @@ class CharacterMemoryClient:
 
     # GET /api/memories/{character}
     get_memories = list_memories
+
+    def reset_memory(self, character: str, memory: str) -> dict[str, Any]:
+        """Reset one memory to its empty/default state on the server."""
+        return self._request(
+            "POST", self._path("api", "memories", character, memory, "reset")
+        )
 
     def get_memory(
         self,
