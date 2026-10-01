@@ -61,8 +61,11 @@ const state = {
   q: "",
   calendarOffset: 0,
   showWorldRoutines: storedCalendarWorldRoutines(),
-  cache: new Map(),        // `${memory}|${user}|${q}|${calendarOffset}` -> Map(page -> data)
+  cache: new Map(),        // character + view filters -> Map(page -> data)
   inflight: null,          // AbortController for the active page fetch
+  overviewRequest: 0,
+  pageData: null,          // unfiltered data for the currently displayed page
+  deleting: new Map(),    // character + memory + record id -> pending deletion
   editor: { editable: false, fields: [], description: "" },
   editing: null,
   graph: { data: null, q: "", user: "", full: false, _gv: null, _wired: false }, // KG viz state
@@ -570,16 +573,19 @@ async function loadCharacters() {
   return true;
 }
 
-async function loadOverview() {
+async function loadOverview({ keepContent = false } = {}) {
   // Never query endpoints with a null/empty character — that produces a
   // confusing "Unknown character 'null'" error from the server.
   if (!state.character) {
     renderSidebar();
     return;
   }
+  const character = state.character;
+  const request = ++state.overviewRequest;
   const spin = $("refresh"); spin.classList.add("spinning");
   try {
-    const data = await getJSON(`${API}/api/memories/${encodeURIComponent(state.character)}`);
+    const data = await getJSON(`${API}/api/memories/${encodeURIComponent(character)}`);
+    if (request !== state.overviewRequest || character !== state.character) return;
     state.memories = data.memories || [];
     state.cache.clear();
     renderSidebar();
@@ -587,15 +593,15 @@ async function loadOverview() {
     if (!state.memories.some((m) => m.name === state.memory)) {
       state.memory = (state.memories[0] && state.memories[0].name) || null;
     }
-    await loadPage();
+    await loadPage({ keepContent });
   } catch (e) {
-    showError(e.message);
+    if (request === state.overviewRequest && character === state.character) showError(e.message);
   } finally {
-    spin.classList.remove("spinning");
+    if (request === state.overviewRequest) spin.classList.remove("spinning");
   }
 }
 
-function cacheKey() { return `${state.memory}|${state.user || ""}|${state.q}|${state.calendarOffset}`; }
+function cacheKey() { return JSON.stringify([state.character, state.memory, state.user || "", state.q, state.calendarOffset]); }
 
 function calendarRange() {
   // Keep the navigation anchored to calendar months instead of a rolling
@@ -647,25 +653,30 @@ function setWorldRoutinesVisible(visible) {
   try { localStorage.setItem(CALENDAR_WORLD_ROUTINES_KEY, String(visible)); } catch (error) { /* storage may be disabled */ }
 }
 
-async function loadPage() {
+async function loadPage({ keepContent = false } = {}) {
+  // Cached navigation must also cancel an older request for another view.
+  if (state.inflight) state.inflight.abort();
+  state.inflight = null;
   if (!state.memory) { renderEmpty("Select a memory", ""); return; }
   $("status").classList.add("hidden");
   const key = cacheKey();
+  const { character, memory, page, q } = state;
   let pages = state.cache.get(key);
   if (!pages) { pages = new Map(); state.cache.set(key, pages); }
 
-  if (pages.has(state.page)) {
-    renderPage(pages.get(state.page));
+  if (pages.has(page)) {
+    renderPage(pages.get(page));
     return;
   }
 
   // cancel any in-flight fetch (debounced search / rapid paging).
-  if (state.inflight) state.inflight.abort();
   const ac = new AbortController();
   state.inflight = ac;
-  renderSkeletons();
+  if (!keepContent || !state.pageData || state.pageData.character !== character || state.pageData.data.memory !== memory) {
+    renderSkeletons();
+  }
 
-  const params = new URLSearchParams({ page: state.page, size: state.size });
+  const params = new URLSearchParams({ page, size: state.size });
   if (state.user) params.set("user", state.user);
   if (state.q) params.set("q", state.q);
   let url;
@@ -683,9 +694,10 @@ async function loadPage() {
 
   try {
     const data = await getJSON(url, ac.signal);
-    const normalized = state.memory === "calendar"
+    if (ac.signal.aborted || state.inflight !== ac || key !== cacheKey() || page !== state.page) return;
+    const normalized = memory === "calendar"
       ? {
-          memory: "calendar", kind: "calendar", search: !!state.q, q: state.q,
+          memory: "calendar", kind: "calendar", search: !!q, q,
           page: 1, pages: 1, total: (data.events || []).length, size: SIZE,
           users: (state.memories.find((m) => m.name === "calendar") || {}).users || [],
           editor: { editable: true, fields: calendarEditorFields(data.timezone || "UTC"), description: "Create one-off events with the date picker, or weekly routines with the day selector. World routines are read-only live projections." },
@@ -701,11 +713,15 @@ async function loadPage() {
           })),
         }
       : data;
-    pages.set(state.page, normalized);
-    if (state.inflight === ac) state.inflight = null;
+    // Deleting the last record on a page can leave that page out of range.
+    if (normalized.page > normalized.pages) {
+      state.page = normalized.pages;
+      return loadPage({ keepContent });
+    }
+    pages.set(page, normalized);
     renderPage(normalized);
   } catch (e) {
-    if (e.name === "AbortError") return;
+    if (e.name === "AbortError" || ac.signal.aborted || state.inflight !== ac) return;
     showError(e.message);
   } finally {
     if (state.inflight === ac) state.inflight = null;
@@ -782,7 +798,21 @@ function renderExtra(extra) {
   ]));
 }
 
+function withoutRecords(data, ids) {
+  const records = data.records || [];
+  const remaining = records.filter((rec) => !ids.has(String(rec.id)));
+  if (remaining.length === records.length) return data;
+  const total = Math.max(0, data.total - (records.length - remaining.length));
+  return { ...data, records: remaining, total, pages: Math.max(data.page, Math.ceil(total / data.size)) };
+}
+
 function renderPage(data) {
+  state.pageData = { character: state.character, data };
+  // A read started during a slow delete may still contain the pending row.
+  const ids = new Set([...state.deleting.values()]
+    .filter((item) => item.character === state.character && item.memory === data.memory)
+    .map((item) => item.id));
+  data = withoutRecords(data, ids);
   state.editor = data.editor || { editable: false, fields: [], description: "" };
   renderHeader();
   renderUserFilter(data.users);
@@ -985,8 +1015,10 @@ function renderPaginator(data) {
   const box = $("paginator"); clear(box);
   const { page, pages, total, size, search } = data;
   if (!total) return;
-  box.appendChild(el("span", { class: "pg-info" },
-    `${(page - 1) * size + 1}–${Math.min(page * size, total)} of ${total}${search ? " matches" : ""}`));
+  const info = (data.records || []).length
+    ? `${(page - 1) * size + 1}–${Math.min(page * size, total)} of ${total}${search ? " matches" : ""}`
+    : `${total}${search ? " matches" : " records"}`;
+  box.appendChild(el("span", { class: "pg-info" }, info));
 
   const btn = (content, target, opts = {}) => el("button", {
     class: "pg-btn" + (opts.active ? " active" : ""),
@@ -1210,14 +1242,49 @@ async function saveMemory(event) {
 }
 
 async function removeMemory(rec) {
+  const { character, memory } = state;
+  const id = String(rec.id);
+  const key = JSON.stringify([character, memory, id]);
+  if (state.deleting.has(key)) return;
   if (!confirm(`Delete memory ${rec.id}? This cannot be undone.`)) return;
-  const url = `${API}/api/memories/${encodeURIComponent(state.character)}/${encodeURIComponent(state.memory)}/${encodeURIComponent(rec.id)}`;
+  const url = `${API}/api/memories/${encodeURIComponent(character)}/${encodeURIComponent(memory)}/${encodeURIComponent(id)}`;
+  state.deleting.set(key, { character, memory, id });
+  const overview = state.memories.find((item) => item.name === memory);
+  if (overview) overview.count = Math.max(0, overview.count - 1);
+  // Invalidate older reads and redraw before waiting for index persistence.
+  state.overviewRequest += 1;
+  $("refresh").classList.remove("spinning");
+  if (state.inflight) state.inflight.abort();
+  renderSidebar();
+  if (state.pageData && state.pageData.character === character && state.pageData.data.memory === memory) {
+    renderPage(state.pageData.data);
+  }
   try {
     await sendJSON(url, { method: "DELETE" });
-    toast("Memory deleted");
-    state.page = 1;
-    await loadOverview();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    state.deleting.delete(key);
+    if (state.character === character) {
+      if (state.memories.includes(overview)) overview.count += 1;
+      renderSidebar();
+      if (state.pageData && state.pageData.character === character && state.pageData.data.memory === memory) {
+        renderPage(state.pageData.data);
+      }
+    }
+    toast(e.message, true);
+    return;
+  }
+  // Remove confirmed rows from the original data too, so overlapping deletes
+  // can roll back independently without resurrecting an earlier deletion.
+  if (state.pageData && state.pageData.character === character && state.pageData.data.memory === memory) {
+    state.pageData.data = withoutRecords(state.pageData.data, new Set([id]));
+  }
+  state.deleting.delete(key);
+  toast("Memory deleted");
+  if (state.character === character) {
+    state.cache.clear();
+    if (state.inflight) state.inflight.abort();
+    await loadOverview({ keepContent: true });
+  }
 }
 
 async function resetMemory() {
@@ -3060,6 +3127,7 @@ function deactivateLive() {
 }
 
 function resetCharacterView() {
+  state.pageData = null;
   state.memory = null; state.page = 1; state.q = ""; state.user = "";
   state.editor = { editable: false, fields: [], description: "" };
   if (state.graph._gv) { try { state.graph._gv.destroy(); } catch (error) {} }
