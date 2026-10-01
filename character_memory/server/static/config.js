@@ -55,6 +55,17 @@ const SECTION_TITLES = Object.fromEntries([
 ]);
 const INTERMEDIATE_PROMPT_PREFIX = "prompt:";
 
+const KG_PRIVACY_HINTS = {
+  none: "All users’ memories can be recalled.",
+  exclude: "Only memories visible to the active participants are returned. Other users’ memories can still influence recall.",
+  private: "Only memories visible to the active participants can be returned or influence recall.",
+};
+
+const EMOTION_GROUPS = [
+  { key: "emotion_baseline", target: "cfg-emotion-baseline", min: 0 },
+  { key: "emotion_user_dims", target: "cfg-emotion-user-dims", min: -1 },
+];
+
 const DEDUP_FIELDS = [
   { key: "enabled", label: "Enable deduplication", type: "checkbox" },
   { key: "exact", label: "Exact matching", type: "checkbox", hint: "Ignore case and surrounding whitespace." },
@@ -849,8 +860,11 @@ function renderConfig() {
   $("cfg-persona").value = cfg.persona || "";
   renderMemoryList(cfg.memory || {});
   renderDedup(cfg.memory?.dedup || {});
+  $("cfg-token-budget").value = cfg.memory?.token_budget ?? "";
+  renderEmotionDefaults(cfg.memory || {});
   $("cfg-kg").checked = !!cfg.kg_enabled;
-  $("cfg-kg-token-budget").disabled = !cfg.kg_enabled;
+  $("cfg-kg-privacy").value = cfg.memory?.knowledge_graph?.privacy || "none";
+  refreshKnowledgeGraphControls();
   $("cfg-kg-token-budget").value = String(
     cfg.memory && cfg.memory.knowledge_graph_token_budget != null
       ? cfg.memory.knowledge_graph_token_budget
@@ -863,6 +877,44 @@ function renderConfig() {
     cfg.section_order || DEFAULT_SECTION_ORDER,
     cfg.intermediate_prompts || {},
   );
+}
+
+function refreshKnowledgeGraphControls() {
+  const enabled = $("cfg-kg").checked;
+  $("cfg-kg-token-budget").disabled = !enabled;
+  $("cfg-kg-privacy").disabled = !enabled;
+  $("cfg-kg-privacy-hint").textContent = KG_PRIVACY_HINTS[$("cfg-kg-privacy").value];
+}
+
+function renderEmotionDefaults(memory) {
+  for (const group of EMOTION_GROUPS) {
+    const box = $(group.target); clear(box);
+    for (const [axis, value] of Object.entries(memory[group.key] || {})) {
+      const id = `cfg-${group.key}-${axis}`;
+      const input = el("input", {
+        id, type: "number", min: group.min, max: 1, step: "any", required: true,
+        class: "cfg-dedup-input", value: String(value),
+        "data-emotion-group": group.key, "data-emotion-axis": axis,
+      });
+      input.addEventListener("input", dirtyMemory);
+      box.appendChild(el("div", { class: "cfg-dedup-field" }, [
+        el("label", { for: id }, axis.replaceAll("_", " ")), input,
+      ]));
+    }
+  }
+}
+
+function gatherEmotionDefaults() {
+  const defaults = {};
+  for (const group of EMOTION_GROUPS) {
+    const values = {};
+    for (const input of $(group.target).querySelectorAll("[data-emotion-axis]")) {
+      if (!input.reportValidity()) throw new Error(`Check emotion default: ${input.dataset.emotionAxis}.`);
+      values[input.dataset.emotionAxis] = Number(input.value);
+    }
+    defaults[group.key] = values;
+  }
+  return defaults;
 }
 
 function renderMemoryList(mem) {
@@ -1141,7 +1193,14 @@ function dirtyMemory() {
 }
 
 function gatherConfig() {
-  const mem = { dedup: gatherDedup() };
+  const mem = {
+    dedup: gatherDedup(),
+    knowledge_graph: { privacy: $("cfg-kg-privacy").value },
+    ...gatherEmotionDefaults(),
+  };
+  const budget = $("cfg-token-budget");
+  if (!budget.reportValidity()) throw new Error("Global memory token budget must be a nonnegative integer.");
+  mem.token_budget = budget.value === "" ? null : Number(budget.value);
   for (const m of MEMORIES) {
     const tog = document.querySelector(`.switch-input[data-mem="${m.name}"]`);
     if (tog) mem[`enabled_${m.name}`] = tog.checked;
@@ -1653,12 +1712,17 @@ function wire() {
   $("cfg-save-memory").addEventListener("click", saveMemory);
   $("cfg-add-intermediate-prompt").addEventListener("click", addIntermediatePrompt);
   $("cfg-kg").addEventListener("change", () => {
-    $("cfg-kg-token-budget").disabled = !$("cfg-kg").checked;
+    refreshKnowledgeGraphControls();
     if ($("cfg-kg").checked) ensureSectionIncluded("knowledge_graph");
     refreshSectionOrderRows();
     dirtyMemory();
   });
+  $("cfg-kg-privacy").addEventListener("change", () => {
+    refreshKnowledgeGraphControls();
+    dirtyMemory();
+  });
   $("cfg-kg-token-budget").addEventListener("input", dirtyMemory);
+  $("cfg-token-budget").addEventListener("input", dirtyMemory);
   $("cfg-extract-interval").addEventListener("input", dirtyMemory);
 
   document.querySelectorAll(".editor-tabs .etab").forEach((b) => {

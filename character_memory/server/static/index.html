@@ -443,6 +443,11 @@
             </div>
             <div id="cfg-memory-list" class="cfg-memory-list"></div>
             <div class="cfg-extract-row">
+              <label class="cfg-label" for="cfg-token-budget">Global memory token budget</label>
+              <input id="cfg-token-budget" type="number" min="0" step="1" class="k-input cfg-budget-input" placeholder="Unlimited" aria-describedby="cfg-token-budget-hint">
+            </div>
+            <div id="cfg-token-budget-hint" class="cfg-hint">Maximum tokens across all recalled memory sections. Leave blank for unlimited; 0 omits memories from context.</div>
+            <div class="cfg-extract-row">
               <label class="cfg-label" for="cfg-extract-interval">Automatic extraction</label>
               <span class="k-wrap">
                 <span class="k-label">every</span>
@@ -451,6 +456,14 @@
               </span>
             </div>
             <div class="cfg-hint">Learning runs once a chat has this many new user turns since its last extraction. <code>POST /extract</code> forces it early.</div>
+            <details class="cfg-dedup-panel">
+              <summary class="cfg-label">Emotion defaults</summary>
+              <p class="cfg-hint">Set the character’s resting mood and initial feelings toward new users. Existing learned mood and relationships are preserved. Save with “Save memories &amp; order” above.</p>
+              <label class="cfg-label">Baseline mood · 0 to 1</label>
+              <div id="cfg-emotion-baseline" class="cfg-dedup-fields"></div>
+              <p class="cfg-label">Relationship defaults · −1 to 1</p>
+              <div id="cfg-emotion-user-dims" class="cfg-dedup-fields"></div>
+            </details>
             <details class="cfg-dedup-panel">
               <summary class="cfg-label">Deduplication &amp; decision model</summary>
               <p class="cfg-hint">Reconcile duplicate structured memories after extraction. Save with “Save memories &amp; order” above. When disabled, the legacy exact-match guard still applies.</p>
@@ -479,6 +492,16 @@
                 <input id="cfg-kg-token-budget" type="number" min="0" step="100" class="k-input">
               </span>
             </div>
+            <div class="cfg-block-head">
+              <label class="cfg-label" for="cfg-kg-privacy">Privacy</label>
+              <select id="cfg-kg-privacy" aria-describedby="cfg-kg-privacy-hint cfg-kg-privacy-save-hint">
+                <option value="none">None · shared recall</option>
+                <option value="exclude">Exclude · hide other users' memories</option>
+                <option value="private">Private · isolate recall by user</option>
+              </select>
+            </div>
+            <span id="cfg-kg-privacy-hint" class="cfg-hint" aria-live="polite"></span>
+            <span id="cfg-kg-privacy-save-hint" class="cfg-hint">Applies to recall for identified users. Save with “Save memories &amp; order” above.</span>
             <span class="cfg-hint">Off by default. Building it runs an LLM extraction pass.</span>
           </div>
 
@@ -677,8 +700,8 @@
   </div>
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[CharacterMemory] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
-  <script src="/gui/static/app.js?v=extractions-graph-1"></script>
-  <script src="/gui/static/config.js?v=extract-interval-1"></script>
+  <script src="/gui/static/app.js?v=memory-settings-1"></script>
+  <script src="/gui/static/config.js?v=memory-settings-1"></script>
   <script src="/gui/static/extractions.js?v=extractions-graph-1"></script>
 </body>
 </html>

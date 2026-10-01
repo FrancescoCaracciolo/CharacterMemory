@@ -24,13 +24,16 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from character_memory import EmotionStatus, Memory, StructuredMemory
 from character_memory.emotion_vectors import emotion_similarity, emotional_impact
 from character_memory.memory.character_base import RAGMemory
 from character_memory.memory.knowledge_graph_memory import KnowledgeGraphMemory
 from character_memory.memory.calendar import CalendarMemory, SELF_OWNER
+from character_memory.memory.world import WorldMemory
 
 # Hard cap on how many hits search ever ranks, so a query against a huge memory
 # stays snappy. Pagination slices within this ranked window.
@@ -769,6 +772,23 @@ class GenericAdapter(MemoryAdapter):
 # --------------------------------------------------------------------------- #
 # Registry.
 # --------------------------------------------------------------------------- #
+class WorldAdapter(GenericAdapter):
+    """World facts expose edit values; immutable events remain browseable."""
+
+    def _record(self, item, idx: int, score: Optional[float] = None) -> MemoryRecord:
+        record = super()._record(item, idx, score)
+        metadata = record.fields.get("metadata") or {}
+        record.fields["temporal_kind"] = metadata.get(
+            "temporal_kind", "temporary" if record.fields.get("valid_until") is not None else "durable"
+        )
+        record.fields["readonly"] = record.fields.get("record_type") != "fact"
+        if record.fields.get("valid_until") is not None:
+            record.fields["valid_until"] = datetime.fromtimestamp(
+                float(record.fields["valid_until"]), ZoneInfo(self.memory.state_store.timezone)
+            ).isoformat()
+        return record
+
+
 _BY_NAME: dict[str, type[MemoryAdapter]] = {}
 
 
@@ -786,6 +806,8 @@ def get_adapter(memory: Memory) -> MemoryAdapter:
         return KnowledgeGraphAdapter(memory)
     if isinstance(memory, CalendarMemory):
         return CalendarAdapter(memory)
+    if isinstance(memory, WorldMemory):
+        return WorldAdapter(memory)
     if isinstance(memory, EmotionStatus):
         return EmotionAdapter(memory)
     if isinstance(memory, RAGMemory):

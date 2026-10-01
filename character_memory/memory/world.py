@@ -13,6 +13,7 @@ from ..concurrency import synchronized
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -1156,6 +1157,7 @@ class WorldMemory(Memory):
                     "content": content, "subject_id": fact.get("subject_id"),
                     "location_id": fact.get("location_id"),
                     "visibility": str(fact.get("visibility") or "known"),
+                    "importance": float(fact.get("importance", row.get("importance", 0.8))),
                     "valid_until": valid_until,
                     "metadata_json": _json({"temporal_kind": temporal_kind}),
                 }
@@ -1544,6 +1546,75 @@ class WorldMemory(Memory):
             dedupe_key=dedupe_key, metadata_json=_json({"temporal_kind": kind}),
         )
         self._bump_record_revision()
+        return row_id
+
+    def _editable_fact(self, row_id: int) -> dict[str, Any]:
+        row = self.records.get_row(row_id)
+        if row is None:
+            raise KeyError(row_id)
+        if row.get("record_type") != "fact":
+            raise ValueError("World events are immutable; only facts can be edited or removed")
+        return row
+
+    @synchronized
+    def update_fact(self, row_id: int, **changes: Any) -> int:
+        """Edit a fact, keeping authored facts in sync with the world seed."""
+        row = self._editable_fact(row_id)
+        allowed = {"content", "subject_id", "location_id", "visibility", "importance", "temporal_kind", "valid_until"}
+        if set(changes) - allowed:
+            raise ValueError(f"Unknown world fact fields: {sorted(set(changes) - allowed)}")
+        values = {key: row.get(key) for key in allowed if key != "temporal_kind"}
+        values["temporal_kind"] = _loads(row.get("metadata_json"), {}).get(
+            "temporal_kind", "temporary" if row.get("valid_until") is not None else "durable"
+        )
+        values.update(changes)
+        text = values["content"]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("World fact content cannot be empty")
+        values["content"] = text.strip()
+        if values["visibility"] not in {"public", "known", "local", "private"}:
+            raise ValueError("World fact visibility must be public, known, local, or private")
+        importance = values["importance"]
+        if type(importance) not in (int, float) or not math.isfinite(importance) or not 0 <= importance <= 1:
+            raise ValueError("World fact importance must be a finite number between 0 and 1")
+        expiry = _timestamp(values["valid_until"], timezone=self.state_store.timezone)
+        kind = values["temporal_kind"]
+        if kind not in {"durable", "temporary"}:
+            raise ValueError("World fact temporal_kind must be durable or temporary")
+        if kind == "temporary" and (expiry is None or not math.isfinite(expiry)):
+            raise ValueError("Temporary world facts require a finite valid_until")
+        if kind == "durable" and expiry is not None:
+            raise ValueError("Durable world facts cannot have valid_until")
+        values["valid_until"] = expiry
+        if row.get("source") == "seed":
+            seed = self.seed_view()
+            for fact in seed["facts"]:
+                if fact["id"] == row["dedupe_key"]:
+                    fact.update(values)
+                    break
+            self.save_seed(seed)
+        else:
+            metadata = _loads(row.get("metadata_json"), {})
+            metadata["temporal_kind"] = values.pop("temporal_kind")
+            row.update(values)
+            row["metadata_json"] = _json(metadata)
+            self.records.update_row(row)
+            self._bump_record_revision()
+            self.records.apply_index_changes(updated_ids=[row_id])
+        return row_id
+
+    @synchronized
+    def delete_fact(self, row_id: int) -> int:
+        """Remove a fact from its authoritative source and retrieval index."""
+        row = self._editable_fact(row_id)
+        if row.get("source") == "seed":
+            seed = self.seed_view()
+            seed["facts"] = [fact for fact in seed["facts"] if fact["id"] != row["dedupe_key"]]
+            self.save_seed(seed)
+        else:
+            self.records.delete_row(row_id)
+            self._bump_record_revision()
+            self.records.apply_index_changes(removed_ids=[row_id])
         return row_id
 
     @synchronized

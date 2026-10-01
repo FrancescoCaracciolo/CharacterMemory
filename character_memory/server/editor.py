@@ -11,6 +11,7 @@ files and a direct edit would disappear on the next rebuild.
 from __future__ import annotations
 
 import json
+import math
 import re
 import warnings
 from typing import Any
@@ -21,6 +22,7 @@ from ..memory.calendar import CalendarMemory
 from ..memory.emotion import EmotionStatus
 from ..memory.episodic import EpisodicMemory
 from ..memory.structured import StructuredMemory
+from ..memory.world import WorldMemory, _timestamp
 
 
 _FIELD_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
@@ -161,6 +163,20 @@ def _structured_schema(memory: StructuredMemory) -> dict[str, Any]:
 
 def edit_schema(memory: Any) -> dict[str, Any]:
     """Return the small JSON form schema consumed by the WebUI."""
+    if isinstance(memory, WorldMemory):
+        return {
+            "editable": True,
+            "fields": [
+                {"name": "content", "label": "Fact", "type": "textarea", "required": True},
+                {"name": "subject_id", "label": "Subject actor", "type": "select", "options": ["", *[actor["id"] for actor in memory.state_store.actors()]]},
+                {"name": "location_id", "label": "Location", "type": "select", "options": ["", *[location["id"] for location in memory.state_store.locations()]]},
+                {"name": "visibility", "label": "Visibility", "type": "select", "options": ["known", "public", "local", "private"], "default": "known"},
+                {"name": "temporal_kind", "label": "Validity", "type": "select", "options": ["durable", "temporary"], "default": "durable"},
+                {"name": "valid_until", "label": "Valid until (temporary facts only)", "type": "text", "placeholder": "2036-01-01T12:00:00+01:00"},
+                {"name": "importance", "label": "Importance", "type": "range", "required": True, "min": 0, "max": 1, "step": 0.05, "default": 0.6},
+            ],
+            "description": "Add, edit, or remove world facts. Authored facts also update world.yaml. Historical world events are immutable.",
+        }
     if isinstance(memory, ConversationEventMemory):
         return {
             "editable": False,
@@ -264,6 +280,11 @@ def _normalise(memory: Any, values: dict[str, Any], *, partial: bool) -> dict[st
                 clean[name] = field["default"]
             continue
         value = values[name]
+        if isinstance(memory, WorldMemory):
+            if field["type"] == "select" and str(value or "") not in field["options"]:
+                raise ValueError(f"Invalid {field['label']}.")
+            if name == "importance" and (type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1):
+                raise ValueError("Importance must be a finite number between 0 and 1.")
         if field["type"] == "range":
             clean[name] = _clip(value, float(field["min"]), float(field["max"]))
         elif field["type"] == "number":
@@ -293,6 +314,17 @@ def _normalise(memory: Any, values: dict[str, Any], *, partial: bool) -> dict[st
     return clean
 
 
+def _world_fact_values(memory: WorldMemory, clean: dict[str, Any]) -> dict[str, Any]:
+    for name in ("subject_id", "location_id"):
+        if name in clean:
+            clean[name] = clean[name] or None
+    if "valid_until" in clean:
+        clean["valid_until"] = _timestamp(clean["valid_until"], timezone=memory.state_store.timezone)
+        if clean["valid_until"] is not None and not math.isfinite(clean["valid_until"]):
+            raise ValueError("Valid until must be a finite timestamp.")
+    return clean
+
+
 def _refresh_index(
     agent: Any,
     memory: StructuredMemory,
@@ -319,6 +351,10 @@ def _refresh_index(
 
 def create_record(agent: Any, memory: Any, values: dict[str, Any]) -> Any:
     clean = _normalise(memory, values, partial=False)
+    if isinstance(memory, WorldMemory):
+        row_id = memory.add_fact(source="webui", **_world_fact_values(memory, clean))
+        _refresh_index(agent, memory.records)
+        return row_id
     if isinstance(memory, EmotionStatus):
         user_id = clean.pop("user_id")
         comment = clean.pop("comment", "")
@@ -361,6 +397,14 @@ def update_record(
     agent: Any, memory: Any, record_id: str, values: dict[str, Any]
 ) -> Any:
     clean = _normalise(memory, values, partial=True)
+    if isinstance(memory, WorldMemory):
+        try:
+            row_id = int(record_id)
+        except ValueError as exc:
+            raise ValueError("World fact IDs must be integers.") from exc
+        memory.update_fact(row_id, **_world_fact_values(memory, clean))
+        _refresh_index(agent, memory.records)
+        return row_id
     if isinstance(memory, EmotionStatus):
         user_id = record_id
         clean.pop("user_id", None)
@@ -402,6 +446,14 @@ def delete_record(agent: Any, memory: Any, record_id: str) -> Any:
     schema = edit_schema(memory)
     if not schema["editable"]:
         raise ValueError(schema["description"])
+    if isinstance(memory, WorldMemory):
+        try:
+            row_id = int(record_id)
+        except ValueError as exc:
+            raise ValueError("World fact IDs must be integers.") from exc
+        memory.delete_fact(row_id)
+        _refresh_index(agent, memory.records)
+        return row_id
     if isinstance(memory, EmotionStatus):
         rows = memory.store.select(memory.table, {"user_id": record_id})
         if not rows:

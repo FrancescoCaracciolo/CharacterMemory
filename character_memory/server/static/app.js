@@ -348,7 +348,7 @@ function markdown(text) {
 function wrapCard(children, rec) {
   const head = el("div", { class: "card-tags" }, []);
   const pill = scorePill(rec);
-  const actions = state.editor && state.editor.editable && !(rec.fields && rec.fields.virtual)
+  const actions = state.editor && state.editor.editable && !(rec.fields && (rec.fields.virtual || rec.fields.readonly))
     ? el("div", { class: "card-actions" }, [
         el("button", { class: "card-action", type: "button", title: "Edit memory", onclick: (event) => {
           event.stopPropagation(); openMemoryEditor(rec);
@@ -1147,6 +1147,7 @@ function syncConditionalEditorFields() {
 
 function openMemoryEditor(rec = null) {
   if (!state.editor || !state.editor.editable) return;
+  if (rec && rec.fields && rec.fields.readonly) return;
   state.editing = rec;
   $("memory-editor-eyebrow").textContent = rec ? `Record ${rec.id}` : "New record";
   $("memory-editor-title").textContent = `${rec ? "Edit" : "Add"} ${$("mem-title").textContent}`;

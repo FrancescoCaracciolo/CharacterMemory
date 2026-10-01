@@ -59,8 +59,9 @@ from character_memory.character_config import (
     save_config,
 )
 from character_memory.manifest import MEMORY_NAMES
-from character_memory.config import DedupConfig
+from character_memory.config import DedupConfig, KnowledgeGraphConfig, KnowledgeGraphPrivacy
 from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX
+from character_memory.reranking import validate_budget
 from .sync import MemorySync
 
 # Two file buckets the GUI knows about. Map to the on-disk directories the
@@ -194,6 +195,36 @@ def _patch_dedup(current: DedupConfig, patch: Any) -> DedupConfig:
             raise HTTPException(422, f"memory.dedup.{key}: {error}")
         values[key] = value
     return DedupConfig(**values)
+
+
+def _patch_knowledge_graph(current: KnowledgeGraphConfig, patch: Any) -> KnowledgeGraphConfig:
+    """Update GUI privacy settings while preserving other graph tunables."""
+    if not isinstance(patch, dict):
+        raise HTTPException(422, "memory.knowledge_graph must be an object")
+    values = asdict(current)
+    for key, value in patch.items():
+        if key != "privacy":
+            raise HTTPException(422, f"memory.knowledge_graph.{key}: unknown setting")
+        try:
+            values[key] = KnowledgeGraphPrivacy.coerce(value)
+        except ValueError as exc:
+            raise HTTPException(422, f"memory.knowledge_graph.privacy: {exc}") from exc
+    return KnowledgeGraphConfig(**values)
+
+
+def _patch_emotion_defaults(current: dict, patch: Any, name: str) -> dict[str, float]:
+    """Validate partial defaults without changing learned emotion state."""
+    if not isinstance(patch, dict):
+        raise HTTPException(422, f"memory.{name} must be an object")
+    values = dict(current)
+    minimum = 0 if name == "emotion_baseline" else -1
+    for axis, value in patch.items():
+        if not isinstance(axis, str) or not axis.strip() or axis != axis.strip() or axis == "comment":
+            raise HTTPException(422, f"memory.{name}: invalid emotion dimension {axis!r}")
+        if type(value) not in (int, float) or not math.isfinite(value) or not minimum <= value <= 1:
+            raise HTTPException(422, f"memory.{name}.{axis} must be a finite number between {minimum} and 1")
+        values[axis] = float(value)
+    return values
 
 
 class ConfigPatch(BaseModel):
@@ -686,6 +717,10 @@ def build_admin_router(
             if hasattr(mem, f"{m}_k"):
                 memory_view[f"{m}_k"] = getattr(mem, f"{m}_k")
         memory_view["knowledge_graph_token_budget"] = mem.knowledge_graph_token_budget
+        memory_view["knowledge_graph"] = {"privacy": mem.knowledge_graph.privacy.value}
+        memory_view["token_budget"] = mem.token_budget
+        memory_view["emotion_baseline"] = dict(mem.emotion_baseline)
+        memory_view["emotion_user_dims"] = dict(mem.emotion_user_dims)
         memory_view["extract_interval"] = mem.extract_interval
         memory_view["dedup"] = asdict(mem.dedup)
         marker = os.path.join(_char_dir(name), ".knowledge_graph")
@@ -760,6 +795,16 @@ def build_admin_router(
             for key, val in patch.memory.items():
                 if key == "dedup":
                     mem.dedup = _patch_dedup(mem.dedup, val)
+                elif key == "knowledge_graph":
+                    mem.knowledge_graph = _patch_knowledge_graph(mem.knowledge_graph, val)
+                elif key == "token_budget":
+                    try:
+                        validate_budget(val)
+                    except ValueError as exc:
+                        raise HTTPException(422, f"memory.token_budget: {exc}") from exc
+                    mem.token_budget = val
+                elif key in ("emotion_baseline", "emotion_user_dims"):
+                    setattr(mem, key, _patch_emotion_defaults(getattr(mem, key), val, key))
                 elif key.startswith("enabled_") and key[len("enabled_"):] in MEMORY_NAMES:
                     setattr(mem, key, bool(val))
                     if bool(val):

@@ -186,6 +186,9 @@ select option { background: var(--bg-2); }
 .card-body .text { white-space: pre-wrap; word-break: break-word; }
 .kw-chips { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
 .kw { font: 500 11px var(--mono); color: var(--info); background: #6fb7ef1a; border: 1px solid #6fb7ef40; padding: 1px 7px; border-radius: 6px; }
+.card .chip, .card .kw {
+  min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere;
+}
 
 /* bars */
 .field { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
@@ -1754,6 +1757,7 @@ select option { background: var(--input); color: var(--text); }
 .world-element-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 43px; }
 .world-element-tools .btn { border-width: 1.5px; border-radius: 8px; }
 .cfg-extract-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-top: 16px; }
+.cfg-budget-input { width: 120px; text-align: left; }
 .cfg-dedup-panel { margin-top: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 9px; }
 .cfg-dedup-panel > summary { cursor: pointer; }
 .cfg-dedup-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 16px; margin-top: 14px; }
