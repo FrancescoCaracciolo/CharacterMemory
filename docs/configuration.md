@@ -132,6 +132,7 @@ memory API, and custom-engine seam.
 | `enabled_character_self` | `True` | Learned character statements and disclosure audience |
 | `enabled_prospective` | `True` | Undated concerns, promises and unresolved threads |
 | `character_self_k` | `4` | Maximum recalled character statements |
+| `character_self_privacy` | `"private"` | `private`: respect each statement's visibility and disclosure audience; `none`: allow all statements in recall across users. Configurable in the WebUI with **Character Self privacy**. |
 | `prospective_k` | `2` | Maximum recalled open threads per participant |
 | `prospective_follow_up_interval` | `86400` | Seconds between unsolicited reminders; relevant queries can still recall a thread |
 | `enabled_knowledge_graph` | `False` | KG is opt-in |
