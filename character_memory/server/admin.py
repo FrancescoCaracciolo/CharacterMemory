@@ -59,7 +59,7 @@ from character_memory.character_config import (
     save_config,
 )
 from character_memory.manifest import MEMORY_NAMES
-from character_memory.config import DedupConfig, KnowledgeGraphConfig, KnowledgeGraphPrivacy
+from character_memory.config import CharacterSelfPrivacy, DedupConfig, KnowledgeGraphConfig, KnowledgeGraphPrivacy
 from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX
 from character_memory.reranking import validate_budget
 from .sync import MemorySync
@@ -718,6 +718,7 @@ def build_admin_router(
                 memory_view[f"{m}_k"] = getattr(mem, f"{m}_k")
         memory_view["knowledge_graph_token_budget"] = mem.knowledge_graph_token_budget
         memory_view["knowledge_graph"] = {"privacy": mem.knowledge_graph.privacy.value}
+        memory_view["character_self_privacy"] = mem.character_self_privacy.value
         memory_view["token_budget"] = mem.token_budget
         memory_view["emotion_baseline"] = dict(mem.emotion_baseline)
         memory_view["emotion_user_dims"] = dict(mem.emotion_user_dims)
@@ -797,6 +798,11 @@ def build_admin_router(
                     mem.dedup = _patch_dedup(mem.dedup, val)
                 elif key == "knowledge_graph":
                     mem.knowledge_graph = _patch_knowledge_graph(mem.knowledge_graph, val)
+                elif key == "character_self_privacy":
+                    try:
+                        mem.character_self_privacy = CharacterSelfPrivacy.coerce(val)
+                    except ValueError as exc:
+                        raise HTTPException(422, f"memory.character_self_privacy: {exc}") from exc
                 elif key == "token_budget":
                     try:
                         validate_budget(val)

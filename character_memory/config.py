@@ -200,6 +200,24 @@ class ContradictionPolicy:
     show_timestamps: bool = True
 
 
+class CharacterSelfPrivacy(str, Enum):
+    """Whether character statements respect their recorded disclosure audience."""
+
+    NONE = "none"
+    PRIVATE = "private"
+
+    @classmethod
+    def coerce(cls, value: object) -> "CharacterSelfPrivacy":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                pass
+        raise ValueError("character-self privacy must be one of: none, private")
+
+
 class KnowledgeGraphPrivacy(str, Enum):
     """How user-scoped nodes participate in knowledge-graph retrieval."""
 
@@ -360,6 +378,8 @@ class MemoryConfig:
     # automatic prompt retrieval for that memory; MCP and tools still work.
     character_info_k: int = 4
     character_self_k: int = 4
+    # Preserve disclosure-aware recall unless shared recall is explicitly chosen.
+    character_self_privacy: CharacterSelfPrivacy = CharacterSelfPrivacy.PRIVATE
     prospective_k: int = 2
     dialogue_style_k: int = 4
     user_facts_k: int = 5
@@ -437,6 +457,7 @@ class MemoryConfig:
     def __post_init__(self) -> None:
         from .reranking import validate_budget
 
+        self.character_self_privacy = CharacterSelfPrivacy.coerce(self.character_self_privacy)
         validate_budget(self.token_budget)
         import math
         if (not math.isfinite(self.prospective_follow_up_interval)

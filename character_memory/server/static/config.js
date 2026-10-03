@@ -61,6 +61,11 @@ const KG_PRIVACY_HINTS = {
   private: "Only memories visible to the active participants can be returned or influence recall.",
 };
 
+const CHARACTER_SELF_PRIVACY_HINTS = {
+  private: "Public statements can be recalled across users. Private statements require every active participant to be in the recorded disclosure audience.",
+  none: "All character statements can be recalled across users, including private statements. Disclosure audiences are still recorded.",
+};
+
 const EMOTION_GROUPS = [
   { key: "emotion_baseline", target: "cfg-emotion-baseline", min: 0 },
   { key: "emotion_user_dims", target: "cfg-emotion-user-dims", min: -1 },
@@ -859,6 +864,8 @@ function renderConfig() {
   const cfg = cfgState.config;
   $("cfg-persona").value = cfg.persona || "";
   renderMemoryList(cfg.memory || {});
+  $("cfg-character-self-privacy").value = cfg.memory?.character_self_privacy || "private";
+  refreshCharacterSelfControls();
   renderDedup(cfg.memory?.dedup || {});
   $("cfg-token-budget").value = cfg.memory?.token_budget ?? "";
   renderEmotionDefaults(cfg.memory || {});
@@ -877,6 +884,13 @@ function renderConfig() {
     cfg.section_order || DEFAULT_SECTION_ORDER,
     cfg.intermediate_prompts || {},
   );
+}
+
+function refreshCharacterSelfControls() {
+  const toggle = document.querySelector('.switch-input[data-mem="character_self"]');
+  $("cfg-character-self-privacy").disabled = !toggle?.checked;
+  $("cfg-character-self-privacy-hint").textContent =
+    CHARACTER_SELF_PRIVACY_HINTS[$("cfg-character-self-privacy").value];
 }
 
 function refreshKnowledgeGraphControls() {
@@ -936,6 +950,7 @@ function renderMemoryList(mem) {
     });
     toggle.addEventListener("change", () => {
       kInput.disabled = !toggle.checked;
+      if (m.name === "character_self") refreshCharacterSelfControls();
       if (toggle.checked) ensureSectionIncluded(m.name);
       refreshSectionOrderRows();
       dirtyMemory();
@@ -1196,6 +1211,7 @@ function gatherConfig() {
   const mem = {
     dedup: gatherDedup(),
     knowledge_graph: { privacy: $("cfg-kg-privacy").value },
+    character_self_privacy: $("cfg-character-self-privacy").value,
     ...gatherEmotionDefaults(),
   };
   const budget = $("cfg-token-budget");
@@ -1719,6 +1735,10 @@ function wire() {
   });
   $("cfg-kg-privacy").addEventListener("change", () => {
     refreshKnowledgeGraphControls();
+    dirtyMemory();
+  });
+  $("cfg-character-self-privacy").addEventListener("change", () => {
+    refreshCharacterSelfControls();
     dirtyMemory();
   });
   $("cfg-kg-token-budget").addEventListener("input", dirtyMemory);

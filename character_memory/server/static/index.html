@@ -484,6 +484,18 @@
 
           <div class="cfg-block">
             <div class="cfg-block-head">
+              <label class="cfg-label" for="cfg-character-self-privacy">Character Self privacy</label>
+              <select id="cfg-character-self-privacy" aria-describedby="cfg-character-self-privacy-hint cfg-character-self-privacy-save-hint">
+                <option value="private">Private · respect disclosure audience</option>
+                <option value="none">None · shared recall</option>
+              </select>
+            </div>
+            <span id="cfg-character-self-privacy-hint" class="cfg-hint" aria-live="polite"></span>
+            <span id="cfg-character-self-privacy-save-hint" class="cfg-hint">Applies to Character statements recall. Save with “Save memories &amp; order” above.</span>
+          </div>
+
+          <div class="cfg-block">
+            <div class="cfg-block-head">
               <label class="cfg-label" for="cfg-kg">
                 <input id="cfg-kg" type="checkbox" class="switch-input inline">
                 Knowledge graph

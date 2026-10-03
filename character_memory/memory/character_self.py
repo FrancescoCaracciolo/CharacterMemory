@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+from ..config import CharacterSelfPrivacy
 from .base import ExtractionSpec, MemoryItem, MemoryScope
 from .continuity import ContinuityMemory, SOURCE_IDS_SCHEMA
 from .extract import ExtractionContext
@@ -13,9 +14,10 @@ from .extract import ExtractionContext
 class CharacterSelfMemory(ContinuityMemory):
     """Dynamic self-continuity alongside immutable character-info lore.
 
-    Public statements recall across users. Private statements recall only when
-    every current participant is in ``disclosed_to``. That list records who
-    actually heard a statement, independently of whether it may be shared.
+    With private recall (the default), private statements recall only when
+    every current participant is in ``disclosed_to``. Shared recall allows all
+    statements. The audience records who actually heard a statement in either
+    mode, independently of whether it may be shared.
     """
 
     name = "character_self"
@@ -29,6 +31,10 @@ class CharacterSelfMemory(ContinuityMemory):
         "visibility": "TEXT NOT NULL DEFAULT 'private'",
         "disclosed_to": "TEXT NOT NULL DEFAULT '[]'",
     }
+
+    def __init__(self, *args, privacy: CharacterSelfPrivacy = CharacterSelfPrivacy.PRIVATE, **kwargs):
+        self.privacy = CharacterSelfPrivacy.coerce(privacy)
+        super().__init__(*args, **kwargs)
 
     def add_statement(
         self, content: str, *, kind: str = "other", visibility: str = "private",
@@ -47,6 +53,8 @@ class CharacterSelfMemory(ContinuityMemory):
         return None
 
     def _filter_recall_rows(self, rows, audience):
+        if self.privacy is CharacterSelfPrivacy.NONE:
+            return rows
         return [row for row in rows if row["visibility"] == "public"
                 or set(audience).issubset(json.loads(row["disclosed_to"]))]
 

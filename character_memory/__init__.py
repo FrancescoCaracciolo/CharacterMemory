@@ -32,6 +32,7 @@ from .chunking import (
 )
 from .config import (
     CharacterMemoryConfig,
+    CharacterSelfPrivacy,
     ChunkingConfig,
     ContradictionPolicy,
     DedupConfig,
@@ -180,6 +181,7 @@ __all__ = [
     "ContradictionPolicy",
     "KnowledgeGraphConfig",
     "KnowledgeGraphPrivacy",
+    "CharacterSelfPrivacy",
     "MemoryConfig",
     "TemporalLLMConfig",
     "TemporalResolutionConfig",

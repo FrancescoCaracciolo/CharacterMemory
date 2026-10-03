@@ -438,6 +438,7 @@ class CharacterAgent:
         self.memories["character_self"] = CharacterSelfMemory(
             self.store, hybrid("character_self"), enabled=m.is_enabled("character_self"),
             half_life=half, sticky_threshold=sticky,
+            privacy=m.character_self_privacy,
         )
         self.memories["prospective"] = ProspectiveMemory(
             self.store, hybrid("prospective"), enabled=m.is_enabled("prospective"),
