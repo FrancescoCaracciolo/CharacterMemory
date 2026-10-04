@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/pypi/l/charactermemory.svg)](https://pypi.org/project/charactermemory/)
 
 > [!WARNING]
-> This library is still in early release. Documentation is still incomplete. There might be still some small but breaking changes on the APIs. 
+> This library is still in early release. Documentation is still incomplete.
 
 <picture>
   <source srcset="https://github.com/user-attachments/assets/5648e15a-256d-4435-8a35-3d9864a78eab" media="(prefers-color-scheme: light)">
