@@ -41,6 +41,11 @@ DEFAULT_CLEANUP_MIN_DELETED = 64
 DEFAULT_CLEANUP_DELETED_RATIO = 0.25
 INDEX_META_SCHEMA_VERSION = 1
 INDEX_META_FILENAME = "index_meta.json"
+# Embedding runs outside the state lock against a snapshot of the nodes; when
+# a concurrent write invalidates that snapshot the work is redone. After this
+# many lost races the final attempt embeds under the lock so progress is
+# guaranteed.
+_MAX_SNAPSHOT_ATTEMPTS = 3
 
 
 def _synchronized(method):
@@ -104,7 +109,13 @@ class HybridSearch(RAGSystem):
         # must not interleave with another write (or a search): compaction can
         # otherwise clear/remap nodes while an incremental add is embedding,
         # leaving vectors and `_pos` values referring to different snapshots.
+        # Embedding requests are never made while holding this lock: vectors
+        # are computed first and installed only if `_index_revision` shows the
+        # snapshot they were computed from is still current.
         self._state_lock = threading.RLock()
+        # (realpath, revision, fingerprint) of the last state written to or
+        # read from disk; `persist` is a no-op while it still matches.
+        self._persisted_marker: Optional[tuple[str, int, str]] = None
 
     def _invalidate_scoped_search(self) -> None:
         self._index_revision += 1
@@ -141,12 +152,14 @@ class HybridSearch(RAGSystem):
         meta["_pos"] = idx
         return TextNode(text=chunk.text, metadata=meta)
 
-    @_synchronized
     def build(self, chunks: list[Chunk]) -> None:
-        self._nodes = [self._chunk_to_node(c, i) for i, c in enumerate(chunks)]
-        self._build_bm25()
-        self._build_faiss()
-        self._invalidate_scoped_search()
+        nodes = [self._chunk_to_node(c, i) for i, c in enumerate(chunks)]
+        index = self._dense_index(self._embed_document_vectors([n.text for n in nodes]))
+        with self._state_lock:
+            self._nodes = nodes
+            self._index = index
+            self._build_bm25()
+            self._invalidate_scoped_search()
 
     @staticmethod
     def _normalize_vectors(
@@ -185,62 +198,116 @@ class HybridSearch(RAGSystem):
         method = getattr(self.embedder, "embed_documents", None)
         return (method or self.embedder.embed)(texts)
 
-    @_synchronized
+    def _embed_document_vectors(self, texts: list[str]) -> Optional["np.ndarray"]:
+        """Embed and normalise document texts; ``None`` for an empty batch.
+
+        Network I/O: callers must not hold ``_state_lock``.
+        """
+        if not texts:
+            return None
+        return self._normalize_vectors(
+            self._embed_documents(texts), expected_count=len(texts)
+        )
+
+    @staticmethod
+    def _dense_index(vecs: Optional["np.ndarray"]) -> Optional[faiss.Index]:
+        if vecs is None:
+            return None
+        index = faiss.IndexFlatIP(int(vecs.shape[1]))
+        index.add(np.ascontiguousarray(vecs))
+        return index
+
+    def _rebuild_dense(self) -> None:
+        """Re-embed every node and install a positionally aligned dense index.
+
+        Embeds a snapshot outside the state lock and installs it only if no
+        write happened meanwhile; see ``_MAX_SNAPSHOT_ATTEMPTS``.
+        """
+        for _ in range(_MAX_SNAPSHOT_ATTEMPTS - 1):
+            with self._state_lock:
+                revision = self._index_revision
+                texts = [n.text for n in self._nodes]
+            index = self._dense_index(self._embed_document_vectors(texts))
+            with self._state_lock:
+                if self._index_revision == revision:
+                    self._index = index
+                    self._invalidate_scoped_search()
+                    return
+        with self._state_lock:
+            self._build_faiss()
+            self._invalidate_scoped_search()
+
+    def _dense_accepts_append(self, vecs: "np.ndarray") -> bool:
+        """Whether ``vecs`` can be appended to the current index in place."""
+        if self._index is None:
+            return not self._nodes
+        return (
+            int(self._index.d) == int(vecs.shape[1])
+            and int(self._index.ntotal) == len(self._nodes)
+        )
+
+    def _append_locked(
+        self, chunks: list[Chunk], index: Optional[faiss.Index], vecs: Optional["np.ndarray"]
+    ) -> None:
+        """Append ``chunks`` and either extend the index with ``vecs`` or
+        replace it with ``index`` (which already covers every node)."""
+        start = len(self._nodes)
+        self._nodes.extend(self._chunk_to_node(c, start + i) for i, c in enumerate(chunks))
+        if vecs is None:
+            self._index = index
+        elif self._index is None:
+            self._index = self._dense_index(vecs)
+        else:
+            self._index.add(np.ascontiguousarray(vecs))
+        self._build_bm25()
+        self._invalidate_scoped_search()
+
     def add_documents(self, chunks: list[Chunk]) -> None:
         if not chunks:
             return
-        start = len(self._nodes)
-        new_nodes = [self._chunk_to_node(c, start + i) for i, c in enumerate(chunks)]
-        self._nodes.extend(new_nodes)
-        try:
-            # Append dense vectors directly; rebuild the lexical index cheaply.
-            vecs = self._normalize_vectors(
-                self._embed_documents([n.text for n in new_nodes]),
-                expected_count=len(new_nodes),
-            )
-            if self._index is None:
-                # Normal first-add path: use the vectors already calculated above
-                # instead of routing through _build_faiss and embedding them twice.
-                if start == 0:
-                    index = faiss.IndexFlatIP(int(vecs.shape[1]))
-                    index.add(np.ascontiguousarray(vecs))
-                    self._index = index
-                else:
-                    # Defensive recovery for an inconsistent in-memory state with
-                    # nodes but no dense index. Rebuild one aligned snapshot. This
-                    # deliberately re-embeds the new batch: concatenating separate
-                    # responses is unsafe if the provider's dimension changed.
-                    warnings.warn(
-                        "HybridSearch found nodes without a dense index; "
-                        "rebuilding all document vectors.",
-                        stacklevel=3,
-                    )
-                    self._build_faiss()
-            else:
-                if (
-                    int(self._index.d) != int(vecs.shape[1])
-                    or int(self._index.ntotal) != start
-                ):
-                    # The live embedding service may change dimensions after an
-                    # index was loaded. Cardinality can likewise be stale after a
-                    # previously interrupted mutation. In either case positional
-                    # alignment requires rebuilding every node as one snapshot.
+        new_texts = [c.text for c in chunks]
+        # A failed embedding leaves the in-memory index untouched; SQLite
+        # remains the source of truth and a later rebuild recovers the row.
+        vecs = self._embed_document_vectors(new_texts)
+        assert vecs is not None
+        for attempt in range(_MAX_SNAPSHOT_ATTEMPTS):
+            with self._state_lock:
+                if self._dense_accepts_append(vecs):
+                    self._append_locked(chunks, None, vecs)
+                    return
+                if attempt == 0:
+                    # The live embedding service may change dimensions after
+                    # an index was loaded, and cardinality can be stale after
+                    # an interrupted mutation (or nodes may exist without a
+                    # dense index). Positional alignment then requires
+                    # re-embedding every node as one snapshot; concatenating
+                    # separate responses is unsafe if the dimension changed.
                     warnings.warn(
                         "HybridSearch dense index is incompatible with the new "
                         "document vectors; rebuilding all document vectors.",
-                        stacklevel=3,
+                        stacklevel=2,
                     )
-                    self._build_faiss()
-                else:
-                    self._index.add(np.ascontiguousarray(vecs))
-        except BaseException:
-            # SQLite remains the source of truth for structured memories. Do
-            # not also leave a failed incremental index mutation in memory;
-            # the next rebuild can recover the already-committed row cleanly.
-            del self._nodes[start:]
-            raise
-        self._build_bm25()
-        self._invalidate_scoped_search()
+                if attempt == _MAX_SNAPSHOT_ATTEMPTS - 1:
+                    start = len(self._nodes)
+                    self._nodes.extend(
+                        self._chunk_to_node(c, start + i) for i, c in enumerate(chunks)
+                    )
+                    try:
+                        # `_build_faiss` assigns the index only on success.
+                        self._build_faiss()
+                    except BaseException:
+                        del self._nodes[start:]
+                        raise
+                    self._build_bm25()
+                    self._invalidate_scoped_search()
+                    return
+                revision = self._index_revision
+                texts = [n.text for n in self._nodes] + new_texts
+            index = self._dense_index(self._embed_document_vectors(texts))
+            with self._state_lock:
+                if self._index_revision == revision:
+                    self._append_locked(chunks, index, None)
+                    return
 
     @staticmethod
     def _is_deleted(node: TextNode) -> bool:
@@ -251,7 +318,6 @@ class HybridSearch(RAGSystem):
     def deleted_count(self) -> int:
         return sum(1 for node in self._nodes if self._is_deleted(node))
 
-    @_synchronized
     def delete_documents(self, ids: Iterable[Any]) -> int:
         """Tombstone every document matching an application metadata id.
 
@@ -261,30 +327,46 @@ class HybridSearch(RAGSystem):
         wanted = set(ids)
         if not wanted:
             return 0
-        deleted = 0
-        for node in self._nodes:
-            if node.metadata.get("id") in wanted and not self._is_deleted(node):
-                node.metadata["_deleted"] = True
-                deleted += 1
-        if not deleted:
-            return 0
-        self._build_bm25()
-        total = len(self._nodes)
-        tombstones = self.deleted_count
-        if self.count == 0 or (
-            tombstones >= self.cleanup_min_deleted
-            and tombstones / max(1, total) >= self.cleanup_deleted_ratio
-        ):
-            self.cleanup()
-        self._invalidate_scoped_search()
+        needs_dense_rebuild = False
+        with self._state_lock:
+            deleted = 0
+            for node in self._nodes:
+                if node.metadata.get("id") in wanted and not self._is_deleted(node):
+                    node.metadata["_deleted"] = True
+                    deleted += 1
+            if not deleted:
+                return 0
+            self._build_bm25()
+            total = len(self._nodes)
+            tombstones = self.deleted_count
+            if self.count == 0 or (
+                tombstones >= self.cleanup_min_deleted
+                and tombstones / max(1, total) >= self.cleanup_deleted_ratio
+            ):
+                _, needs_dense_rebuild = self._cleanup_locked()
+            self._invalidate_scoped_search()
+        if needs_dense_rebuild:
+            self._rebuild_dense()
         return deleted
 
-    @_synchronized
     def cleanup(self) -> int:
         """Physically remove tombstones without re-embedding healthy vectors."""
+        with self._state_lock:
+            deleted, needs_dense_rebuild = self._cleanup_locked()
+        if needs_dense_rebuild:
+            self._rebuild_dense()
+        return deleted
+
+    def _cleanup_locked(self) -> tuple[int, bool]:
+        """Compact tombstones; return ``(removed, needs_dense_rebuild)``.
+
+        When the dense index cannot be reconstructed positionally it is
+        dropped, and the caller re-embeds via :meth:`_rebuild_dense` after
+        releasing the lock.
+        """
         deleted = self.deleted_count
         if not deleted:
-            return 0
+            return 0, False
         active_positions = [
             pos for pos, node in enumerate(self._nodes) if not self._is_deleted(node)
         ]
@@ -293,7 +375,7 @@ class HybridSearch(RAGSystem):
             self._bm25 = None
             self._index = None
             self._invalidate_scoped_search()
-            return deleted
+            return deleted, False
 
         old_nodes = self._nodes
         can_reconstruct = (
@@ -309,6 +391,7 @@ class HybridSearch(RAGSystem):
             self._nodes.append(TextNode(text=old.text, metadata=meta))
 
         self._build_bm25()
+        needs_dense_rebuild = False
         if can_reconstruct:
             assert self._index is not None
             vectors = np.asarray(
@@ -321,15 +404,17 @@ class HybridSearch(RAGSystem):
         else:
             # A positional mismatch means existing vectors cannot safely be
             # associated with nodes. Re-embedding active text is the necessary
-            # correctness recovery, not routine cleanup behavior.
+            # correctness recovery, not routine cleanup behavior. Until it
+            # completes, dense search is unavailable rather than misaligned.
             warnings.warn(
                 "HybridSearch cleanup found an inconsistent dense index; "
                 "re-embedding active documents.",
-                stacklevel=2,
+                stacklevel=3,
             )
-            self._build_faiss()
+            self._index = None
+            needs_dense_rebuild = True
         self._invalidate_scoped_search()
-        return deleted
+        return deleted, needs_dense_rebuild
 
     def _build_bm25(self) -> None:
         active = [node for node in self._nodes if not self._is_deleted(node)]
@@ -375,6 +460,8 @@ class HybridSearch(RAGSystem):
         return retriever
 
     def _build_faiss(self) -> None:
+        # Embeds while the caller holds the state lock: only the last-resort
+        # fallback after `_MAX_SNAPSHOT_ATTEMPTS` lost races uses this.
         if not self._nodes:
             self._index = None
             return
@@ -382,13 +469,9 @@ class HybridSearch(RAGSystem):
             self._embed_documents([n.text for n in self._nodes]),
             expected_count=len(self._nodes),
         )
-        dim = int(vecs.shape[1])
-        index = faiss.IndexFlatIP(dim)
-        index.add(np.ascontiguousarray(vecs))
-        self._index = index
+        self._index = self._dense_index(vecs)
 
     # SEARCH
-    @_synchronized
     def search(
         self,
         query: Query,
@@ -408,72 +491,89 @@ class HybridSearch(RAGSystem):
         subset is cached and FAISS uses an ID selector, so disallowed entries
         are not merely removed after consuming the candidate pool.
         """
-        allowed_positions: Optional[frozenset[int]] = None
+        if k <= 0:
+            return []
+        queries = [(text, weight) for text, weight in as_queries(query) if weight > 0.0]
+        if not queries:
+            return []
+        wanted: Optional[set] = None
         if allowed_ids is not None:
             wanted = (
                 {allowed_ids}
                 if isinstance(allowed_ids, (str, bytes))
                 else set(allowed_ids)
             )
-            allowed_positions = self._allowed_positions_for(allowed_ids, wanted)
-        if k <= 0:
-            return []
-        active_count = (
-            len(allowed_positions)
-            if allowed_positions is not None
-            else self.count
-        )
-        if active_count == 0 or self._index is None:
-            return []
-        queries = [(text, weight) for text, weight in as_queries(query) if weight > 0.0]
-        if not queries:
-            return []
-        pool = min(max(self.candidate_pool, k * 3), active_count)
+        with self._state_lock:
+            if self._searchable_count(allowed_ids, wanted) == 0:
+                return []
 
         # Embed every query text in one batch (one round-trip for the dense
-        # pass regardless of how many messages are in the window).
+        # pass regardless of how many messages are in the window). This is
+        # network I/O, so it happens before taking the state lock.
         q_texts = [q for q, _ in queries]
         q_vecs = self._normalize_vectors(
             self._embed_queries(q_texts), expected_count=len(q_texts)
         )
-        assert self._index is not None
-        if (
-            int(self._index.d) != int(q_vecs.shape[1])
-            or int(self._index.ntotal) != len(self._nodes)
-        ):
-            # Cover dimension drift that happens after load but before the
-            # next write, as well as interrupted legacy indexes with a stale
-            # vector count. Query and document vectors must share one live
-            # dimensionality before FAISS can search them.
-            warnings.warn(
-                "HybridSearch dense index is incompatible with the live "
-                "query vectors; rebuilding all document vectors.",
-                stacklevel=3,
-            )
-            self._build_faiss()
-            assert self._index is not None
-            if int(self._index.d) != int(q_vecs.shape[1]):
+        from .fusion import fuse
+        for attempt in range(_MAX_SNAPSHOT_ATTEMPTS):
+            with self._state_lock:
+                active_count = self._searchable_count(allowed_ids, wanted)
+                if active_count == 0:
+                    return []
+                if (
+                    self._index is not None
+                    and int(self._index.d) == int(q_vecs.shape[1])
+                    and int(self._index.ntotal) == len(self._nodes)
+                ):
+                    allowed_positions = (
+                        self._allowed_positions_for(allowed_ids, wanted)
+                        if wanted is not None
+                        else None
+                    )
+                    pool = min(max(self.candidate_pool, k * 3), active_count)
+                    candidates = [
+                        self._query_candidates(text, vector, pool, where, allowed_positions)
+                        for (text, _), vector in zip(queries, q_vecs)
+                    ]
+                    return fuse(queries, candidates, k, self.rrf_k, self.min_dense_similarity,
+                                self._result_key,
+                                lambda pos: (self._nodes[pos].text,
+                                             self._nodes[pos].metadata.get("source", ""),
+                                             self._nodes[pos].metadata))
+                if attempt == _MAX_SNAPSHOT_ATTEMPTS - 1:
+                    index_dim = None if self._index is None else int(self._index.d)
+                    break
+                if attempt == 0:
+                    # Cover dimension drift that happens after load but before
+                    # the next write, interrupted legacy indexes with a stale
+                    # vector count, and nodes left without a dense index by a
+                    # failed recovery. Query and document vectors must share
+                    # one live dimensionality before FAISS can search them.
+                    warnings.warn(
+                        "HybridSearch dense index is incompatible with the live "
+                        "query vectors; rebuilding all document vectors.",
+                        stacklevel=2,
+                    )
+            self._rebuild_dense()
+            with self._state_lock:
+                index_dim = None if self._index is None else int(self._index.d)
+            if index_dim is not None and index_dim != int(q_vecs.shape[1]):
                 # An asymmetric provider may update its model state during
-                # document embedding. Refresh queries once before declaring
-                # the provider contract inconsistent.
+                # document embedding. Refresh queries before declaring the
+                # provider contract inconsistent.
                 q_vecs = self._normalize_vectors(
                     self._embed_queries(q_texts), expected_count=len(q_texts)
                 )
-            if int(self._index.d) != int(q_vecs.shape[1]):
-                raise ValueError(
-                    "Embedding provider returned incompatible query and "
-                    f"document dimensions ({q_vecs.shape[1]} and "
-                    f"{self._index.d})"
-                )
+        raise ValueError(
+            "Embedding provider returned incompatible query and "
+            f"document dimensions ({q_vecs.shape[1]} and {index_dim})"
+        )
 
-        from .fusion import fuse
-        candidates = [self._query_candidates(text, vector, pool, where, allowed_positions)
-                      for (text, _), vector in zip(queries, q_vecs)]
-        return fuse(queries, candidates, k, self.rrf_k, self.min_dense_similarity,
-                    self._result_key,
-                    lambda pos: (self._nodes[pos].text,
-                                 self._nodes[pos].metadata.get("source", ""),
-                                 self._nodes[pos].metadata))
+    def _searchable_count(self, allowed_ids: object, wanted: Optional[set]) -> int:
+        """Active documents visible to a search; caller holds the state lock."""
+        if wanted is None:
+            return self.count
+        return len(self._allowed_positions_for(allowed_ids, wanted))
 
     def _result_key(self, pos: int) -> Hashable:
         """Return a retrieval-group key without changing positional IDs."""
@@ -636,7 +736,16 @@ class HybridSearch(RAGSystem):
         same index concurrently. The lock is per index directory, matching the
         existing per-character in-process lock convention; it is auto-released
         by the OS on close/exit, so a crash can't leave it stuck.
+
+        A no-op when nothing changed since this instance last wrote or loaded
+        `path` and its ``nodes.json`` still exists, so callers may persist
+        every index after any write without rewriting untouched ones.
         """
+        marker = self._persist_key(path)
+        if marker == self._persisted_marker and os.path.exists(
+            os.path.join(path, "nodes.json")
+        ):
+            return
         os.makedirs(path, exist_ok=True)
         nodes_json = [
             {"id": n.metadata.get("id", i), "text": n.text,
@@ -673,8 +782,11 @@ class HybridSearch(RAGSystem):
             # place; otherwise a poller can pair new nodes with the old FAISS
             # file and mistake the transient count mismatch for corruption.
             os.replace(nodes_tmp, os.path.join(path, "nodes.json"))
+        self._persisted_marker = marker
 
-    @_synchronized
+    def _persist_key(self, path: str) -> tuple[str, int, str]:
+        return (os.path.realpath(path), self._index_revision, self._index_fingerprint())
+
     def load(self, path: str) -> None:
         idx_file = os.path.join(path, "faiss.index")
         loaded: Optional[faiss.Index] = None
@@ -713,19 +825,21 @@ class HybridSearch(RAGSystem):
                 if fcntl is not None:
                     fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
-        self._nodes = []
-        # Never let a previously-loaded dense index survive a failed repair of
-        # the new path. It would refer to a different positional node set.
-        self._index = None
+        # Build the new snapshot privately and install it in one step at the
+        # end: searches keep serving the previous (self-consistent) nodes and
+        # vectors while a repair is embedding, and a failed repair leaves
+        # them untouched instead of pairing new nodes with an old index.
+        nodes: list[TextNode] = []
         for i, entry in enumerate(data):
             meta = dict(entry.get("metadata") or {})
             if "id" in entry:
                 meta["id"] = entry["id"]
             meta.setdefault("source", entry.get("source", ""))
             meta["_pos"] = i  # recompute canonical positional index
-            self._nodes.append(TextNode(text=entry["text"], metadata=meta))
+            nodes.append(TextNode(text=entry["text"], metadata=meta))
         rebuild = True
         if loaded is not None:
+            # May probe the embedding endpoint; no lock is held here.
             expected = getattr(self.embedder, "dim", None)
             current_fingerprint = self._index_fingerprint()
             metadata_matches = bool(
@@ -738,10 +852,9 @@ class HybridSearch(RAGSystem):
             if (
                 expected is not None
                 and loaded.d == expected
-                and int(loaded.ntotal) == len(self._nodes)
+                and int(loaded.ntotal) == len(nodes)
                 and metadata_matches
             ):
-                self._index = loaded
                 rebuild = False
             else:
                 # Embedding behavior/dim drifted, the metadata is legacy, or
@@ -749,7 +862,7 @@ class HybridSearch(RAGSystem):
                 print(
                     f"[rag] dense-index mismatch (index_dim={loaded.d}, "
                     f"embedder_dim={expected}, index_count={loaded.ntotal}, "
-                    f"node_count={len(self._nodes)}, "
+                    f"node_count={len(nodes)}, "
                     f"metadata_matches={metadata_matches}); rebuilding active nodes."
                 )
         elif load_error is not None:
@@ -762,21 +875,28 @@ class HybridSearch(RAGSystem):
                 f"[rag] could not load dense metadata {meta_file!r}: "
                 f"{meta_error!r}; rebuilding active nodes."
             )
+        index: Optional[faiss.Index] = loaded
         if rebuild:
             # Tombstones do not need new embeddings during a repair. Drop them
             # physically before recreating the dense index.
-            active = [node for node in self._nodes if not self._is_deleted(node)]
-            self._nodes = []
+            active = [node for node in nodes if not self._is_deleted(node)]
+            nodes = []
             for pos, node in enumerate(active):
                 meta = dict(node.metadata)
                 meta.pop("_deleted", None)
                 meta["_pos"] = pos
-                self._nodes.append(TextNode(text=node.text, metadata=meta))
+                nodes.append(TextNode(text=node.text, metadata=meta))
+            index = self._dense_index(
+                self._embed_document_vectors([n.text for n in nodes])
+            )
+        with self._state_lock:
+            self._nodes = nodes
+            self._index = index
             self._build_bm25()
-            self._build_faiss()
-            # Persist both corrected nodes and index so later loads are fast,
-            # including the previously-missing-index case.
-            self.persist(path)
-        else:
-            self._build_bm25()
-        self._invalidate_scoped_search()
+            self._invalidate_scoped_search()
+            if rebuild:
+                # Persist both corrected nodes and index so later loads are
+                # fast, including the previously-missing-index case.
+                self.persist(path)
+            else:
+                self._persisted_marker = self._persist_key(path)

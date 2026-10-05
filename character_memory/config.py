@@ -110,7 +110,11 @@ class EmbeddingConfig:
     model: str = os.getenv("OPENAI_EMBEDDINGS_MODEL", "text-embedding-ada-002")
     dim: Optional[int] = None  # inferred from the first request if None
     batch_size: int = 64
-    timeout: float = 120.0
+    # Embeddings sit on the recall hot path, so waits are kept short: the
+    # worst case per batch is (max_retries + 1) * timeout plus SDK backoff.
+    timeout: float = 30.0          # seconds per request (read/write/pool)
+    connect_timeout: float = 5.0   # seconds to establish the connection
+    max_retries: int = 1           # SDK retries on timeouts / 5xx / 429
     # Optional role-specific transformations for asymmetric retrieval models.
     # Empty strings preserve symmetric OpenAI-compatible behavior.
     retrieval_query_prefix: str = ""

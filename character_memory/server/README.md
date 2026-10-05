@@ -161,6 +161,16 @@ computation; the unlisted remainder is lexical/dense search CPU, rendering
 and budget selection. A line whose total is dominated by `embed` points at
 the embedding endpoint, not at the retriever.
 
+Tool executions are timed server-side too: every MCP `tools/call` and every
+tool the character invokes during answer generation prints a line such as
+`[meter] POST /mcp tool='search_memory' 41.07 ms [embed=35.2ms]` (with
+`ERROR` when the tool reported a failure). Independently of `--meter`, MCP
+responses that contain tool calls carry a standard `Server-Timing` header,
+e.g. `tool-0;desc="search_memory";dur=41.07, tool-0.embed;dur=35.20`, with
+one `tool-<n>` entry per call in batch order. MCP tool handlers run in the
+server's worker thread pool, so a slow tool call does not block other
+requests.
+
 Per-character `config.yaml` can override the same feature under
 `temporal_resolution:`. The server enables the local `dateparser` engine by
 default; the LLM engine remains inactive unless explicitly selected. See

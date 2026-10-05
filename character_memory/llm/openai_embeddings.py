@@ -4,6 +4,7 @@ import hashlib
 import json
 from typing import Optional
 
+import httpx
 import numpy as np
 from openai import OpenAI
 from .._timing import time_phase
@@ -24,7 +25,14 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
         for k, v in overrides.items():
             setattr(cfg, k, v)
         self.config = cfg
-        self._client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key, timeout=cfg.timeout)
+        timeout = max(0.1, float(cfg.timeout))
+        connect = max(0.1, min(float(cfg.connect_timeout), timeout))
+        self._client = OpenAI(
+            base_url=cfg.base_url,
+            api_key=cfg.api_key,
+            timeout=httpx.Timeout(timeout, connect=connect),
+            max_retries=max(0, int(cfg.max_retries)),
+        )
         self._dim: Optional[int] = cfg.dim
         # Context assembly asks several independent indexes to embed the same
         # small query batch, and the history-aware window slides by one

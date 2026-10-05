@@ -21,6 +21,7 @@ import inspect
 import json
 from typing import Any, Callable, Iterable, Optional, Union
 
+from .._timing import time_tool
 from .base import Tool, ToolCall, ToolDefinition, ToolOutput, ToolResult
 
 #: Anything :meth:`ToolRegistry.add` accepts.
@@ -122,6 +123,12 @@ class ToolRegistry:
         ``ok=False`` whose ``text`` explains the failure. The agent feeds that
         text back to the model so it can recover, instead of crashing the loop.
         """
+        with time_tool(name) as timing:
+            result = self._execute(name, arguments)
+            timing.failed = not result.ok
+        return result
+
+    def _execute(self, name: str, arguments: Any) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(

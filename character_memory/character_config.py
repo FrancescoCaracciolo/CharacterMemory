@@ -24,7 +24,8 @@ default, unknown keys are ignored so the format is forward-compatible)::
     name: Kurisu
     persona: "A neuroscience researcher..."
     llm:        { base_url, api_key, model, temperature, max_tokens, timeout }
-    embedding:  { base_url, api_key, model, dim, batch_size, timeout }
+    embedding:  { base_url, api_key, model, dim, batch_size, timeout,
+                  connect_timeout, max_retries }
     chunking:   { info_chunker, dialogue_chunker, header_max_tokens,
                   header_min_tokens, dialogue_turns_per_chunk,
                   dialogue_context_width }

@@ -38,7 +38,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
+from .._timing import ToolTiming, time_tool, tool_timing_sink
 from ..agent import CharacterAgent
 from ..chunking import Chunk
 from ..emotion_vectors import emotion_vector, encode_emotion_vector
@@ -1882,7 +1884,10 @@ def _dispatch_tool_call(
                 f"{','.join(sorted(categories))}.",
             )
     handler, needs_memory = handler_entry
-    return _invoke(handler, agent, name, args, needs_memory)
+    with time_tool(name) as timing:
+        result = _invoke(handler, agent, name, args, needs_memory)
+        timing.failed = result.get("isError") is True
+    return result
 
 
 def _invoke(
@@ -1917,6 +1922,64 @@ def _invoke(
         return _as_tool_result(handler(agent, mem, args))
     except (KeyError, RuntimeError, TypeError, ValueError) as e:
         return _json_error(str(e))
+
+
+def _dispatch_batch(
+    batch: list[Any],
+    agent: CharacterAgent,
+    categories: Optional[frozenset[str]] = None,
+) -> tuple[list[dict[str, Any]], list[ToolTiming]]:
+    """Dispatch every JSON-RPC envelope in ``batch`` (blocking).
+
+    Returns the wire responses plus the timing of each ``tools/call``. Any
+    outer ``tool_timing_sink`` (the request meter) still receives every
+    timing.
+    """
+    timings: list[ToolTiming] = []
+    outer_sink = tool_timing_sink.get()
+
+    def collect(timing: ToolTiming) -> None:
+        timings.append(timing)
+        if outer_sink is not None:
+            outer_sink(timing)
+
+    responses: list[dict[str, Any]] = []
+    token = tool_timing_sink.set(collect)
+    try:
+        for item in batch:
+            if not isinstance(item, dict):
+                # Per JSON-RPC 2.0: invalid batch members return a single
+                # envelope back to the client.
+                responses.append({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request."}})
+                continue
+            try:
+                result = _dispatch(item, agent, categories)
+            except _RpcError as e:
+                responses.append({"jsonrpc": "2.0", "id": item.get("id"), "error": {"code": e.code, "message": e.message}})
+                continue
+            if result is None:
+                continue  # notification — no response.
+            responses.append({"jsonrpc": "2.0", "id": item.get("id"), "result": result})
+    finally:
+        tool_timing_sink.reset(token)
+    return responses, timings
+
+
+def _server_timing(timings: list[ToolTiming]) -> str:
+    """Render tool timings as an HTTP ``Server-Timing`` header value.
+
+    One ``tool-<n>`` metric per call (in batch order) with the tool name as
+    its description, followed by its nested phases (e.g. ``tool-0.embed``).
+    """
+    parts: list[str] = []
+    for i, timing in enumerate(timings):
+        desc = timing.name.replace("\\", "").replace('"', "")
+        if timing.failed:
+            desc += " (error)"
+        parts.append(f'tool-{i};desc="{desc}";dur={timing.elapsed_ms:.2f}')
+        for phase, ms in sorted(timing.phases.items()):
+            parts.append(f"tool-{i}.{phase};dur={ms:.2f}")
+    return ", ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -1985,26 +2048,18 @@ def build_router(
             )
 
         batch = payload if isinstance(payload, list) else [payload]
-        responses: list[dict] = []
-        for item in batch:
-            if not isinstance(item, dict):
-                # Per JSON-RPC 2.0: invalid batch members return a single
-                # envelope back to the client.
-                responses.append({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request."}})
-                continue
-            try:
-                result = _dispatch(item, agent, categories)
-            except _RpcError as e:
-                responses.append({"jsonrpc": "2.0", "id": item.get("id"), "error": {"code": e.code, "message": e.message}})
-                continue
-            if result is None:
-                continue  # notification — no response.
-            responses.append({"jsonrpc": "2.0", "id": item.get("id"), "result": result})
+        # Tool handlers are synchronous and may block on SQLite, disk and
+        # embedding requests; run them in the worker pool so one slow call
+        # cannot stall every other request on the event loop.
+        responses, timings = await run_in_threadpool(
+            _dispatch_batch, batch, agent, categories
+        )
 
+        headers = {"Server-Timing": _server_timing(timings)} if timings else None
         if not responses:
-            return Response(status_code=202)
+            return Response(status_code=202, headers=headers)
         body = responses if isinstance(payload, list) else responses[0]
-        return JSONResponse(body)
+        return JSONResponse(body, headers=headers)
 
     @router.get("/mcp")
     async def mcp_get() -> Response:

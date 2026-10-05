@@ -81,20 +81,25 @@ class PostgresHybridSearch(RAGSystem):
 
     def build(self, chunks, *, pending=()):
         """Publish a replacement generation only after embedding and indexing succeed."""
+        # Embed before taking the collection lock so searches and incremental
+        # writes are not blocked behind embedding round-trips.
+        dim = int(self.embedder.dim)
+        batches = []
+        for start in range(0, len(chunks), self.batch_size):
+            batch = chunks[start:start + self.batch_size]
+            vectors = self._vectors([c.text for c in batch])
+            if vectors.shape[1] != dim:
+                raise ValueError('Embedding dimension changed during collection build')
+            batches.append((batch, vectors))
         with self._lock:
             table = 'cm_vectors_' + uuid.uuid4().hex
-            dim = int(self.embedder.dim)
             try:
                 with self.store.connection() as conn:
                     conn.execute(f'''CREATE TABLE {identifier(table)} (
                         doc_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                         text TEXT NOT NULL, source TEXT NOT NULL, metadata JSONB NOT NULL,
                         embedding vector({dim}) NOT NULL, lexical tsvector NOT NULL)''')
-                for start in range(0, len(chunks), self.batch_size):
-                    batch = chunks[start:start + self.batch_size]
-                    vectors = self._vectors([c.text for c in batch])
-                    if vectors.shape[1] != dim:
-                        raise ValueError('Embedding dimension changed during collection build')
+                for batch, vectors in batches:
                     with self.store.connection() as conn:
                         self._insert(conn, table, batch, vectors)
                 with self.store.connection() as conn:
