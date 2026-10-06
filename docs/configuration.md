@@ -88,7 +88,9 @@ All in `character_memory/config.py`, re-exported from the top level.
 | `model` | `OPENAI_EMBEDDINGS_MODEL` | |
 | `dim` | `None` | inferred from the first request if `None` |
 | `batch_size` | `64` | |
-| `timeout` | `120.0` | |
+| `timeout` | `30.0` | seconds per request |
+| `connect_timeout` | `5.0` | seconds to connect; capped at `timeout` |
+| `max_retries` | `1` | SDK retries on timeouts, 5xx and 429; worst case per batch is `(max_retries + 1) * timeout` |
 | `retrieval_query_prefix` | `""` | prepended only when embedding retrieval queries |
 | `retrieval_document_prefix` | `""` | prepended only when embedding indexed documents |
 | `retrieval_min_similarity` | `None` | optional cosine floor for dense candidates |
@@ -294,7 +296,7 @@ persona: |
   A neuroscience researcher. Goes by "Christina" (don't call her that).
 
 llm:        { base_url, api_key, model, temperature, max_tokens, timeout }
-embedding:  { base_url, api_key, model, dim, batch_size, timeout }
+embedding:  { base_url, api_key, model, dim, batch_size, timeout, connect_timeout, max_retries }
 chunking:   { info_chunker, dialogue_chunker, header_max_tokens,
               header_min_tokens, dialogue_turns_per_chunk,
               dialogue_context_width }
