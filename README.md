@@ -22,6 +22,7 @@
   <a href="#installation"><b>Installation</b></a> •
   <a href="#general-idea"><b>General Idea</b></a> •
   <a href="#knowledge-graph-retrieval"><b>Knowledge Graph</b></a> •
+  <a href="#demo-and-projects-using-it"><b>Demo Projects</b></a> •
   <a href="https://youtu.be/XSOa74PPeko#gh-dark-mode-only"><b>Introduction Video</b></a><a href="https://youtu.be/rdJ7QPhogNY#gh-light-mode-only"><b>Introduction Video</b></a> •
   <a href="#credits-and-ai-disclosure"><b>Credits</b></a> •
   <a href="https://github.com/FrancescoCaracciolo/CharacterMemory/tree/master/docs"><b>Documentation ↗</b></a>
@@ -184,6 +185,17 @@ At the end,
 - Episodes that happened in the same location the character currently is, are more likely to be recalled
 
 The knowledge graph requires one additional LLM call after every extraction. (And tens of LLM calls to ingest existing memories)
+### Demo and Projects using it
+
+- **Amadeus System** (by me)
+Show the knowledge graph to the user while generating the answer and allow the user to explore it.
+
+Still in beta, not available to the public yet.
+
+https://github.com/user-attachments/assets/ade9442e-b19a-4a71-a275-756d935a8b47
+
+- [**Amadeus Project**](https://github.com/reflectors02/Amadeus-Project/tree/main): experimenting with the new memory system 
+- [**Nyarch Assistant**](https://github.com/NyarchLinux/NyarchAssistant): will have native support to CharacterMemory starting from v1.6.0 
 
 ### Credits and AI Disclosure
 - The logo, banner and graphics are designed by [GiuliettesPhotography](https://www.instagram.com/giuliettesphotography) 
