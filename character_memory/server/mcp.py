@@ -49,7 +49,7 @@ from ..memory.character_base import RAGMemory
 from ..memory.emotion import EmotionStatus
 from ..memory.knowledge_graph_memory import KnowledgeGraphMemory
 from ..memory.structured import StructuredMemory
-from ..memory.world import WorldCommand, WorldMemory
+from ..memory.world import FACT_VISIBILITY_FILTERS, WorldCommand, WorldMemory
 from ..memory.calendar import CalendarMemory, SELF_OWNER
 from ..tools import (
     CalculateTimeDifference,
@@ -521,6 +521,10 @@ def _world(agent: CharacterAgent) -> WorldMemory:
 
 def _tool_get_world_state(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     return _world(agent).snapshot(commit=False).to_dict()
+
+
+def _tool_get_world_catalog(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    return _world(agent).catalog(fact_visibility=args.get("fact_visibility", "visible"))
 
 
 def _tool_search_world_records(agent: CharacterAgent, mem: Any, args: dict) -> dict:
@@ -1659,6 +1663,25 @@ _register(
     "get_world_state", "Return the observer-filtered projected world state.",
     {"type": "object", "properties": {}, "required": []},
     _tool_get_world_state, needs_memory=False, categories=("world",),
+)
+_register(
+    "get_world_catalog",
+    "List all configured locations, actors, routines (including disabled ones), "
+    "and authored/learned world facts, without advancing the world. "
+    "`fact_visibility` defaults to `visible` (unexpired facts visible to the observer). "
+    "`all` or an exact visibility label performs administrative inspection, "
+    "including expired facts and facts hidden from the observer. "
+    "The fact filter does not restrict location, actor, or routine definitions.",
+    {"type": "object", "properties": {
+        "fact_visibility": {
+            "type": "string", "enum": list(FACT_VISIBILITY_FILTERS), "default": "visible",
+            "description": (
+                "visible: observer-visible, unexpired facts; all: every stored fact; "
+                "public/known/local/private: every fact with that exact visibility label."
+            ),
+        },
+    }, "required": []},
+    _tool_get_world_catalog, needs_memory=False, categories=("world",),
 )
 _register(
     "search_world_records", "Search facts and events visible to the observer.",

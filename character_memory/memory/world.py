@@ -53,6 +53,7 @@ ACTIVITY_KINDS = {
     "leisure", "social", "other",
 }
 COMMAND_KINDS = {"move", "start_activity", "eat", "sleep", "wake", "schedule"}
+FACT_VISIBILITY_FILTERS = ("visible", "all", "public", "known", "local", "private")
 WORLD_RECORD_USER_ID = "_world"
 
 
@@ -1355,6 +1356,42 @@ class WorldMemory(Memory):
         states = self.simulator.project(stamp)
         return self._snapshot_from_states({k: v for k, v in states.items() if v is not None}, stamp)
 
+    @synchronized
+    def catalog(self, *, fact_visibility: str = "visible") -> dict[str, Any]:
+        """List all definitions and facts without advancing or recording recall.
+
+        ``visible`` uses observer-scoped search rules and excludes expired facts.
+        ``all`` and exact visibility labels are administrative ledger filters:
+        they include expired facts and may expose facts hidden from the observer.
+        Actors and routines are definitions, not perceived or projected state.
+        """
+        if not isinstance(fact_visibility, str) or fact_visibility not in FACT_VISIBILITY_FILTERS:
+            raise ValueError(
+                "fact_visibility must be one of: " + ", ".join(FACT_VISIBILITY_FILTERS)
+            )
+        now = self._now()
+        location_id = None
+        if fact_visibility == "visible":
+            location_id = self.snapshot(now=now).observer.get("location_id")
+        facts = []
+        for row in self.records.all_rows():
+            if row.get("record_type") != "fact":
+                continue
+            if fact_visibility == "visible":
+                if not self._record_is_visible(row, location_id=location_id, now=now):
+                    continue
+            elif fact_visibility != "all" and row.get("visibility") != fact_visibility:
+                continue
+            facts.append(self.records.row_item(row, 1.0).metadata)
+        return {
+            "observer_id": self.observer_id,
+            "fact_visibility": fact_visibility,
+            "locations": self.state_store.locations(),
+            "facts": facts,
+            "routines": self.state_store.routines(),
+            "actors": self.state_store.actors(),
+        }
+
     def next_action(
         self, actor_id: str, now: float, *, location_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
@@ -1662,6 +1699,19 @@ class WorldMemory(Memory):
         self.state_store.set_meta("record_revision", revision)
         return revision
 
+    def _record_is_visible(
+        self, row: dict[str, Any], *, location_id: Optional[str], now: float,
+    ) -> bool:
+        valid_until = row.get("valid_until")
+        if valid_until is not None and float(valid_until) <= now:
+            return False
+        visibility = row.get("visibility")
+        return bool(
+            visibility in {"public", "known"}
+            or self.observer_id in _loads(row.get("witnesses"), [])
+            or (visibility == "local" and location_id and row.get("location_id") == location_id)
+        )
+
     def _visible_record_items(
         self,
         query: Query,
@@ -1687,18 +1737,7 @@ class WorldMemory(Memory):
         visible: list[MemoryItem] = []
         now = self._now()
         for item in items:
-            meta = item.metadata
-            valid_until = meta.get("valid_until")
-            if valid_until is not None and float(valid_until) <= now:
-                continue
-            visibility = meta.get("visibility")
-            witnesses = meta.get("witnesses") or []
-            allowed = visibility in {"public", "known"}
-            allowed = allowed or self.observer_id in witnesses
-            allowed = allowed or (
-                visibility == "local" and location_id and meta.get("location_id") == location_id
-            )
-            if allowed:
+            if self._record_is_visible(item.metadata, location_id=location_id, now=now):
                 visible.append(item)
             if len(visible) >= limit:
                 break

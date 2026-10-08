@@ -270,6 +270,47 @@ reply = agent.generate_answer(chat, tools=tools)
 
 ---
 
+## MCP world catalog
+
+When `WorldMemory` is enabled, external MCP clients can call
+`get_world_catalog` through `/mcp?character=<name>&tools=world` (also available
+when the category filter is omitted or set to `all`).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "get_world_catalog",
+    "arguments": {"fact_visibility": "all"}
+  }
+}
+```
+
+The result contains `locations`, `actors`, `routines`, and `facts`, plus
+`observer_id` and the selected `fact_visibility`. Lists are complete, not
+search-ranked or capped at the current snapshot's ten facts. Actors and
+routines are configured definitions, including off-screen actors and
+disabled routines, not their current perceived state. Facts include both
+authored and learned rows, with IDs, visibility, source, validity, and decoded
+metadata; events are excluded.
+
+| `fact_visibility` | Facts returned |
+|---|---|
+| `visible` (default) | Unexpired public/known facts, facts witnessed by the observer, and local facts at the observer's projected location when locations are enabled. |
+| `all` | Every stored world fact, including private, off-location, and expired facts. |
+| `public`, `known`, `local`, `private` | Every fact with that exact visibility label, including expired facts. |
+
+**Privacy:** `all` and exact-label filters are administrative inspection,
+not observer-scoped retrieval. They can reveal facts the character does not
+know. The filter applies only to facts, never to the location, actor, or
+routine definitions. Use `get_world_state` or `search_world_records` for
+perception-filtered state and search. The catalog is MCP-only and does not
+advance the simulation, modify recall statistics, or require embeddings.
+
+---
+
 ## Putting it together
 
 ```python
