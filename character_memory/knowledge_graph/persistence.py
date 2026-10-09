@@ -34,6 +34,12 @@ from .nodes import node_from_dict
 
 NODES_TABLE = "kg_nodes"
 EDGES_TABLE = "kg_edges"
+# One-row revision counter bumped by every graph publication. A writer that
+# finds the revision it last saw/loaded knows no other process merged rows in
+# between, so its in-memory graph is still the authoritative union and the
+# (expensive) full reload from SQLite can be skipped.
+SYNC_TABLE = "kg_sync"
+_REVISION_KEY = "revision"
 
 # Column definitions. The kind-specific fields ride inside the JSON `data`
 # column so the schema is stable across node/edge kinds; the few columns we
@@ -65,6 +71,42 @@ _EDGE_COLUMNS: dict[str, str] = {
 def _ensure_tables(store: Store) -> None:
     store.create_table(NODES_TABLE, _NODE_COLUMNS)
     store.create_table(EDGES_TABLE, _EDGE_COLUMNS)
+    store.create_table(
+        SYNC_TABLE, {"key": "TEXT PRIMARY KEY", "value": "INTEGER NOT NULL"}, pk="key"
+    )
+
+
+def _read_revision(conn: Any) -> int:
+    row = conn.execute(
+        f"SELECT value FROM {SYNC_TABLE} WHERE key=?", [_REVISION_KEY]
+    ).fetchone()
+    return int(row[0]) if row is not None and row[0] is not None else 0
+
+
+_CONTAINERS = (dict, list, tuple, set)
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple((k, _freeze(v)) for k, v in value.items())
+    if isinstance(value, (list, tuple, set)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _fingerprint(obj: Any) -> int:
+    """In-process fingerprint of a node/edge's persisted state (never stored).
+
+    Every persisted column is derived from ``to_dict()`` (whose key set is
+    fixed per kind), so hashing its values detects any change without paying
+    for JSON encoding on the tens of thousands of rows that did not change.
+    """
+    return hash(
+        tuple(
+            _freeze(v) if isinstance(v, _CONTAINERS) else v
+            for v in obj.to_dict().values()
+        )
+    )
 
 
 def _user_id_of(node_dict: dict[str, Any]) -> Optional[str]:
@@ -189,8 +231,11 @@ def save_graph(
     apply only explicit graph tombstones.  A graph rebuilt from scratch uses
     ``replace=True`` to publish an authoritative replacement.
 
-    The returned graph is reloaded from SQLite after the merge and is therefore
-    the authoritative union when another process had added rows meanwhile.
+    Only rows whose serialized form changed since this process last saved or
+    loaded the graph are written. When the ``kg_sync`` revision shows that
+    another writer published in between, the graph is reloaded from SQLite
+    after the merge and the returned graph is that authoritative union;
+    otherwise ``graph`` itself is returned (its attached caches stay warm).
     """
     # Materialise JSON rows before entering the cross-process lock.  This also
     # avoids iterating live dicts while an extraction thread adds a node/edge.
@@ -198,6 +243,13 @@ def save_graph(
     edges = list(graph.edges.values())
     removed_nodes = set(getattr(graph, "_removed_node_ids", set()))
     removed_edges = set(getattr(graph, "_removed_edge_ids", set()))
+    node_hashes = {node.id: _fingerprint(node) for node in nodes}
+    edge_hashes = {edge.id: _fingerprint(edge) for edge in edges}
+    known = getattr(graph, "_persisted_row_hashes", None)
+    if not replace and known is not None:
+        known_nodes, known_edges = known
+        nodes = [n for n in nodes if known_nodes.get(n.id) != node_hashes[n.id]]
+        edges = [e for e in edges if known_edges.get(e.id) != edge_hashes[e.id]]
     node_rows: list[dict[str, Any]] = []
     for node in nodes:
         text = (node.text or "").strip()
@@ -231,9 +283,12 @@ def save_graph(
             }
         )
 
+    seen_revision = getattr(graph, "_persisted_revision", None)
+
     with _graph_write_lock(path):
         _ensure_tables(store)
         with store.transaction(immediate=True) as conn:
+            durable_revision = _read_revision(conn)
             if replace:
                 conn.execute(f"DELETE FROM {EDGES_TABLE}")
                 conn.execute(f"DELETE FROM {NODES_TABLE}")
@@ -259,11 +314,30 @@ def save_graph(
             for row in edge_rows:
                 sql, params = _upsert_sql(EDGES_TABLE, row)
                 conn.execute(sql, params)
+            new_revision = durable_revision + 1
+            conn.execute(
+                f"INSERT INTO {SYNC_TABLE} (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [_REVISION_KEY, new_revision],
+            )
 
-        # SQLite is now authoritative.  Re-read it while the graph publication
-        # lock is held, then build/publish the exact same node set to the hybrid
-        # index.  This keeps cross-process additions searchable immediately.
-        durable = load_graph(store)
+        if replace or (seen_revision is not None and seen_revision == durable_revision):
+            # Nobody else published since this graph was last synchronized:
+            # SQLite now equals the in-memory graph plus nothing new.
+            durable = graph
+            for journal, persisted in (
+                (getattr(graph, "_removed_node_ids", None), removed_nodes),
+                (getattr(graph, "_removed_edge_ids", None), removed_edges),
+            ):
+                if journal is not None:
+                    journal.difference_update(persisted)
+            graph._persisted_row_hashes = (node_hashes, edge_hashes)
+            graph._persisted_revision = new_revision
+        else:
+            # SQLite is authoritative and holds rows from another writer.
+            # Re-read it while the graph publication lock is held so the hybrid
+            # index published below covers cross-process additions too.
+            durable = load_graph(store)
         sync_hybrid_index(hybrid, graph_index_chunks(durable))
         if path:
             hybrid.persist(path)
@@ -274,6 +348,10 @@ def save_graph(
 def load_graph(store: Store) -> KnowledgeGraph:
     """Reconstruct the graph from the `kg_nodes` / `kg_edges` tables."""
     _ensure_tables(store)
+    # Read the revision before the rows: a publication landing in between
+    # leaves an older revision here, so the next save conservatively reloads.
+    revision_rows = store.select(SYNC_TABLE, {"key": _REVISION_KEY}, limit=1)
+    revision = int(revision_rows[0]["value"]) if revision_rows else 0
     data: dict[str, Any] = {"nodes": [], "edges": [], "counters": {}}
     for row in store.select(NODES_TABLE):
         try:
@@ -316,7 +394,15 @@ def load_graph(store: Store) -> KnowledgeGraph:
                 except (ValueError, IndexError):
                     pass
         data["counters"][kind] = max_n
-    return KnowledgeGraph.from_dict(data)
+    graph = KnowledgeGraph.from_dict(data)
+    # Fingerprints of the objects as loaded: a row whose stored form differs
+    # from what from_dict normalised it to is simply rewritten on next save.
+    graph._persisted_row_hashes = (
+        {node.id: _fingerprint(node) for node in graph.nodes.values()},
+        {edge.id: _fingerprint(edge) for edge in graph.edges.values()},
+    )
+    graph._persisted_revision = revision
+    return graph
 
 
 def has_persisted(store: Store, index_path: str, hybrid=None) -> bool:

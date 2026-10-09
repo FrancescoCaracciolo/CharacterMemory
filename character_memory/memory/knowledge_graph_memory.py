@@ -13,9 +13,11 @@ dedupped source rows to graph nodes.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..chunking import Chunk
+from ..concurrency import object_lock
 from ..config import KnowledgeGraphPrivacy
 from ..knowledge_graph import (
     KnowledgeGraphConfig,
@@ -150,6 +152,17 @@ class KnowledgeGraphMemory(Memory):
             "retrieved_ids": list(dict.fromkeys(surfaced)),
         }
 
+    def _recall_scope(self, query: Query):
+        """Embed the query first, then hold the retriever lock for the whole
+        recall so the activation snapshot read afterwards belongs to this
+        request rather than to a concurrent one."""
+        stack = ExitStack()
+        prefetch = getattr(self.retriever.hybrid, "prefetched_queries", None)
+        if callable(prefetch):
+            stack.enter_context(prefetch(query))
+        stack.enter_context(object_lock(self.retriever))
+        return stack
+
     def build_section_result(
         self,
         query: Query,
@@ -161,20 +174,24 @@ class KnowledgeGraphMemory(Memory):
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: Optional[float] = None,
     ) -> RecallResult:
-        result = super().build_section_result(
-            query,
-            user_id,
-            limit,
-            state_changing=state_changing,
-            temporal_resolution=temporal_resolution,
-            temporal_resolution_engine=temporal_resolution_engine,
-            temporal_weight=temporal_weight,
+        # Resolve before locking: an LLM-backed temporal engine is network I/O.
+        resolution = self.resolve_temporal(
+            query, temporal_resolution, temporal_resolution_engine
         )
-        if result.items:
-            result.diagnostics = self._activation_snapshot(
-                result.items,
-                visible_ids=self.retriever.visible_node_ids(user_id=user_id),
+        with self._recall_scope(query):
+            result = super().build_section_result(
+                query,
+                user_id,
+                limit,
+                state_changing=state_changing,
+                temporal_resolution=resolution,
+                temporal_weight=temporal_weight,
             )
+            if result.items:
+                result.diagnostics = self._activation_snapshot(
+                    result.items,
+                    visible_ids=self.retriever.visible_node_ids(user_id=user_id),
+                )
         return result
 
     def build_section_participants_result(
@@ -202,11 +219,24 @@ class KnowledgeGraphMemory(Memory):
             )
         if not self.enabled:
             return RecallResult()
-
-        if self.retriever._privacy_mode() is not KnowledgeGraphPrivacy.NONE:
-            resolution = self.resolve_temporal(
-                query, temporal_resolution, temporal_resolution_engine
+        resolution = self.resolve_temporal(
+            query, temporal_resolution, temporal_resolution_engine
+        )
+        with self._recall_scope(query):
+            return self._participants_result_locked(
+                query, participants, limit, state_changing, resolution, temporal_weight
             )
+
+    def _participants_result_locked(
+        self,
+        query: Query,
+        participants: list[str],
+        limit: int,
+        state_changing: bool,
+        resolution: Optional["TemporalResolution"],
+        temporal_weight: Optional[float],
+    ) -> RecallResult:
+        if self.retriever._privacy_mode() is not KnowledgeGraphPrivacy.NONE:
             items = self.retriever.retrieve(
                 query,
                 user_ids=participants,
@@ -243,9 +273,6 @@ class KnowledgeGraphMemory(Memory):
         # prevents a global heartbeat/world/wiki node from being rendered and
         # practiced once per human speaker in a group chat — and keeps a
         # P-participant group from paying P full retrievals.
-        resolution = self.resolve_temporal(
-            query, temporal_resolution, temporal_resolution_engine
-        )
         multi = self.retriever.retrieve_multi(
             query,
             user_ids=participants,

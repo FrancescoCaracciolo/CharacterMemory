@@ -425,7 +425,10 @@ curl -X POST http://localhost:8000/extract \
 
 `/save` only stores the answer. Extraction runs automatically once the chat
 has `memory.extract_interval` user turns since its last extraction; change the
-interval in `config.yaml` or in the WebUI's Configure tab.
+interval in `config.yaml` or in the WebUI's Configure tab. If that chat is
+already being extracted, `/save` returns right away with `extracted: false`
+and the server runs the interval check again in the background once the
+current pass finishes.
 
 For `/context`, omit `budget` to inherit the character configuration, send
 `null` for unlimited, or `0` to omit memories. A positive integer caps rendered

@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from character_memory.character import ContextSnapshot
 from character_memory.memory.base import MemoryItem
@@ -94,8 +94,14 @@ def build_context_event(
     user: str,
     message: str,
     chat_id: str,
+    include_graphs: bool = True,
 ) -> dict[str, Any]:
-    """Turn a single-pass context snapshot into the browser event payload."""
+    """Turn a single-pass context snapshot into the browser event payload.
+
+    ``include_graphs=False`` skips the knowledge-graph subgraph views (the
+    only expensive part, since they read the shared graph); the event then
+    carries an empty ``graphs`` mapping.
+    """
     recalls: list[dict[str, Any]] = []
     for name, section in snapshot.sections.items():
         recall = snapshot.recalls.get(name)
@@ -128,7 +134,7 @@ def build_context_event(
     query_items = _query_payload(snapshot.query)
     query_text = query_items[0]["text"] if query_items else ""
     graphs: dict[str, dict[str, Any]] = {}
-    kg = snapshot.recalls.get("knowledge_graph")
+    kg = snapshot.recalls.get("knowledge_graph") if include_graphs else None
     if kg is not None:
         diagnostics = kg.diagnostics or {}
         if isinstance(diagnostics.get("participants"), dict):
@@ -165,6 +171,50 @@ def build_context_event(
         "item_count": sum(len(r["items"]) for r in recalls),
         "graphs": graphs,
     }
+
+
+class DeferredEventPublisher:
+    """Build and publish live-monitor events on one daemon thread, in order.
+
+    Building an event reads the shared knowledge graph (subgraph views), so
+    doing it inside ``/context`` made every request queue on the graph lock
+    behind the others. Here at most one build runs at a time and requests
+    never wait for it. When work piles up, tasks are told to degrade
+    (``task(True)``: skip the graph views) so the backlog drains quickly;
+    past ``max_pending`` the oldest queued task is dropped.
+    """
+
+    def __init__(self, *, max_pending: int = 64, degrade_after: int = 4) -> None:
+        self.max_pending = max(1, int(max_pending))
+        self.degrade_after = max(1, int(degrade_after))
+        self._pending: deque[Callable[[bool], Any]] = deque()
+        self._cond = threading.Condition()
+        self._thread: Optional[threading.Thread] = None
+
+    def submit(self, task: Callable[[bool], Any]) -> None:
+        with self._cond:
+            self._pending.append(task)
+            while len(self._pending) > self.max_pending:
+                self._pending.popleft()
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run, name="context-events", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._pending:
+                    self._cond.wait()
+                task = self._pending.popleft()
+                degraded = len(self._pending) >= self.degrade_after
+            try:
+                task(degraded)
+            except Exception:
+                # Monitoring is best-effort and must never kill the worker.
+                pass
 
 
 class ContextEventBroker:
@@ -304,6 +354,7 @@ def sse_event(event: dict[str, Any]) -> str:
 
 __all__ = [
     "ContextEventBroker",
+    "DeferredEventPublisher",
     "build_context_event",
     "project_context_event",
     "item_payload",

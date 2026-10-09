@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import threading
 from typing import Optional
 
 import httpx
@@ -40,6 +41,9 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
         # request. Cache per (role, prefix, text); only misses reach the
         # embedding server. Bulk indexing batches are never retained.
         self._cache: dict[tuple[str, str, str], np.ndarray] = {}
+        # Guards only the cache dict (never the network call): concurrent
+        # requests share one provider and eviction iterates the dict.
+        self._cache_lock = threading.Lock()
 
     @property
     def dim(self) -> int:
@@ -93,12 +97,13 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
         misses: list[int] = list(range(len(texts)))
         if cacheable:
             misses = []
-            for i, text in enumerate(texts):
-                cached = self._cache.get((role, prefix, text))
-                if cached is not None:
-                    rows[i] = cached
-                else:
-                    misses.append(i)
+            with self._cache_lock:
+                for i, text in enumerate(texts):
+                    cached = self._cache.get((role, prefix, text))
+                    if cached is not None:
+                        rows[i] = cached
+                    else:
+                        misses.append(i)
 
         if misses:
             pending = [prefix + texts[i] for i in misses]
@@ -119,10 +124,11 @@ class OpenAICompatibleEmbeddings(EmbeddingProvider):
             for offset, i in enumerate(misses):
                 rows[i] = vectors[offset]
             if cacheable:
-                for i in misses:
-                    self._cache[(role, prefix, texts[i])] = rows[i]
-                while len(self._cache) > _TEXT_CACHE_LIMIT:
-                    self._cache.pop(next(iter(self._cache)))
+                with self._cache_lock:
+                    for i in misses:
+                        self._cache[(role, prefix, texts[i])] = rows[i]
+                    while len(self._cache) > _TEXT_CACHE_LIMIT:
+                        self._cache.pop(next(iter(self._cache)))
 
         if not texts:
             return np.asarray([], dtype=np.float32)

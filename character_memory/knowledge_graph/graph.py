@@ -61,6 +61,13 @@ class KnowledgeGraph:
         # still propagate intentional removals (dedup/wiki refresh) precisely.
         self._removed_node_ids: set[str] = set()
         self._removed_edge_ids: set[str] = set()
+        # Persistence bookkeeping owned by ``persistence.save_graph`` /
+        # ``load_graph``: per-row fingerprints of what SQLite holds (so a save
+        # writes only changed rows) and the ``kg_sync`` revision they match.
+        # ``None`` means "never synchronized": the next save writes every row
+        # and reloads the durable union.
+        self._persisted_row_hashes: Optional[tuple[dict[str, int], dict[str, int]]] = None
+        self._persisted_revision: Optional[int] = None
         # Mutation clock, bumped by every structural/attribute change made
         # through this API. Cross-query caches (the numeric activation
         # snapshot, visibility sets) key off it; raw in-place attribute writes

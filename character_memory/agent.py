@@ -56,7 +56,7 @@ from .memory.heartbeat import HeartbeatJournal
 from .memory.knowledge_graph_memory import KnowledgeGraphMemory
 from .memory.store import SQLiteStore
 from .memory.store_base import Store
-from .concurrency import chat_serialized
+from .concurrency import Coalescer, chat_lock, chat_serialized
 from .rag.base import RAGSystem
 from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
@@ -209,6 +209,7 @@ class CharacterAgent:
         #: disabled via ``MemoryConfig.extraction_log_limit = 0``.
         self.extraction_log: Optional[ExtractionLog] = None
         self._built = False
+        self._persist_coalescer = Coalescer()
 
     def _configure_temporal_resolution(
         self, config: Optional[TemporalResolutionConfig]
@@ -835,7 +836,15 @@ class CharacterAgent:
             self.persist_structured()
 
     def persist_structured(self) -> None:
-        """Publish derived indexes and acknowledge durable reconciliation work."""
+        """Publish derived indexes and acknowledge durable reconciliation work.
+
+        Concurrent callers (parallel extractions, MCP writes) are coalesced:
+        each returns once a publication that started after its call finished,
+        so N simultaneous writers cost about two publications, not N.
+        """
+        self._persist_coalescer.run(self._persist_structured_now)
+
+    def _persist_structured_now(self) -> None:
         reports, pending = self._pending_reconciliation_reports()
         for name in reports:
             self.memories[name].sync_reconciliation_index()
@@ -1167,19 +1176,30 @@ class CharacterAgent:
         self._extract_chat_unlocked(chat)
         return True
 
-    @chat_serialized
-    def maybe_extract(self, target: Union[Chat, str]) -> bool:
+    def maybe_extract(
+        self, target: Union[Chat, str], *, wait: bool = True
+    ) -> Optional[bool]:
         """Extract `target` if its counter reached `extract_interval`.
 
         The counter is the number of user turns since the chat's last
         extraction (scheduled or forced via :meth:`extract`). Returns whether
         extraction ran; an unknown chat id returns False.
+
+        ``wait=False`` returns ``None`` instead of blocking when the chat is
+        busy (another extraction or generation holds its lock); the caller
+        should retry later, since the busy holder may not cover new turns.
         """
         self._require_loaded()
         chat = self._as_chat(target)
         if chat is None:
             return False
-        return self._maybe_auto_extract(chat)
+        lock = chat_lock(self.store, chat.id)
+        if not lock.acquire(blocking=wait):
+            return None
+        try:
+            return self._maybe_auto_extract(chat)
+        finally:
+            lock.release()
 
     @chat_serialized
     def generate_answer(

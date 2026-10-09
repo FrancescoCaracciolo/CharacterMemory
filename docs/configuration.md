@@ -52,6 +52,7 @@ preserves unrelated settings, and offers optional connection tests. See the
 | `CM_KG_CHARACTERS` | _empty_ | Comma-separated character names to enable the KG for. |
 | `CM_REBUILD_KG` | _empty_ | Comma-separated names to rebuild at startup, or `all`. |
 | `CM_SYNC_INTERVAL` | `3.0` | Background cache-sync poll interval (seconds); `0` disables. |
+| `CM_WORKER_THREADS` | _empty_ (40) | Size of the thread pool that runs the server's sync endpoints. Raise it if many slow requests (extraction, KG writes) overlap. |
 | `CM_API_KEY` | _empty_ | Require this API key on every server endpoint (comma-separated list allowed); empty = no auth. |
 
 A `.env` in the current working directory is auto-loaded, falling back to the

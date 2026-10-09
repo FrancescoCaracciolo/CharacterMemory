@@ -1754,8 +1754,8 @@ class KnowledgeGraphRetriever:
         self._skip_reconcile_on_next_save = False
         self._commit_projection_meta()
         self._known_users = self._graph_user_ids()
-        # The reload replaced the graph (dropping its attached caches); the
-        # retriever-side temporal memo refers to rows that may have merged.
+        # Source rows may have changed (extraction/dedup precede a save, or a
+        # reload merged another writer's rows); the temporal memo keys on them.
         self._temporal_interval_cache.clear()
         return self
 

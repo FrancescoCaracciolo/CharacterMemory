@@ -64,7 +64,11 @@ their *final* atomic step (temp-write + ``os.replace``), the poller either
 sees the old mtime (no reload — correct, nothing new committed yet) or the
 new mtime (reload — correct, loads the freshly-persisted state). The shared
 index lock also prevents a manual/direct load from combining files from two
-different publications.
+different publications. A newer mtime that matches the ``nodes.json`` this
+process itself last published or loaded (``HybridSearch.synced_mtime_ns``)
+is not reloaded: the in-RAM state already is that publication, and under
+write-heavy load reloading our own writes (a full graph reload for the KG)
+would monopolize the memory's lock.
 
 A per-agent :class:`threading.RLock` serializes the poller against a manual
 :meth:`check_now` (from the ``/refresh`` endpoint) so two concurrent reloads
@@ -240,6 +244,12 @@ class MemorySync:
             m = _mtime(p)
             if m <= self._index_mtimes.get(name, 0.0) or m <= 0.0:
                 continue
+            if self._is_own_publication(hybrid, name):
+                # This process wrote (or already loaded) exactly this file:
+                # its in-RAM state is current, and reloading would only burn
+                # the memory's lock (a full graph reload for the KG).
+                self._index_mtimes[name] = m
+                continue
             if isinstance(mem, KnowledgeGraphMemory):
                 if self._reload_kg():
                     reloaded = True
@@ -249,6 +259,17 @@ class MemorySync:
                     reloaded = True
                     self._index_mtimes[name] = m
         return reloaded
+
+    def _is_own_publication(self, hybrid: Any, name: str) -> bool:
+        synced = getattr(hybrid, "synced_mtime_ns", None)
+        if not callable(synced):
+            return False
+        index_dir = self._index_dir(name)
+        try:
+            current = os.stat(os.path.join(index_dir, "nodes.json")).st_mtime_ns
+        except OSError:
+            return False
+        return synced(index_dir) == current
 
     # ---------------------------------------------------------- reloaders
     def _reload_kg(self) -> bool:

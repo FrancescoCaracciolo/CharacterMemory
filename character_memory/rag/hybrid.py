@@ -15,7 +15,8 @@ import os
 import threading
 import warnings
 from collections import OrderedDict
-from collections.abc import Hashable, Iterable
+from collections.abc import Hashable, Iterable, Iterator
+from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Optional
 
@@ -116,6 +117,60 @@ class HybridSearch(RAGSystem):
         # (realpath, revision, fingerprint) of the last state written to or
         # read from disk; `persist` is a no-op while it still matches.
         self._persisted_marker: Optional[tuple[str, int, str]] = None
+        # realpath -> st_mtime_ns of the ``nodes.json`` this instance last
+        # published or loaded; lets a cache poller tell its own writes apart
+        # from another process's.
+        self._synced_mtime_ns: dict[str, int] = {}
+        # Per-thread query vectors computed ahead of time by
+        # ``prefetched_queries`` so callers holding their own locks around
+        # ``search`` do no network I/O inside them.
+        self._prefetch = threading.local()
+
+    def synced_mtime_ns(self, path: str) -> Optional[int]:
+        """``st_mtime_ns`` of ``<path>/nodes.json`` as this instance last
+        wrote or read it (``None`` if it never touched ``path``)."""
+        return self._synced_mtime_ns.get(os.path.realpath(path))
+
+    def _record_synced(self, path: str, mtime_ns: Optional[int] = None) -> None:
+        if mtime_ns is None:
+            try:
+                mtime_ns = os.stat(os.path.join(path, "nodes.json")).st_mtime_ns
+            except OSError:
+                return
+        self._synced_mtime_ns[os.path.realpath(path)] = mtime_ns
+
+    @contextmanager
+    def prefetched_queries(self, query: Query) -> Iterator[None]:
+        """Embed ``query`` now; a ``search`` for the same texts on this thread
+        inside the block reuses the vectors instead of calling the provider.
+
+        Lets a caller that serializes its own state (the knowledge-graph
+        retriever) keep embedding latency outside its lock. A failed embedding
+        is ignored here: ``search`` then embeds (and raises) as usual.
+        """
+        texts = tuple(text for text, weight in as_queries(query) if weight > 0.0)
+        previous = getattr(self._prefetch, "entry", None)
+        if texts:
+            try:
+                vectors = self._normalize_vectors(
+                    self._embed_queries(list(texts)), expected_count=len(texts)
+                )
+            except Exception:  # noqa: BLE001 - search() surfaces the error
+                vectors = None
+            if vectors is not None:
+                self._prefetch.entry = (texts, vectors)
+        try:
+            yield
+        finally:
+            self._prefetch.entry = previous
+
+    def _query_vectors(self, texts: list[str]) -> "np.ndarray":
+        entry = getattr(self._prefetch, "entry", None)
+        if entry is not None and entry[0] == tuple(texts):
+            return entry[1]
+        return self._normalize_vectors(
+            self._embed_queries(texts), expected_count=len(texts)
+        )
 
     def _invalidate_scoped_search(self) -> None:
         self._index_revision += 1
@@ -511,9 +566,7 @@ class HybridSearch(RAGSystem):
         # pass regardless of how many messages are in the window). This is
         # network I/O, so it happens before taking the state lock.
         q_texts = [q for q, _ in queries]
-        q_vecs = self._normalize_vectors(
-            self._embed_queries(q_texts), expected_count=len(q_texts)
-        )
+        q_vecs = self._query_vectors(q_texts)
         from .fusion import fuse
         for attempt in range(_MAX_SNAPSHOT_ATTEMPTS):
             with self._state_lock:
@@ -782,6 +835,9 @@ class HybridSearch(RAGSystem):
             # place; otherwise a poller can pair new nodes with the old FAISS
             # file and mistake the transient count mismatch for corruption.
             os.replace(nodes_tmp, os.path.join(path, "nodes.json"))
+            # Still under the exclusive lock: no other writer can have
+            # replaced the file since, so this is exactly our publication.
+            self._record_synced(path)
         self._persisted_marker = marker
 
     def _persist_key(self, path: str) -> tuple[str, int, str]:
@@ -805,6 +861,7 @@ class HybridSearch(RAGSystem):
                 with open(
                     os.path.join(path, "nodes.json"), encoding="utf-8"
                 ) as f:
+                    loaded_mtime_ns = os.fstat(f.fileno()).st_mtime_ns
                     data = json.load(f)
                 if os.path.exists(meta_file):
                     try:
@@ -900,3 +957,4 @@ class HybridSearch(RAGSystem):
                 self.persist(path)
             else:
                 self._persisted_marker = self._persist_key(path)
+                self._record_synced(path, loaded_mtime_ns)

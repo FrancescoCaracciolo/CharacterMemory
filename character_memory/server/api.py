@@ -46,8 +46,12 @@ public ``/gui`` paths.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -92,10 +96,13 @@ from .meter import RequestMeterMiddleware
 from .sync import MemorySync
 from .context_events import (
     ContextEventBroker,
+    DeferredEventPublisher,
     build_context_event,
     project_context_event,
     sse_event,
 )
+
+logger = logging.getLogger(__name__)
 
 # Default to the current working directory: once installed the package has no
 # notion of a "repo root", so the server operates relative to the cwd it is
@@ -203,6 +210,48 @@ AGENTS: dict[str, CharacterAgent] = _discover_characters(ASSETS_DIR)
 # `/context` observability is intentionally process-local and bounded.  It is
 # a live UI aid, not a second persistence layer for chat or memory data.
 CONTEXT_EVENTS = ContextEventBroker(max_events=25)
+CONTEXT_PUBLISHER = DeferredEventPublisher()
+_SSE_POLL_SECONDS = 0.2
+
+
+class _ExtractionFollowups:
+    """Deferred ``maybe_extract`` for chats that were busy when ``/save`` ran.
+
+    At most one follow-up is queued per chat; it blocks on the chat lock in a
+    small dedicated pool (not the request pool) and then applies the normal
+    interval check, so a due extraction is delayed, never skipped.
+    """
+
+    def __init__(self, max_workers: int = 2) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="extract-followup"
+        )
+        self._pending: set[tuple[int, str]] = set()
+        self._lock = threading.Lock()
+
+    def schedule(self, agent: CharacterAgent, chat_id: str) -> None:
+        key = (id(agent), chat_id)
+        with self._lock:
+            if key in self._pending:
+                return
+            self._pending.add(key)
+        self._executor.submit(self._run, agent, chat_id, key)
+
+    def shutdown(self) -> None:
+        # Drop queued checks but let a running extraction finish before the
+        # agents (and their stores) are closed.
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def _run(self, agent: CharacterAgent, chat_id: str, key: tuple[int, str]) -> None:
+        with self._lock:
+            self._pending.discard(key)
+        try:
+            agent.maybe_extract(chat_id)
+        except Exception:
+            logger.exception("Deferred extraction for chat %s failed", chat_id)
+
+
+EXTRACTION_FOLLOWUPS = _ExtractionFollowups()
 
 
 # One cache synchronizer per character. The poller reloads in-RAM hybrid
@@ -376,6 +425,27 @@ app.include_router(build_admin_router_impl(AGENTS, ASSETS_DIR, SAVE_ROOT, SYNC_M
 app.include_router(build_jobs_router_impl())
 
 
+@app.on_event("startup")
+async def _configure_threadpool() -> None:
+    """Size the worker pool that runs the sync endpoints (``CM_WORKER_THREADS``).
+
+    Every sync route occupies one pool thread for its whole duration, so a
+    burst of slow requests (LLM extraction, KG writes) can exhaust anyio's
+    default of 40 and make even trivial routes appear hung.
+    """
+    raw = os.environ.get("CM_WORKER_THREADS", "").strip()
+    if not raw:
+        return
+    try:
+        threads = int(raw)
+    except ValueError:
+        return
+    if threads > 0:
+        import anyio.to_thread
+
+        anyio.to_thread.current_default_thread_limiter().total_tokens = threads
+
+
 @app.on_event("shutdown")
 def _shutdown() -> None:
     """Stop the sync pollers, then flush structured-memory indexes to disk."""
@@ -384,6 +454,10 @@ def _shutdown() -> None:
             monitor.stop()
         except Exception:  # pragma: no cover - best effort
             pass
+    try:
+        EXTRACTION_FOLLOWUPS.shutdown()
+    except Exception:  # pragma: no cover - best effort
+        pass
     for agent in AGENTS.values():
         try:
             agent.close()
@@ -442,19 +516,26 @@ def context(req: ContextRequest) -> ContextResponse:
             req.memory_types if req.memory_types is not None else req.memories
         )
     snapshot = agent.build_context_snapshot(chat, **recall_options)
-    try:
+    # The live-monitor event (graph subgraph views read the shared KG) is
+    # built off the request path; monitoring must never delay or fail /context.
+    broker = CONTEXT_EVENTS
+    chat_id = chat.id
+
+    def publish_event(degraded: bool) -> None:
         event = build_context_event(
             agent,
             snapshot=snapshot,
             character=req.character,
             user=req.user,
             message=req.message,
-            chat_id=chat.id,
+            chat_id=chat_id,
+            include_graphs=not degraded,
         )
-        CONTEXT_EVENTS.publish(req.character, event)
+        broker.publish(req.character, event)
+
+    try:
+        CONTEXT_PUBLISHER.submit(publish_event)
     except Exception:
-        # Monitoring must never change the thin-client contract or turn a
-        # successful recall into a failed request.
         pass
     return ContextResponse(
         chat_id=chat.id,
@@ -483,7 +564,9 @@ def context_events(
         character, last_event_id=last_event_id, user_id=user
     )
 
-    def stream():
+    async def stream():
+        # Async on purpose: a sync generator would pin one threadpool worker
+        # per open monitor tab for the whole connection, starving requests.
         try:
             # Flush headers through buffering proxies immediately so the
             # browser enters its listening state before the first request.
@@ -492,12 +575,18 @@ def context_events(
                 projected = project_context_event(event, user)
                 if projected is not None:
                     yield sse_event(projected)
+            idle = 0.0
             while True:
                 try:
-                    event = subscriber.get(timeout=15.0)
+                    event = subscriber.get_nowait()
                 except queue.Empty:
-                    yield ": keep-alive\n\n"
+                    await asyncio.sleep(_SSE_POLL_SECONDS)
+                    idle += _SSE_POLL_SECONDS
+                    if idle >= 15.0:
+                        idle = 0.0
+                        yield ": keep-alive\n\n"
                     continue
+                idle = 0.0
                 projected = project_context_event(event, user)
                 if projected is not None:
                     yield sse_event(projected)
@@ -537,7 +626,12 @@ def save(req: SaveRequest) -> SaveResponse:
     """
     owner, chat = _find_chat(req.chat_id)
     chat.add_message("assistant", req.answer, occurred_at=req.occurred_at)
-    extracted = owner.maybe_extract(chat)
+    extracted = owner.maybe_extract(chat, wait=False)
+    if extracted is None:
+        # The chat is mid-extraction; waiting would pin this request thread
+        # for the whole LLM pass. Re-check the interval once it finishes.
+        EXTRACTION_FOLLOWUPS.schedule(owner, chat.id)
+        extracted = False
     return SaveResponse(chat_id=chat.id, extracted=extracted)
 
 
