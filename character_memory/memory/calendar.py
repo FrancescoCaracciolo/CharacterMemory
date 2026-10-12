@@ -35,6 +35,11 @@ EVENT_KIND = "event"
 ROUTINE_KIND = "routine"
 ACTIVE_STATUS = "scheduled"
 CANCELLED_STATUS = "cancelled"
+# Longest span one resolved temporal range may add to a calendar search.
+# Recurring rows are expanded per day, so this bounds the work a single
+# expression ("100 years ago", an LLM "range") can trigger. A year-grain
+# reference (366 days) still fits whole.
+_MAX_TEMPORAL_WINDOW_SECONDS = 400 * 86_400
 
 
 def _json(value: Any) -> str:
@@ -242,11 +247,16 @@ class WorldRoutineCalendarSource(CalendarSource):
         zone = _zone(timezone)
         local_start = datetime.fromtimestamp(float(start), tz=UTC).astimezone(zone).date() - timedelta(days=1)
         local_end = datetime.fromtimestamp(float(before), tz=UTC).astimezone(zone).date() + timedelta(days=1)
+        routine_days = [
+            (routine, set(routine.get("days") or []))
+            for routine in routines
+            if routine.get("enabled")
+        ]
         cursor = local_start
         while cursor <= local_end:
             weekday = cursor.weekday()
-            for routine in routines:
-                if not routine.get("enabled") or weekday not in set(routine.get("days") or []):
+            for routine, days in routine_days:
+                if weekday not in days:
                     continue
                 at = _parse_local_time(routine.get("start_local"))
                 start_dt = datetime.combine(cursor, at, tzinfo=zone)
@@ -707,9 +717,10 @@ class CalendarMemory(StructuredMemory):
         local_start = datetime.fromtimestamp(float(start), tz=UTC).astimezone(zone).date() - timedelta(days=1)
         local_end = datetime.fromtimestamp(float(before), tz=UTC).astimezone(zone).date() + timedelta(days=1)
         out: list[CalendarOccurrence] = []
+        weekdays = set(event.weekdays)
         cursor = local_start
         while cursor <= local_end:
-            if cursor.weekday() in set(event.weekdays):
+            if cursor.weekday() in weekdays:
                 start_dt = datetime.combine(cursor, at, tzinfo=zone)
                 start_ts = start_dt.astimezone(UTC).timestamp()
                 end_ts = start_ts + max(1, int(event.duration_minutes or 1)) * 60
@@ -735,26 +746,93 @@ class CalendarMemory(StructuredMemory):
         self, start: float, before: float, *, owners: Optional[Iterable[str]] = None,
         include_cancelled: bool = False,
     ) -> list[CalendarOccurrence]:
+        return self._occurrences_in_windows(
+            [(float(start), float(before))],
+            owners=owners,
+            include_cancelled=include_cancelled,
+        )
+
+    def _occurrences_in_windows(
+        self,
+        windows: list[tuple[float, float]],
+        *,
+        owners: Optional[Iterable[str]] = None,
+        include_cancelled: bool = False,
+    ) -> list[CalendarOccurrence]:
+        """Occurrences inside any of the disjoint ``[start, before)`` windows.
+
+        Recurring rows are expanded day by day, so cost is proportional to the
+        total window length. Expanding each window separately (instead of the
+        span covering all of them) keeps a far-away temporal reference from
+        projecting every routine across decades.
+        """
         owner_set = {str(v) for v in owners} if owners is not None else None
-        out: list[CalendarOccurrence] = []
+        events: list[CalendarEvent] = []
         for row in self.all_rows():
             event = self._row_event(row)
             if not self._visible(event, owner_set):
                 continue
             if not include_cancelled and event.status == CANCELLED_STATUS:
                 continue
-            out.extend(self._row_occurrences(
-                event,
-                float(start),
-                float(before),
-                include_cancelled=include_cancelled,
-            ))
-        for source in self._sources:
-            out.extend(source.occurrences(float(start), float(before), owners=owner_set))
+            events.append(event)
+        out: list[CalendarOccurrence] = []
+        for start, before in windows:
+            for event in events:
+                out.extend(self._row_occurrences(
+                    event,
+                    float(start),
+                    float(before),
+                    include_cancelled=include_cancelled,
+                ))
+            for source in self._sources:
+                out.extend(source.occurrences(float(start), float(before), owners=owner_set))
         # A shared persisted event should only occur once even when requested
-        # through several owners.
+        # through several owners (or found in adjacent windows).
         out.sort(key=lambda item: (item.start_at, item.end_at, item.id))
         return list({item.id: item for item in out}.values())
+
+    @staticmethod
+    def _temporal_windows(
+        resolution: "TemporalResolution",
+        now: float,
+        *,
+        start: Optional[float],
+        before: Optional[float],
+    ) -> list[tuple[float, float]]:
+        """Bounded candidate windows contributed by resolved temporal ranges.
+
+        Each range is capped at ``_MAX_TEMPORAL_WINDOW_SECONDS`` (keeping the
+        part nearest to ``now``) and clipped to explicit ``start``/``before``
+        bounds, which temporal widening never overrides.
+        """
+        cap = _MAX_TEMPORAL_WINDOW_SECONDS
+        windows: list[tuple[float, float]] = []
+        for value in resolution.ranges:
+            lo, hi = float(value.start_timestamp), float(value.end_timestamp)
+            if hi - lo > cap:
+                if hi <= now:
+                    lo = hi - cap
+                elif lo >= now:
+                    hi = lo + cap
+                else:
+                    lo, hi = max(lo, now - cap / 2), min(hi, now + cap / 2)
+            if start is not None:
+                lo = max(lo, float(start))
+            if before is not None:
+                hi = min(hi, float(before))
+            if hi > lo:
+                windows.append((lo, hi))
+        return windows
+
+    @staticmethod
+    def _merge_windows(windows: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        merged: list[tuple[float, float]] = []
+        for lo, hi in sorted(windows):
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        return merged
 
     def _semantic_scores(self, query: Query) -> dict[int, float]:
         if not query:
@@ -788,19 +866,27 @@ class CalendarMemory(StructuredMemory):
         default_hi = now + self.near_future_days * 86_400
         lo = default_lo if start is None else float(start)
         hi = default_hi if before is None else float(before)
-        if temporal_resolution is not None and temporal_resolution.ranges:
-            # Widen rather than replace the normal candidate window: temporal
-            # relevance is an additional signal, never a hard filter.
-            if start is None:
-                lo = min(lo, *(value.start_timestamp for value in temporal_resolution.ranges))
-            if before is None:
-                hi = max(hi, *(value.end_timestamp for value in temporal_resolution.ranges))
         if hi <= lo:
             raise ValueError("calendar range must end after it starts")
         limit = int(limit)
         if limit <= 0:
             return []
-        occurrences = self.occurrences(lo, hi, owners=owners, include_cancelled=include_cancelled)
+        windows = [(lo, hi)]
+        if temporal_resolution is not None and temporal_resolution.ranges:
+            # Widen rather than replace the normal candidate window: temporal
+            # relevance is an additional signal, never a hard filter. Add the
+            # referenced ranges as separate windows -- never the span between
+            # them and now, which for "100 years ago" would expand every
+            # routine across a century of days (a GIL-bound CPU loop that
+            # stalls every concurrent request).
+            windows.extend(self._temporal_windows(
+                temporal_resolution, now, start=start, before=before
+            ))
+        occurrences = self._occurrences_in_windows(
+            self._merge_windows(windows),
+            owners=owners,
+            include_cancelled=include_cancelled,
+        )
         if not occurrences:
             return []
         if isinstance(query, list):

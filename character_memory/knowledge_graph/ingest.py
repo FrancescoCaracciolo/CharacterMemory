@@ -43,6 +43,7 @@ post-extraction update (`KnowledgeGraphRetriever.update`).
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
 from ..llm.base import LLMClient
@@ -73,6 +74,8 @@ _FACT_BATCH_SIZE = 50
 _EPISODE_BATCH_SIZE = 50
 _WIKI_BATCH_SIZE = 3
 _EXTRACTION_TOKEN_LIMIT = 10_000
+
+_NOT_PREFETCHED = object()
 
 
 def _token_counter() -> Callable[[str], int]:
@@ -309,6 +312,79 @@ def _existing_state_clause(
     return "\n".join(parts) + "\n\n"
 
 
+def _fact_extraction_messages(
+    facts: list[dict[str, Any]],
+    known_users: list[str],
+    *,
+    graph: KnowledgeGraph,
+    character: Optional[CharacterContext] = None,
+) -> list[dict[str, str]]:
+    numbered = [f"{i}. {f.get('content') or f.get('text') or ''}" for i, f in enumerate(facts)]
+    prompt = _FACT_EXTRACTION_PROMPT.format(
+        char_clause=_char_clause(character),
+        state_clause=_existing_state_clause(graph, known_users, character),
+    )
+    return [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": "Facts:\n" + "\n".join(numbered)},
+    ]
+
+
+@dataclass
+class PlannedFactBatch:
+    """One fact-extraction request prepared from a graph snapshot.
+
+    ``result`` is the raw LLM response once :func:`run_fact_extraction` ran
+    (``None`` when the call failed: ingestion then uses the row-owner
+    heuristic, exactly like a failed inline call).
+    """
+
+    rows: list[dict[str, Any]]
+    messages: list[dict[str, str]]
+    result: Optional[dict[str, Any]] = None
+
+
+def plan_fact_extraction(
+    graph: KnowledgeGraph,
+    rows: list[dict[str, Any]],
+    *,
+    known_users: Optional[list[str]] = None,
+    character: Optional[CharacterContext] = None,
+    batch_size: int = _FACT_BATCH_SIZE,
+    token_limit: int = _EXTRACTION_TOKEN_LIMIT,
+) -> list[PlannedFactBatch]:
+    """Build the fact-extraction prompts; reads ``graph`` but does no I/O."""
+    batches = _batch_by_limits(
+        [r for r in rows if str(r.get("content") or "").strip()],
+        max_items=batch_size,
+        max_tokens=token_limit,
+        text_of=lambda row: str(row.get("content") or row.get("text") or ""),
+    )
+    users = list(known_users or [])
+    return [
+        PlannedFactBatch(
+            rows=list(batch),
+            messages=_fact_extraction_messages(
+                batch, users, graph=graph, character=character
+            ),
+        )
+        for batch in batches
+    ]
+
+
+def run_fact_extraction(
+    llm: LLMClient, plan: list[PlannedFactBatch]
+) -> list[PlannedFactBatch]:
+    """Make the planned LLM calls. Touches no graph state, so callers run it
+    without holding the retriever lock."""
+    for batch in plan:
+        try:
+            batch.result = llm.chat_structured(batch.messages, _FACT_EXTRACTION_SCHEMA)
+        except Exception:
+            batch.result = None
+    return plan
+
+
 def _extract_fact_subjects(
     llm: Optional[LLMClient],
     facts: list[dict[str, Any]],
@@ -317,32 +393,33 @@ def _extract_fact_subjects(
     graph: KnowledgeGraph,
     character: Optional[CharacterContext] = None,
     _on_llm_request_done: Optional[Callable[[], None]] = None,
+    _result: Any = _NOT_PREFETCHED,
 ) -> dict[int, dict[str, Any]]:
     """Run the batched fact-extraction call. Falls back to heuristic on failure.
 
     Returns `{fact_index: {subject, entities}}`. When no LLM is wired, every
     fact is attributed to the user that owned it (its `user_id` column) and
     no entities are extracted — the graph still builds, just sparser.
+    ``_result`` supplies an already-fetched raw response (``None`` = failed).
     """
     fallback = {i: {"subject": str(f.get("user_id") or "self"), "entities": []} for i, f in enumerate(facts)}
-    if not facts or llm is None:
-        return fallback
-    numbered = [f"{i}. {f.get('content') or f.get('text') or ''}" for i, f in enumerate(facts)]
-    prompt = _FACT_EXTRACTION_PROMPT.format(
-        char_clause=_char_clause(character),
-        state_clause=_existing_state_clause(graph, known_users, character),
-    )
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": "Facts:\n" + "\n".join(numbered)},
-    ]
-    try:
-        result = llm.chat_structured(messages, _FACT_EXTRACTION_SCHEMA)
-    except Exception:
-        return fallback
-    finally:
-        if _on_llm_request_done is not None:
-            _on_llm_request_done()
+    if _result is not _NOT_PREFETCHED:
+        if not facts or not isinstance(_result, dict):
+            return fallback
+        result = _result
+    else:
+        if not facts or llm is None:
+            return fallback
+        messages = _fact_extraction_messages(
+            facts, known_users, graph=graph, character=character
+        )
+        try:
+            result = llm.chat_structured(messages, _FACT_EXTRACTION_SCHEMA)
+        except Exception:
+            return fallback
+        finally:
+            if _on_llm_request_done is not None:
+                _on_llm_request_done()
     out: dict[int, dict[str, Any]] = {}
     for entry in result.get("facts", []) or []:
         try:
@@ -485,6 +562,7 @@ def ingest_facts(
     batch_size: int = _FACT_BATCH_SIZE,
     token_limit: int = _EXTRACTION_TOKEN_LIMIT,
     _on_llm_request_done: Optional[Callable[[], None]] = None,
+    planned: Optional[list[PlannedFactBatch]] = None,
 ) -> list[str]:
     """FactNodes + FactEdges + EntityNodes for every row.
 
@@ -492,6 +570,12 @@ def ingest_facts(
     incremental `update` path). When omitted, the whole table is read.
     `character` carries the character identity so the extraction prompt can
     judge relevance. Returns the ids of the FactNodes created.
+
+    `planned` carries LLM results fetched earlier by
+    :func:`plan_fact_extraction` / :func:`run_fact_extraction`. They are
+    matched to `rows` by row id: planned rows missing from `rows` (deleted in
+    the meantime) are skipped, and rows that were not planned are extracted
+    inline as usual.
     """
     rows = rows if rows is not None else facts_mem.store.select(facts_mem.table)
     if not rows:
@@ -500,22 +584,46 @@ def ingest_facts(
     # Track entities per fact so we can wire co-occurrence between them.
     fact_participants: dict[str, set[str]] = {}
     known_user_ids = list(known_users or [])
+    work: list[tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]] = []
+    if planned:
+        pending = {r.get("id"): r for r in rows}
+        for planned_batch in planned:
+            subjects = _extract_fact_subjects(
+                llm,
+                planned_batch.rows,
+                known_user_ids,
+                graph=graph,
+                character=character,
+                _result=planned_batch.result,
+            )
+            current: list[dict[str, Any]] = []
+            current_subjects: dict[int, dict[str, Any]] = {}
+            for i, planned_row in enumerate(planned_batch.rows):
+                fresh = pending.pop(planned_row.get("id"), None)
+                if fresh is None:
+                    continue
+                if i in subjects:
+                    current_subjects[len(current)] = subjects[i]
+                current.append(fresh)
+            work.append((current, current_subjects))
+        rows = list(pending.values())
     batches = _batch_by_limits(
         rows,
         max_items=batch_size,
         max_tokens=token_limit,
         text_of=lambda row: str(row.get("content") or row.get("text") or ""),
-    )
+    ) if rows else []
     for batch in batches:
-        subjects = _extract_fact_subjects(
+        work.append((batch, _extract_fact_subjects(
             llm,
             batch,
             known_user_ids,
             graph=graph,
             character=character,
             _on_llm_request_done=_on_llm_request_done,
-        )
+        )))
 
+    for batch, subjects in work:
         for i, r in enumerate(batch):
             content = str(r.get("content") or "").strip()
             if not content:
