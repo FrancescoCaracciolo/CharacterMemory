@@ -1,9 +1,11 @@
 /* CharacterMemory browser.
  *
- * Talks to three JSON endpoints on the API server:
+ * Talks to JSON endpoints on the API server:
  *   GET /                              -> { characters: [...] }
  *   GET /api/memories/{character}      -> { memories: [...] }            (sidebar)
  *   GET /api/memories/{c}/{m}?page&size&user&q  -> paged records          (main pane)
+ *   GET /api/groups/{c}[/{group_id}]    -> group directory / admin detail
+ *   PATCH /api/groups/{c}/{group_id}    -> display_name / privacy override
  *
  * Each memory type renders through a function in RENDERERS (keyed by memory
  * name); unknown names fall back to a renderer keyed by the page's `kind`
@@ -14,7 +16,7 @@
 const API = "";
 const SIZE = 25;
 // Top-level views; each has a `tab-<name>` button (see setTab).
-const VIEW_TABS = ["browse", "configure", "live", "extractions"];
+const VIEW_TABS = ["browse", "groups", "configure", "live", "extractions"];
 const LIVE_GRAPH_EMBED_PATH = "/gui/embed/knowledge-graph";
 const LIVE_GRAPH_EMBED = location.pathname.replace(/\/+$/, "") === LIVE_GRAPH_EMBED_PATH;
 
@@ -68,6 +70,7 @@ const state = {
   deleting: new Map(),    // character + memory + record id -> pending deletion
   editor: { editable: false, fields: [], description: "" },
   editing: null,
+  groups: { items: [], selected: null, detail: null, listRequest: 0, detailRequest: 0 },
   graph: { data: null, q: "", user: "", full: false, _gv: null, _wired: false }, // KG viz state
   live: {
     events: new Map(), selectedId: null, follow: true, source: null,
@@ -286,6 +289,7 @@ function metaRow(rec) {
   const m = rec.meta || {};
   const parts = [];
   if (rec.user_id) parts.push(["user", rec.user_id]);
+  if (rec.group_id || (rec.fields && rec.fields.group_id)) parts.push(["group", rec.group_id || rec.fields.group_id]);
   if (rec.id != null) parts.push(["id", String(rec.id)]);
   if (m.created_at) parts.push(["created", relTime(m.created_at)]);
   if (m.updated_at) parts.push(["updated", relTime(m.updated_at)]);
@@ -1353,6 +1357,190 @@ function onSearchInput() {
     state.page = 1;
     loadPage();
   }, 220);
+}
+
+// ---------------------------------------------------------------- persistent groups
+// Inspection uses administrative endpoints, never audience-scoped recall.
+// Saved speakers and learned content are read-only.
+const GROUP_PRIVACY_HINTS = {
+  none: "Group memories may be recalled across audiences.",
+  members: "Group memories are eligible only when every audience member is an observed user of the source group.",
+  group_only: "Group memories are eligible only in a chat or request with this same group identifier.",
+};
+
+function groupUrl(groupId = null, character = state.character) {
+  const base = `${API}/api/groups/${encodeURIComponent(character)}`;
+  return groupId == null ? base : `${base}/${encodeURIComponent(groupId)}`;
+}
+
+function showGroupStatus(message, bad = false) {
+  const box = $("groups-status");
+  box.textContent = message;
+  box.classList.toggle("hidden", !message);
+  box.classList.toggle("bad", bad);
+}
+
+function renderGroupList() {
+  const box = $("groups-list"); clear(box);
+  const query = $("groups-filter").value.trim().toLowerCase();
+  const groups = state.groups.items.filter((group) =>
+    `${group.display_name || ""} ${group.group_id}`.toLowerCase().includes(query));
+  $("groups-count").textContent = String(state.groups.items.length);
+  if (!groups.length) {
+    box.appendChild(el("div", { class: "group-empty-note" }, query ? "No matching groups." : "No persistent groups yet."));
+    return;
+  }
+  for (const group of groups) {
+    const selected = group.group_id === state.groups.selected;
+    box.appendChild(el("button", {
+      type: "button", class: "cfg-char group-item" + (selected ? " active" : ""),
+      "aria-current": selected ? "true" : "false", onclick: () => selectGroup(group.group_id),
+    }, [
+      el("div", { class: "cfg-char-name" }, group.display_name || group.group_id),
+      el("code", { class: "group-list-id" }, group.group_id),
+      el("div", { class: "cfg-char-tags" }, [
+        chip(`${(group.observed_users || []).length} observed`),
+        chip(group.effective_privacy || group.privacy || "inherit", "kind-chip"),
+      ]),
+    ]));
+  }
+}
+
+function resetGroupDetail() {
+  state.groups.detail = null;
+  $("group-detail").classList.add("hidden");
+  $("group-empty").classList.remove("hidden");
+  $("group-title").textContent = "Persistent groups";
+  $("group-id").classList.add("hidden");
+}
+
+async function loadGroups() {
+  if (!state.character || LIVE_GRAPH_EMBED) return;
+  const character = state.character;
+  const request = ++state.groups.listRequest;
+  // A detail read and its list must belong to the same refresh.
+  state.groups.detailRequest++;
+  $("group-settings").disabled = true;
+  showGroupStatus("Loading groups…");
+  try {
+    const data = await getJSON(groupUrl(null, character));
+    if (character !== state.character || request !== state.groups.listRequest) return;
+    state.groups.items = data.groups || [];
+    if (!state.groups.items.some((group) => group.group_id === state.groups.selected)) {
+      state.groups.selected = state.groups.items[0]?.group_id || null;
+    }
+    renderGroupList();
+    if (state.groups.selected) await selectGroup(state.groups.selected);
+    else { resetGroupDetail(); showGroupStatus(""); }
+  } catch (error) {
+    if (character === state.character && request === state.groups.listRequest) {
+      showGroupStatus(error.message, true);
+    }
+  }
+}
+
+async function selectGroup(groupId) {
+  const character = state.character;
+  const request = ++state.groups.detailRequest;
+  state.groups.selected = groupId;
+  resetGroupDetail();
+  renderGroupList();
+  $("group-settings").disabled = true;
+  showGroupStatus("Loading group…");
+  try {
+    const data = await getJSON(groupUrl(groupId, character));
+    if (character !== state.character || request !== state.groups.detailRequest || groupId !== state.groups.selected) return;
+    state.groups.detail = data;
+    renderGroupDetail(data);
+    showGroupStatus("");
+  } catch (error) {
+    if (character === state.character && request === state.groups.detailRequest) showGroupStatus(error.message, true);
+  }
+}
+
+function refreshGroupPrivacyHint() {
+  const privacy = $("group-privacy").value;
+  const effective = state.groups.detail?.effective_privacy;
+  $("group-privacy-hint").textContent = privacy
+    ? GROUP_PRIVACY_HINTS[privacy]
+    : `Inherits the character default${effective ? ` (${effective})` : ""}. ${GROUP_PRIVACY_HINTS[effective] || "Change the default in Character studio."}`;
+}
+
+function renderGroupMemories(target, rows, render, textField) {
+  const box = $(target); clear(box);
+  $(`${target}-count`).textContent = String(rows.length);
+  if (!rows.length) {
+    box.appendChild(el("div", { class: "group-empty-note" }, "No learned records yet."));
+    return;
+  }
+  for (const row of rows) {
+    box.appendChild(render({
+      ...row, text: row[textField] || "",
+      fields: { ...row, readonly: true },
+      meta: { created_at: row.created_at, last_recalled: row.last_recalled, recall_count: row.recall_count },
+    }));
+  }
+}
+
+function renderGroupDetail(group) {
+  $("group-title").textContent = group.display_name || group.group_id;
+  $("group-id").textContent = group.group_id;
+  $("group-id").classList.remove("hidden");
+  $("group-empty").classList.add("hidden");
+  $("group-detail").classList.remove("hidden");
+  $("group-settings").disabled = false;
+  $("group-display-name").value = group.display_name || "";
+  $("group-privacy").value = group.privacy || "";
+  refreshGroupPrivacyHint();
+  $("group-summary").textContent = group.summary || "No group summary learned yet.";
+  $("group-summary").classList.toggle("is-empty", !group.summary);
+  const users = $("group-users"); clear(users);
+  for (const user of group.observed_users || []) users.appendChild(el("span", { class: "chip group-user" }, user));
+  if (!users.childNodes.length) users.appendChild(el("div", { class: "group-empty-note" }, "No saved user messages yet."));
+  const chats = $("group-chats"); clear(chats);
+  const linked = group.linked_chats || [];
+  $("group-chats-count").textContent = String(linked.length);
+  for (const chat of linked) {
+    chats.appendChild(el("div", { class: "group-chat" }, [
+      icon("messages-square"),
+      el("div", { class: "group-chat-description" }, [
+        el("strong", {}, chat.title || "Untitled chat"),
+        el("code", {}, chat.id),
+      ]),
+      chat.created_at ? el("time", { title: absTime(chat.created_at) }, relTime(chat.created_at)) : null,
+    ]));
+  }
+  if (!linked.length) chats.appendChild(el("div", { class: "group-empty-note" }, "No linked chats."));
+  renderGroupMemories("group-facts", group.facts || [], renderUserFact, "content");
+  renderGroupMemories("group-episodes", group.episodes || [], renderEpisode, "summary");
+}
+
+async function saveGroup(event) {
+  event.preventDefault();
+  if (!state.groups.detail || $("group-settings").disabled) return;
+  const character = state.character;
+  const groupId = state.groups.selected;
+  const request = ++state.groups.detailRequest;
+  $("group-settings").disabled = true;
+  showGroupStatus("Saving group settings…");
+  try {
+    const data = await sendJSON(groupUrl(groupId, character), {
+      method: "PATCH",
+      body: { display_name: $("group-display-name").value.trim(), privacy: $("group-privacy").value || null },
+    });
+    if (character !== state.character || request !== state.groups.detailRequest || groupId !== state.groups.selected) return;
+    state.groups.detail = data;
+    state.groups.items = state.groups.items.map((group) => group.group_id === groupId ? data : group);
+    renderGroupList();
+    renderGroupDetail(data);
+    showGroupStatus("");
+    toast("Group settings updated");
+  } catch (error) {
+    if (character === state.character && request === state.groups.detailRequest) {
+      $("group-settings").disabled = false;
+      showGroupStatus(error.message, true);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- knowledge-graph viz
@@ -2632,6 +2820,7 @@ function liveMetaChips(event) {
   const out = [chip(`${event.memory_count || 0} memories`, "kind-chip"), chip(`${event.item_count || 0} items`)];
   if (event.user) out.push(chip(`speaker · ${event.user}`));
   if (event.chat_id) out.push(chip(`chat · ${event.chat_id}`));
+  if (event.group_id) out.push(chip(`group · ${event.group_id}`));
   if ((event.participants || []).length > 1) out.push(chip(`participants · ${event.participants.join(", ")}`));
   if (Object.keys(event.graphs || {}).length) out.push(chip("graph active", "kind-chip"));
   return out;
@@ -3127,6 +3316,10 @@ function deactivateLive() {
 }
 
 function resetCharacterView() {
+  state.groups.listRequest++; state.groups.detailRequest++;
+  state.groups.items = []; state.groups.selected = null;
+  $("groups-filter").value = "";
+  resetGroupDetail(); renderGroupList(); showGroupStatus("");
   state.pageData = null;
   state.memory = null; state.page = 1; state.q = ""; state.user = "";
   state.editor = { editable: false, fields: [], description: "" };
@@ -3246,7 +3439,10 @@ async function init() {
   wireLiveControls();
   wireLiveEmbedControls();
   wireApiKeyDialog();
-  $("refresh").addEventListener("click", () => loadOverview());
+  $("refresh").addEventListener("click", () => $("tab-groups").classList.contains("active") ? loadGroups() : loadOverview());
+  $("groups-filter").addEventListener("input", renderGroupList);
+  $("group-form").addEventListener("submit", saveGroup);
+  $("group-privacy").addEventListener("change", refreshGroupPrivacyHint);
   $("add-memory").addEventListener("click", () => openMemoryEditor());
   $("reset-memory").addEventListener("click", resetMemory);
   $("memory-form").addEventListener("submit", saveMemory);
@@ -3262,6 +3458,7 @@ async function init() {
     resetCharacterView();
     if (state.live._active) connectLiveStream();
     if (window.cmExtractions) window.cmExtractions.setCharacter(state.character);
+    if ($("tab-groups").classList.contains("active")) loadGroups();
     loadOverview();
   });
   $("memory-filter").addEventListener("input", renderSidebar);
@@ -3273,11 +3470,13 @@ async function init() {
   // keyboard: "/" focuses search, Esc clears.
   document.addEventListener("keydown", (e) => {
     const graphOpen = !$("graph-view").classList.contains("hidden");
+    const groupsOpen = $("tab-groups").classList.contains("active");
     if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT" && document.activeElement.tagName !== "TEXTAREA") {
-      e.preventDefault(); $(graphOpen ? "graph-q" : "q").focus();
+      e.preventDefault(); $(groupsOpen ? "groups-filter" : graphOpen ? "graph-q" : "q").focus();
     } else if (e.key === "Escape") {
       if (!$("api-key-overlay").classList.contains("hidden")) closeApiKeyDialog();
       else if (!$("memory-editor").classList.contains("hidden")) closeMemoryEditor();
+      else if (groupsOpen && $("groups-filter").value) { $("groups-filter").value = ""; renderGroupList(); }
       else if (graphOpen && $("graph-q").value) $("graph-q-clear").click();
       else if (!graphOpen && $("q").value) { $("q").value = ""; onSearchInput(); }
     }
@@ -3322,14 +3521,17 @@ window.cmUtil = {
 
 function setTab(name, { history = true } = {}) {
   const viewTitle = LIVE_GRAPH_EMBED ? "Knowledge graph"
-    : ({ browse: "Memories", configure: "Character studio", live: "Live recall", extractions: "Extractions" }[name] || "Memories");
+    : ({ browse: "Memories", groups: "Groups", configure: "Character studio", live: "Live recall", extractions: "Extractions" }[name] || "Memories");
   document.title = `CharacterMemory — ${viewTitle}`;
   const browse = name === "browse";
   const configure = name === "configure";
+  const groups = name === "groups";
   const live = name === "live";
   const extractions = name === "extractions";
   $("tab-browse").classList.toggle("active", browse);
   $("tab-browse").setAttribute("aria-selected", browse ? "true" : "false");
+  $("tab-groups").classList.toggle("active", groups);
+  $("tab-groups").setAttribute("aria-selected", groups ? "true" : "false");
   $("tab-configure").classList.toggle("active", configure);
   $("tab-configure").setAttribute("aria-selected", configure ? "true" : "false");
   $("tab-live").classList.toggle("active", live);
@@ -3340,9 +3542,11 @@ function setTab(name, { history = true } = {}) {
   const cfg = $("cfg-pane");
   if (main) main.classList.toggle("hidden", !browse);
   if (cfg) cfg.classList.toggle("hidden", !configure);
+  $("groups-pane").classList.toggle("hidden", !groups);
   $("live-pane").classList.toggle("hidden", !live);
   $("ex-pane").classList.toggle("hidden", !extractions);
   if (live) activateLive(); else deactivateLive();
+  if (groups) loadGroups();
   if (configure && window.cmConfig && typeof window.cmConfig.activate === "function") {
     window.cmConfig.activate();
   }
@@ -3356,6 +3560,7 @@ function setTab(name, { history = true } = {}) {
 
 function wireTabs() {
   $("tab-browse").addEventListener("click", () => setTab("browse"));
+  $("tab-groups").addEventListener("click", () => setTab("groups"));
   $("tab-configure").addEventListener("click", () => setTab("configure"));
   $("tab-live").addEventListener("click", () => setTab("live"));
   $("tab-extractions").addEventListener("click", () => setTab("extractions"));

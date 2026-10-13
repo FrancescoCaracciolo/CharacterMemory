@@ -1,4 +1,5 @@
-from .base import Memory, MemoryItem, MemoryScope, ExtractionSpec, RecallResult
+from .base import Memory, MemoryItem, MemoryScope, ExtractionSpec, RecallContext, RecallResult
+from .groups import GroupDirectory, GroupMemory
 from .character_base import CharacterInfoMemory, DialogueStyleMemory, RAGMemory
 from .character_self import CharacterSelfMemory
 from .prospective import ProspectiveMemory
@@ -38,6 +39,9 @@ __all__ = [
     "Memory",
     "MemoryItem",
     "RecallResult",
+    "RecallContext",
+    "GroupDirectory",
+    "GroupMemory",
     "MemoryScope",
     "ExtractionSpec",
     "RAGMemory",

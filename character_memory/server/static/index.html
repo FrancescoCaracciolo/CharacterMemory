@@ -32,7 +32,7 @@
       document.documentElement.style.colorScheme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="/gui/static/styles.css?v=extractions-graph-1">
+  <link rel="stylesheet" href="/gui/static/styles.css?v=groups-1">
   <!-- Icons are Lucide (vendored under /gui/static/vendor — no CDN): <i data-lucide="name">
        placeholders become inline SVG at load; JS-built DOM uses cmUtil.icon().
        The knowledge-graph view stays a self-contained canvas force-renderer. -->
@@ -46,6 +46,7 @@
       </div>
       <nav class="tabbar" role="tablist" aria-label="View">
         <button id="tab-browse" class="tab active" role="tab" aria-selected="true"><i data-lucide="layers-3" class="icon tab-icon" aria-hidden="true"></i> Memories</button>
+        <button id="tab-groups" class="tab" role="tab" aria-selected="false"><i data-lucide="users-round" class="icon tab-icon" aria-hidden="true"></i> Groups</button>
         <button id="tab-configure" class="tab" role="tab" aria-selected="false"><i data-lucide="user-round-pen" class="icon tab-icon" aria-hidden="true"></i> Character studio</button>
         <button id="tab-live" class="tab" role="tab" aria-selected="false"><i data-lucide="radar" class="icon tab-icon" aria-hidden="true"></i> Live recall</button>
         <button id="tab-extractions" class="tab" role="tab" aria-selected="false"><i data-lucide="sparkles" class="icon tab-icon" aria-hidden="true"></i> Extractions</button>
@@ -197,6 +198,89 @@
         <div id="records" class="records"></div>
         <div id="paginator" class="paginator"></div>
         <div id="status" class="status hidden"></div>
+      </section>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- Persistent groups: administrative inspection, not audience recall. -->
+    <!-- ================================================================ -->
+    <div id="groups-pane" class="groups-pane hidden">
+      <aside class="groups-rail">
+        <div class="cfg-rail-head">
+          <span class="cfg-rail-title">Persistent groups</span>
+          <span id="groups-count" class="count">0</span>
+        </div>
+        <div class="side-head">
+          <input id="groups-filter" class="filter-input" type="search" placeholder="Find a group…" aria-label="Filter groups" autocomplete="off">
+        </div>
+        <nav id="groups-list" class="groups-list" aria-label="Groups"></nav>
+      </aside>
+      <section class="groups-main" aria-label="Group profile">
+        <header class="groups-head">
+          <div>
+            <div class="cfg-label">Group directory</div>
+            <h2 id="group-title">Persistent groups</h2>
+            <code id="group-id" class="group-id hidden"></code>
+          </div>
+          <span class="chip kind-chip">Administrative view</span>
+        </header>
+        <div class="groups-content">
+          <p class="groups-notice">This administrative view is unrestricted, not a preview of audience-scoped recall. Group privacy covers profiles, facts, episodes, and knowledge-graph memories only; other memory systems keep their existing behavior.</p>
+          <div id="groups-status" class="status hidden" role="status" aria-live="polite"></div>
+          <div id="group-empty" class="cfg-empty">
+            <div class="cfg-empty-big"><span class="brand-mascot" aria-hidden="true"></span></div>
+            <div class="cfg-empty-text">Select a group to inspect its shared memories. Start a new chat with a group identifier in Character studio to create one.</div>
+          </div>
+          <div id="group-detail" class="hidden">
+            <form id="group-form" class="cfg-block">
+              <fieldset id="group-settings">
+                <div class="cfg-block-head">
+                  <span class="cfg-label">Profile settings</span>
+                  <button id="group-save" class="btn primary" type="submit">Save changes</button>
+                </div>
+                <div class="group-settings-grid">
+                  <label class="memory-field" for="group-display-name">
+                    <span class="memory-field-label">Display name</span>
+                    <input id="group-display-name" class="memory-input" type="text" placeholder="Optional friendly name" autocomplete="off">
+                  </label>
+                  <label class="memory-field" for="group-privacy">
+                    <span class="memory-field-label">Privacy override</span>
+                    <select id="group-privacy" class="memory-input" aria-describedby="group-privacy-hint">
+                      <option value="">Inherit character default</option>
+                      <option value="none">None · shared across audiences</option>
+                      <option value="members">Members · observed speakers only</option>
+                      <option value="group_only">Group only · this group context</option>
+                    </select>
+                  </label>
+                </div>
+                <p id="group-privacy-hint" class="cfg-hint" aria-live="polite"></p>
+              </fieldset>
+            </form>
+            <section class="cfg-block" aria-labelledby="group-summary-title">
+              <div class="cfg-block-head"><h3 id="group-summary-title" class="cfg-label">Learned summary</h3><span class="chip">Read-only</span></div>
+              <div id="group-summary" class="group-summary"></div>
+            </section>
+            <section class="cfg-block" aria-labelledby="group-users-title">
+              <div class="cfg-block-head"><h3 id="group-users-title" class="cfg-label">Observed users</h3><span class="chip">Read-only</span></div>
+              <p class="cfg-hint">Derived only from saved user messages across linked chats. Creating a chat or owning one does not add a member.</p>
+              <div id="group-users" class="group-users"></div>
+            </section>
+            <section class="cfg-block" aria-labelledby="group-chats-title">
+              <div class="cfg-block-head"><h3 id="group-chats-title" class="cfg-label">Linked chats</h3><span id="group-chats-count" class="count"></span></div>
+              <div id="group-chats" class="group-chats"></div>
+            </section>
+            <div class="group-memories-grid">
+              <section aria-labelledby="group-facts-title">
+                <div class="group-section-head"><h3 id="group-facts-title" class="cfg-label">Facts</h3><span id="group-facts-count" class="count"></span></div>
+                <div id="group-facts"></div>
+              </section>
+              <section aria-labelledby="group-episodes-title">
+                <div class="group-section-head"><h3 id="group-episodes-title" class="cfg-label">Episodes</h3><span id="group-episodes-count" class="count"></span></div>
+                <div id="group-episodes"></div>
+              </section>
+            </div>
+          </div>
+        </div>
       </section>
     </div>
 
@@ -484,6 +568,19 @@
 
           <div class="cfg-block">
             <div class="cfg-block-head">
+              <label class="cfg-label" for="cfg-group-privacy">Default group privacy</label>
+              <select id="cfg-group-privacy" aria-describedby="cfg-group-privacy-hint cfg-group-privacy-boundary">
+                <option value="members">Members · observed speakers only</option>
+                <option value="group_only">Group only · matching group context</option>
+                <option value="none">None · shared across audiences</option>
+              </select>
+            </div>
+            <span id="cfg-group-privacy-hint" class="cfg-hint" aria-live="polite"></span>
+            <span id="cfg-group-privacy-boundary" class="cfg-hint">Covers group profiles, facts, episodes, and knowledge-graph memories only. Turning Group profiles off does not disable privacy or the group directory. Save with “Save memories &amp; order” above; individual groups can override this default in Groups.</span>
+          </div>
+
+          <div class="cfg-block">
+            <div class="cfg-block-head">
               <label class="cfg-label" for="cfg-character-self-privacy">Character Self privacy</label>
               <select id="cfg-character-self-privacy" aria-describedby="cfg-character-self-privacy-hint cfg-character-self-privacy-save-hint">
                 <option value="private">Private · respect disclosure audience</option>
@@ -622,12 +719,27 @@
         <!-- Mini chat -->
         <div class="edit-pane hidden" data-edit="chat">
           <div class="chat-wrap">
+            <div class="chat-group-bar">
+              <label class="chat-group-field" for="cfg-chat-group">
+                <span class="cfg-label">New chat group</span>
+                <select id="cfg-chat-group" aria-describedby="cfg-chat-group-hint">
+                  <option value="">No group</option>
+                  <option value="new">New group identifier…</option>
+                </select>
+              </label>
+              <label id="cfg-chat-group-new-field" class="chat-group-field hidden" for="cfg-chat-group-new">
+                <span class="cfg-label">Group identifier</span>
+                <input id="cfg-chat-group-new" type="text" placeholder="e.g. lab-team" autocomplete="off" spellcheck="false">
+              </label>
+              <p id="cfg-chat-group-hint" class="cfg-hint">Optional. The group is fixed when the chat starts. Users are observed only after they send saved messages.</p>
+              <span id="cfg-chat-groups-status" class="cfg-hint" role="status"></span>
+            </div>
             <div id="chat-log" class="chat-log" aria-live="polite"></div>
             <form id="chat-form" class="chat-form">
               <input id="cfg-chat-user" class="chat-user" value="user" title="Your user id" spellcheck="false">
               <input id="chat-input" class="chat-input" placeholder="Say something to the character…" autocomplete="off">
               <button id="chat-send" class="btn primary" type="submit">Send</button>
-              <button id="cfg-chat-clear" class="btn ghost" type="button" title="Clear this conversation view">Clear</button>
+              <button id="cfg-chat-clear" class="btn ghost" type="button" title="Start a new chat; saved conversation history is retained">New chat</button>
             </form>
           </div>
         </div>
@@ -713,8 +825,8 @@
   </div>
   <script src="/gui/static/vendor/lucide.min.js?v=icons-1"
     onerror="console.error('[CharacterMemory] Failed to load the Lucide icon bundle (/gui/static/vendor/lucide.min.js) — the GUI will render without icons. Hard-reload (Ctrl+Shift+R) or check the server static dir.')"></script>
-  <script src="/gui/static/app.js?v=memory-delete-2"></script>
-  <script src="/gui/static/config.js?v=memory-settings-1"></script>
+  <script src="/gui/static/app.js?v=groups-1"></script>
+  <script src="/gui/static/config.js?v=groups-1"></script>
   <script src="/gui/static/extractions.js?v=extractions-graph-1"></script>
 </body>
 </html>

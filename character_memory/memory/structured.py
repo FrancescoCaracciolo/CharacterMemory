@@ -10,6 +10,7 @@ recall/persist/index plumbing lives here.
 from __future__ import annotations
 
 import time
+import inspect
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -17,7 +18,7 @@ from ..chunking.base import Chunk
 from ..config import ContradictionPolicy
 from ..rag.base import Query
 from ..rag.base import RAGSystem
-from .base import Memory, MemoryItem
+from .base import Memory, MemoryItem, RecallContext, item_bullet
 from .decay import (
     age_seconds,
     decay_score,
@@ -63,16 +64,28 @@ class StructuredMemory(Memory):
         sticky_threshold: float = 0.8,
         clock: Optional[Callable[[], float]] = None,
         name: Optional[str] = None,
+        group_directory: Any = None,
     ) -> None:
         super().__init__(enabled=enabled, name=name)
         self._reconciliation_index_applied: set[int] = set()
         self.store = store
+        self.group_directory = group_directory
+        if self.supports_recall_context and self.group_directory is None:
+            from .groups import GroupDirectory
+            self.group_directory = GroupDirectory(store)
         self.hybrid = hybrid
         self.half_life = half_life
         self.sticky_threshold = sticky_threshold
         self._now = clock or time.time
         cols = {**COMMON_COLUMNS, **self.extra_columns}
         self.store.create_table(self.table, cols)
+        for col, decl in self.extra_columns.items():
+            if col not in self.store.columns(self.table):
+                try:
+                    self.store.execute(f"ALTER TABLE {identifier(self.table)} ADD COLUMN {identifier(col)} {decl}")
+                except self.store.operational_errors:
+                    if col not in self.store.columns(self.table):
+                        raise
         if getattr(hybrid, "remote", False) and getattr(store, "durable_indexes", False):
             self._repair_lock = hybrid._lock
             store.track_table(self.table, collection=hybrid.collection)
@@ -106,7 +119,18 @@ class StructuredMemory(Memory):
 
     def load(self, path: str) -> None:
         self._reconciliation_index_applied.clear()
-        return self.hybrid.load(path)
+        self.hybrid.load(path)
+        if "group_id" in self.extra_columns:
+            rows = {row["id"]: row for row in self.all_rows()}
+            documents = getattr(self.hybrid, "documents", [])
+            if any(
+                "group_id" not in chunk.metadata
+                or (chunk.metadata.get("id") in rows
+                    and chunk.metadata.get("group_id") != rows[chunk.metadata["id"]].get("group_id"))
+                for chunk in documents
+            ):
+                self.rebuild_index()
+                self.hybrid.persist(path)
 
     def reset(self) -> None:
         """Delete all rows and rebuild this memory's retrieval index empty."""
@@ -127,8 +151,23 @@ class StructuredMemory(Memory):
         """Render a row into a prompt item (override me)."""
         return MemoryItem(text=self.row_text(row), score=score, kind=self.name, metadata=dict(row))
 
+    def _group_label(self, row: dict[str, Any]) -> str:
+        """Make shared provenance explicit even in single-participant rendering."""
+        group_id = row.get("group_id")
+        if group_id is None:
+            return ""
+        name = ""
+        if self.group_directory is not None:
+            rows = self.store.select("groups", {"group_id": group_id}, limit=1)
+            if rows and rows[0].get("display_name") not in ("", group_id):
+                name = f"; {rows[0]['display_name']}"
+        return f"[group: {group_id}{name}] "
+
     def _row_meta(self, row: dict[str, Any]) -> dict:
-        return {"id": row["id"], "user_id": row["user_id"]}
+        meta = {"id": row["id"], "user_id": row["user_id"]}
+        if "group_id" in self.extra_columns:
+            meta["group_id"] = row.get("group_id")
+        return meta
 
     def index_chunks(self, row: dict[str, Any]) -> list[Chunk]:
         """Search keys contributed by one stored row.
@@ -145,9 +184,12 @@ class StructuredMemory(Memory):
         ]
 
     # Extraction helpers (used by subclasses' apply_extraction).
-    def _has_text(self, user_id: str, text: str, content_col: str = "content") -> bool:
+    def _has_text(self, user_id: str, text: str, content_col: str = "content",
+                  *, group_id: Optional[str] = None) -> bool:
         """True if a row for `user_id` already stores `text` (case-insensitive)."""
         rows = self.store.select(self.table, {"user_id": user_id})
+        if "group_id" in self.extra_columns:
+            rows = [row for row in rows if row.get("group_id") == group_id]
         return any((r.get(content_col) or "").strip().lower() == text.strip().lower() for r in rows)
 
     @staticmethod
@@ -161,6 +203,8 @@ class StructuredMemory(Memory):
 
     # ADD ELEMENT
     def add(self, user_id: str, importance: float, **fields) -> int:
+        if fields.get("group_id") is not None and self.group_directory is not None:
+            self.group_directory.ensure(fields["group_id"])
         now = self._now()
         row = {
             "user_id": user_id,
@@ -185,6 +229,8 @@ class StructuredMemory(Memory):
         """Store several rows and append their search chunks in one batch."""
         row_ids: list[int] = []
         for user_id, importance, fields in entries:
+            if fields.get("group_id") is not None and self.group_directory is not None:
+                self.group_directory.ensure(fields["group_id"])
             row_ids.append(
                 self.store.upsert(
                     self.table,
@@ -293,6 +339,57 @@ class StructuredMemory(Memory):
     def _recall_where(self, user_id: str) -> dict[str, Any] | None:
         """Hybrid/SQLite filter for one recall; character memories override."""
         return {"user_id": user_id}
+    def eligible_rows(
+        self, user_id: str, *, recall_context: Optional[RecallContext] = None
+    ) -> list[dict[str, Any]]:
+        """Authoritative privacy preselection, also used by conversational tools."""
+        if not self.supports_recall_context:
+            return self.store.select(self.table, self._recall_where(user_id))
+        context = recall_context if recall_context is not None else RecallContext(audience=(user_id,))
+        eligible = self.group_directory.eligible_ids(context) if self.group_directory is not None else set()
+        return [
+            row for row in self.store.select(self.table)
+            if (row.get("group_id") in eligible if row.get("group_id") is not None
+                else bool(row.get("user_id")) and row.get("user_id") in context.audience)
+        ]
+
+    def _priority_rows(
+        self, rows: list[dict[str, Any]], recall_context: Optional[RecallContext]
+    ) -> list[dict[str, Any]]:
+        """Rows reserved ahead of query candidates, within the same top-k bound."""
+        return []
+
+    def _search_rows(self, query: Query, k: int, rows: list[dict[str, Any]], where=None):
+        """Pass authoritative allowed IDs before native lexical/dense selection."""
+        ids = frozenset(int(row["id"]) for row in rows)
+        if not ids:
+            return []
+        search = self.hybrid.search
+        if "allowed_ids" in inspect.signature(search).parameters:
+            return search(query, k=k, where=where, allowed_ids=ids)
+        # Third-party backends retain their equality-only contract. Search one
+        # visible row at a time instead of letting hidden hits exhaust the pool.
+        hits = []
+        for row_id in ids:
+            hits.extend(hit for hit in search(query, k=k, where={**(where or {}), "id": row_id})
+                        if hit.metadata.get("id") == row_id)
+        hits.sort(key=lambda hit: hit.score, reverse=True)
+        return hits[:k]
+
+    def format_grouped(self, items: list[MemoryItem], participants: list[str]) -> str:
+        if not self.supports_recall_context:
+            return super().format_grouped(items, participants)
+        private = [item for item in items if item.metadata.get("group_id") is None]
+        blocks = [super().format_grouped(private, participants)] if private else []
+        groups: dict[str, list[MemoryItem]] = {}
+        for item in items:
+            if item.metadata.get("group_id") is not None:
+                groups.setdefault(item.metadata["group_id"], []).append(item)
+        for group_id, group_items in groups.items():
+            blocks.append(f"Group {group_id}:\n" + "\n".join(
+                item_bullet(item, self.timestamp_style) for item in group_items
+            ))
+        return "\n\n".join(blocks)
 
     def _sticky_rows(self, rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         """Rows eligible for the one-slot sticky reservation."""
@@ -414,13 +511,15 @@ class StructuredMemory(Memory):
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: float = 1.0,
         audience: Optional[list[str]] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> list[MemoryItem]:
         if limit <= 0:
             return []
 
-        where = self._recall_where(user_id)
-        stored_rows = self.store.select(self.table, where)
-        rows = self._filter_recall_rows(stored_rows, audience or [user_id])
+        where = None if self.supports_recall_context else self._recall_where(user_id)
+        context = recall_context if recall_context is not None else RecallContext(audience=(user_id,))
+        stored_rows = self.eligible_rows(user_id, recall_context=context)
+        rows = self._filter_recall_rows(stored_rows, list(context.audience) if self.supports_recall_context else audience or [user_id])
         rows_by_id = {int(r["id"]): r for r in rows}
         if not rows_by_id:
             return []
@@ -429,12 +528,7 @@ class StructuredMemory(Memory):
         # normalized score; third-party RAG backends fall back to normalization
         # against their best hit for this call.
         candidate_pool = int(getattr(self.hybrid, "candidate_pool", max(limit, 30)))
-        hits = self.hybrid.search(
-            query,
-            # Audience-hidden rows must not consume the visible candidate pool.
-            k=max(limit, candidate_pool) + len(stored_rows) - len(rows),
-            where=where,
-        )
+        hits = self._search_rows(query, max(limit, candidate_pool), rows, where=where)
         relevance_by_id = {
             rid: relevance
             for rid, relevance in self._hit_relevance(hits).items()
@@ -457,6 +551,8 @@ class StructuredMemory(Memory):
         sticky_ids = {int(row["id"]) for row in sticky}
         reserve_sticky = limit > 1 and sticky_limit > 0 and bool(sticky_ids)
         candidate_ids = set(relevance_by_id)
+        priority_ids = [int(row["id"]) for row in self._priority_rows(rows, context)]
+        candidate_ids.update(priority_ids)
         candidate_ids.update(temporal_by_id)
         if reserve_sticky:
             candidate_ids.update(sticky_ids)
@@ -507,12 +603,17 @@ class StructuredMemory(Memory):
             )
         else:
             chosen = scored[:limit]
+        if priority_ids:
+            by_id = {entry[1]: entry for entry in scored}
+            priority = [by_id[row_id] for row_id in priority_ids if row_id in by_id][:limit]
+            remaining = [entry for entry in chosen if entry[1] not in priority_ids]
+            chosen = [*priority, *remaining[:limit - len(priority)]]
 
         # Bump recall counters for what we surfaced (skipped when read-only).
         if state_changing:
             self._bump_recall([entry[2]["id"] for entry in chosen])
 
-        return [
+        items = [
             self._scored_item(
                 row,
                 score=score,
@@ -523,6 +624,10 @@ class StructuredMemory(Memory):
             )
             for score, _, row, semantic, temporal, combined, temporal_match in chosen
         ]
+        for item in items:
+            if item.metadata.get("id") in priority_ids:
+                item.metadata["current_group"] = True
+        return items
 
     def get_memories(self, limit: int = 0) -> list[MemoryItem]:
         """All rows in this memory's table, rendered as items.
@@ -539,6 +644,10 @@ class StructuredMemory(Memory):
             int(item.metadata["id"]) for item in items
             if item.metadata.get("id") is not None
         )))
+    def record_recall_with_context(self, items: list[MemoryItem], recall_context: RecallContext) -> None:
+        """Recheck disclosure before committing selectively rendered exposure."""
+        eligible = {int(row["id"]) for row in self.eligible_rows("", recall_context=recall_context)}
+        self.record_recall([item for item in items if item.metadata.get("id") in eligible])
 
     def _bump_recall(self, ids: list[int]) -> None:
         if not ids:

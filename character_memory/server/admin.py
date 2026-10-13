@@ -243,6 +243,7 @@ class ChatRequest(BaseModel):
     message: str
     user: str = "user"
     chat_id: Optional[str] = None
+    group_id: Optional[str] = None
     occurred_at: Optional[float] = None
 
 
@@ -1138,8 +1139,21 @@ def build_admin_router(
                     status_code=404,
                     detail=f"Unknown chat_id {req.chat_id!r}.",
                 )
+            if req.group_id is not None and req.group_id != chat.group_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"chat_id {req.chat_id!r} is bound to group "
+                        f"{chat.group_id!r}; a chat's group binding is immutable."
+                    ),
+                )
         else:
-            chat = agent.create_chat(req.user, title=req.message[:60])
+            try:
+                chat = agent.create_chat(
+                    req.user, title=req.message[:60], group_id=req.group_id
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         chat.add_message(
             "user", req.message, user_id=req.user, occurred_at=req.occurred_at
         )

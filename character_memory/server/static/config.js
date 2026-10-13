@@ -39,6 +39,7 @@ const MEMORIES = [
   { name: "conversation_events", title: "Source conversations", k: true },
   { name: "heartbeat", title: "Heartbeat journal", k: true },
   { name: "user_summary", title: "User summary", k: true },
+  { name: "groups", title: "Group profiles", k: true, enabledDefault: false },
   { name: "emotion", title: "Emotion tracking", k: false },
   { name: "world", title: "Private world", k: true },
   { name: "calendar", title: "Calendar", k: true },
@@ -46,7 +47,7 @@ const MEMORIES = [
 
 const DEFAULT_SECTION_ORDER = [
   "character_info", "character_self", "emotion", "world", "calendar", "prospective", "user_directives", "user_facts",
-  "episodic", "conversation_events", "heartbeat", "user_summary",
+  "episodic", "conversation_events", "heartbeat", "user_summary", "groups",
   "knowledge_graph", "dialogue_style",
 ];
 const SECTION_TITLES = Object.fromEntries([
@@ -64,6 +65,12 @@ const KG_PRIVACY_HINTS = {
 const CHARACTER_SELF_PRIVACY_HINTS = {
   private: "Public statements can be recalled across users. Private statements require every active participant to be in the recorded disclosure audience.",
   none: "All character statements can be recalled across users, including private statements. Disclosure audiences are still recorded.",
+};
+
+const GROUP_PRIVACY_HINTS = {
+  none: "Group memories may be recalled across audiences.",
+  members: "Every audience member must be an observed user of the source group. Observed users come only from saved user messages.",
+  group_only: "Group memories are eligible only in the same group context.",
 };
 
 const EMOTION_GROUPS = [
@@ -114,8 +121,10 @@ const cfgState = {
   bucket: "information",  // active files bucket
   file: null,             // {name} of the selected file
   chat: {                 // mini-chat state, per character
-    // [charName]: { chat_id, messages: [{role, content}] }
+    // [charName]: { chat_id, group_id, group_mode, sending, messages }
   },
+  chatGroups: [],
+  chatGroupsRequest: 0,
 };
 
 // --------------------------------------------------------------- fetch helpers
@@ -214,7 +223,10 @@ async function selectCharacter(name) {
   cfgState.file = null;
   renderCharList();
   // Lazy-build a chat-cfgState slot per character.
-  if (!cfgState.chat[name]) cfgState.chat[name] = { chat_id: null, messages: [] };
+  if (!cfgState.chat[name]) cfgState.chat[name] = { chat_id: null, group_id: null, group_mode: "", messages: [] };
+  cfgState.chatGroups = [];
+  renderChatGroupControls();
+  loadChatGroups();
   $("cfg-empty").classList.add("hidden");
   $("cfg-pane-main").classList.remove("hidden");
   $("cfg-name").textContent = name;
@@ -866,6 +878,8 @@ function renderConfig() {
   renderMemoryList(cfg.memory || {});
   $("cfg-character-self-privacy").value = cfg.memory?.character_self_privacy || "private";
   refreshCharacterSelfControls();
+  $("cfg-group-privacy").value = cfg.memory?.group_privacy || "members";
+  refreshGroupControls();
   renderDedup(cfg.memory?.dedup || {});
   $("cfg-token-budget").value = cfg.memory?.token_budget ?? "";
   renderEmotionDefaults(cfg.memory || {});
@@ -891,6 +905,12 @@ function refreshCharacterSelfControls() {
   $("cfg-character-self-privacy").disabled = !toggle?.checked;
   $("cfg-character-self-privacy-hint").textContent =
     CHARACTER_SELF_PRIVACY_HINTS[$("cfg-character-self-privacy").value];
+}
+
+function refreshGroupControls() {
+  // Profile extraction/retrieval can be off; privacy and metadata cannot.
+  $("cfg-group-privacy").disabled = false;
+  $("cfg-group-privacy-hint").textContent = GROUP_PRIVACY_HINTS[$("cfg-group-privacy").value];
 }
 
 function refreshKnowledgeGraphControls() {
@@ -934,8 +954,8 @@ function gatherEmotionDefaults() {
 function renderMemoryList(mem) {
   const box = $("cfg-memory-list"); clear(box);
   for (const m of MEMORIES) {
-    const enabled = mem[`enabled_${m.name}`] !== false;
-    const kVal = mem[`${m.name}_k`] != null ? mem[`${m.name}_k`] : "";
+    const enabled = mem[`enabled_${m.name}`] ?? (m.enabledDefault !== false);
+    const kVal = mem[`${m.name}_k`] ?? (m.name === "groups" ? 4 : "");
     const kInput = el("input", {
       type: "number", min: "0", max: "50", value: String(kVal),
       class: "k-input", "data-mem": m.name, disabled: !enabled,
@@ -1212,6 +1232,7 @@ function gatherConfig() {
     dedup: gatherDedup(),
     knowledge_graph: { privacy: $("cfg-kg-privacy").value },
     character_self_privacy: $("cfg-character-self-privacy").value,
+    group_privacy: $("cfg-group-privacy").value,
     ...gatherEmotionDefaults(),
   };
   const budget = $("cfg-token-budget");
@@ -1436,7 +1457,51 @@ async function pollJob(jobId, onUpdate) {
 }
 
 // --------------------------------------------------------------- mini chat
+async function loadChatGroups() {
+  if (!cfgState.active) return;
+  const character = cfgState.active;
+  const request = ++cfgState.chatGroupsRequest;
+  $("cfg-chat-groups-status").textContent = "Loading group directory…";
+  try {
+    const data = await getJSON(`${API}/api/groups/${encodeURIComponent(character)}`);
+    if (character !== cfgState.active || request !== cfgState.chatGroupsRequest) return;
+    cfgState.chatGroups = data.groups || [];
+    $("cfg-chat-groups-status").textContent = "";
+    renderChatGroupControls();
+  } catch (error) {
+    if (character === cfgState.active && request === cfgState.chatGroupsRequest) {
+      $("cfg-chat-groups-status").textContent = `Group directory unavailable: ${error.message}. You can still enter a group identifier.`;
+    }
+  }
+}
+
+function renderChatGroupControls() {
+  const slot = cfgState.chat[cfgState.active] || {};
+  const select = $("cfg-chat-group"); clear(select);
+  select.appendChild(el("option", { value: "" }, "No group"));
+  for (const group of cfgState.chatGroups) {
+    select.appendChild(el("option", { value: `group:${group.group_id}` },
+      group.display_name && group.display_name !== group.group_id ? `${group.display_name} · ${group.group_id}` : group.group_id));
+  }
+  // Keep a saved selection visible if another admin changed the directory.
+  if (slot.group_id && slot.group_mode !== "new" && !cfgState.chatGroups.some((group) => group.group_id === slot.group_id)) {
+    select.appendChild(el("option", { value: `group:${slot.group_id}` }, slot.group_id));
+  }
+  select.appendChild(el("option", { value: "new" }, "New group identifier…"));
+  select.value = slot.group_mode === "new" ? "new" : slot.group_id ? `group:${slot.group_id}` : "";
+  const locked = !!(slot.chat_id || slot.sending);
+  select.disabled = locked;
+  $("cfg-chat-group-new").value = slot.group_mode === "new" ? slot.group_id || "" : "";
+  $("cfg-chat-group-new").disabled = locked;
+  $("cfg-chat-group-new-field").classList.toggle("hidden", slot.group_mode !== "new");
+  $("cfg-chat-group-hint").textContent = slot.chat_id
+    ? `This chat’s group is fixed: ${slot.group_id || "no group"}. Start a new chat to choose a different scope; saved history is retained.`
+    : "Optional. The group is fixed when the chat starts. Users are observed only after they send saved messages.";
+  $("chat-send").disabled = !!slot.sending;
+  $("cfg-chat-clear").disabled = !!slot.sending;
+}
 function renderChat() {
+  renderChatGroupControls();
   const log = $("chat-log"); clear(log);
   const slot = cfgState.chat[cfgState.active] || { messages: [] };
   if (!slot.messages.length) {
@@ -1445,7 +1510,7 @@ function renderChat() {
   }
   for (const m of slot.messages) {
     log.appendChild(el("div", { class: `chat-bubble ${m.role}` }, [
-      el("div", { class: "chat-role" }, m.role === "user" ? "you" : cfgState.active),
+      el("div", { class: "chat-role" }, m.role === "user" ? (m.user_id || "you") : cfgState.active),
       m.role === "assistant"
         ? el("div", { class: "chat-md", html: markdown(m.content || "") })
         : el("div", { class: "chat-text" }, m.content || ""),
@@ -1456,42 +1521,58 @@ function renderChat() {
 
 async function sendMessage(text) {
   if (!cfgState.active || !text.trim()) return;
-  const slot = cfgState.chat[cfgState.active];
-  slot.messages.push({ role: "user", content: text });
+  const character = cfgState.active;
+  const slot = cfgState.chat[character];
+  if (slot.sending) return;
+  if (!slot.chat_id && slot.group_mode === "new" && !slot.group_id?.trim()) {
+    showError("Enter a group identifier, or choose No group.");
+    $("cfg-chat-group-new").focus();
+    return;
+  }
+  const user = $("cfg-chat-user").value || "user";
+  const groupId = slot.group_id?.trim() || null;
+  slot.sending = true;
+  slot.messages.push({ role: "user", content: text, user_id: user });
   renderChat();
   $("chat-input").value = "";
   const sendBtn = $("chat-send"); sendBtn.disabled = true;
   // Thinking placeholder.
   const log = $("chat-log");
   const think = el("div", { class: "chat-bubble assistant thinking" }, [
-    el("div", { class: "chat-role" }, cfgState.active),
+    el("div", { class: "chat-role" }, character),
     el("div", { class: "chat-text" }, "…"),
   ]);
   log.appendChild(think);
   log.scrollTop = log.scrollHeight;
   try {
-    const user = $("cfg-chat-user").value || "user";
-    const data = await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(cfgState.active)}/chat`, {
-      body: { message: text, user, chat_id: slot.chat_id },
+    const data = await sendJSON(`${API}/api/admin/characters/${encodeURIComponent(character)}/chat`, {
+      body: { message: text, user, chat_id: slot.chat_id, ...(!slot.chat_id && groupId ? { group_id: groupId } : {}) },
     });
     slot.chat_id = data.chat_id;
+    slot.group_id = groupId;
     slot.messages.push({ role: "assistant", content: data.reply });
     think.remove();
-    renderChat();
+    if (cfgState.active === character) {
+      renderChat();
+      loadChatGroups();
+    }
   } catch (e) {
     think.remove();
     slot.messages.pop();  // roll back the optimistic user turn
-    showError(e.message);
-    renderChat();
+    if (cfgState.active === character) {
+      renderChat();
+      showError(e.message);
+    }
   } finally {
-    sendBtn.disabled = false;
+    slot.sending = false;
+    if (cfgState.active === character) renderChatGroupControls();
   }
 }
 
 function clearChat() {
-  if (!cfgState.active) return;
+  if (!cfgState.active || cfgState.chat[cfgState.active]?.sending) return;
   // Just drop the local conversation view + chat_id; the server keeps history.
-  cfgState.chat[cfgState.active] = { chat_id: null, messages: [] };
+  cfgState.chat[cfgState.active] = { chat_id: null, group_id: null, group_mode: "", messages: [] };
   renderChat();
 }
 
@@ -1504,6 +1585,7 @@ function setEditTab(name) {
     p.classList.toggle("hidden", p.dataset.edit !== name);
   });
   if (name === "world") loadWorld();
+  if (name === "chat") loadChatGroups();
 }
 
 function setBucket(name) {
@@ -1532,7 +1614,7 @@ const wiz = {
 function defaultWizardMemories() {
   // Same defaults as the library (everything except KG, which is its own toggle).
   const out = {};
-  for (const m of MEMORIES) out[m.name] = { enabled: true, k: null };
+  for (const m of MEMORIES) out[m.name] = { enabled: m.enabledDefault !== false, k: null };
   return out;
 }
 
@@ -1629,7 +1711,7 @@ function renderWizFileLists() {
 function renderWizMemories() {
   const box = $("wiz-memories"); clear(box);
   for (const m of MEMORIES) {
-    const st = wiz.memories[m.name] || { enabled: true, k: null };
+    const st = wiz.memories[m.name] || { enabled: m.enabledDefault !== false, k: null };
     const toggle = el("input", {
       type: "checkbox", class: "switch-input", checked: st.enabled, "data-mem": m.name,
     });
@@ -1741,6 +1823,10 @@ function wire() {
     refreshCharacterSelfControls();
     dirtyMemory();
   });
+  $("cfg-group-privacy").addEventListener("change", () => {
+    refreshGroupControls();
+    dirtyMemory();
+  });
   $("cfg-kg-token-budget").addEventListener("input", dirtyMemory);
   $("cfg-token-budget").addEventListener("input", dirtyMemory);
   $("cfg-extract-interval").addEventListener("input", dirtyMemory);
@@ -1788,6 +1874,19 @@ function wire() {
     sendMessage($("chat-input").value);
   });
   $("cfg-chat-clear").addEventListener("click", clearChat);
+  $("cfg-chat-group").addEventListener("change", (event) => {
+    const slot = cfgState.chat[cfgState.active];
+    if (!slot || slot.chat_id || slot.sending) return;
+    const value = event.target.value;
+    slot.group_mode = value === "new" ? "new" : value ? "existing" : "";
+    slot.group_id = value.startsWith("group:") ? value.slice(6) : null;
+    renderChatGroupControls();
+    if (slot.group_mode === "new") $("cfg-chat-group-new").focus();
+  });
+  $("cfg-chat-group-new").addEventListener("input", (event) => {
+    const slot = cfgState.chat[cfgState.active];
+    if (slot && !slot.chat_id && !slot.sending && slot.group_mode === "new") slot.group_id = event.target.value;
+  });
 
   // Wizard
   $("wiz-close").addEventListener("click", closeWizard);

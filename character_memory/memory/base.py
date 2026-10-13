@@ -127,6 +127,19 @@ class RecallResult:
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RecallContext:
+    """Request-local disclosure audience; never stored on a shared memory."""
+
+    group_id: Optional[str] = None
+    audience: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "audience", tuple(dict.fromkeys(
+            uid for uid in self.audience if isinstance(uid, str) and uid
+        )))
+
+
 @dataclass
 class ExtractionSpec:
     """How a memory is populated by LLM extraction.
@@ -183,6 +196,7 @@ class Memory(ABC):
     # The orchestrator only forwards temporal kwargs to opt-in memories. This
     # preserves source compatibility with third-party Memory subclasses.
     supports_temporal_resolution: bool = False
+    supports_recall_context: bool = False
 
     def __init__(self, *, enabled: bool = True, name: Optional[str] = None) -> None:
         self.enabled = enabled
@@ -238,7 +252,11 @@ class Memory(ABC):
         temporal_resolution: bool | "TemporalResolution" | None = None,
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: Optional[float] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> list[MemoryItem]:
+        context_kwargs = (
+            {"recall_context": recall_context} if self.supports_recall_context else {}
+        )
         if self.supports_temporal_resolution:
             return self.recall(
                 query,
@@ -252,8 +270,9 @@ class Memory(ABC):
                     if temporal_weight is None
                     else temporal_weight
                 ),
+                **context_kwargs,
             )
-        return self.recall(query, user_id, limit, state_changing=state_changing)
+        return self.recall(query, user_id, limit, state_changing=state_changing, **context_kwargs)
 
     @abstractmethod
     def recall(
@@ -323,6 +342,10 @@ class Memory(ABC):
         is a no-op so existing Memory subclasses remain source-compatible.
         """
 
+    def record_recall_with_context(self, items: list[MemoryItem], recall_context: RecallContext) -> None:
+        """Compatible opt-in hook for disclosure-aware selective reinforcement."""
+        self.record_recall(items)
+
     def build_section(
         self,
         query: Query,
@@ -333,6 +356,7 @@ class Memory(ABC):
         temporal_resolution: bool | "TemporalResolution" | None = None,
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: Optional[float] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> Optional[str]:
         """Recall (if enabled) and format; `None` when there is nothing to show.
 
@@ -346,6 +370,7 @@ class Memory(ABC):
             temporal_resolution=temporal_resolution,
             temporal_resolution_engine=temporal_resolution_engine,
             temporal_weight=temporal_weight,
+            **({"recall_context": recall_context} if self.supports_recall_context else {}),
         ).body
 
     def build_section_result(
@@ -358,6 +383,7 @@ class Memory(ABC):
         temporal_resolution: bool | "TemporalResolution" | None = None,
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: Optional[float] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> RecallResult:
         """Recall and render once, retaining the actual items for inspection."""
         items = (
@@ -369,6 +395,7 @@ class Memory(ABC):
                 temporal_resolution=temporal_resolution,
                 temporal_resolution_engine=temporal_resolution_engine,
                 temporal_weight=temporal_weight,
+                **({"recall_context": recall_context} if self.supports_recall_context else {}),
             )
             if self.enabled
             else []
@@ -391,6 +418,7 @@ class Memory(ABC):
         temporal_resolution: bool | "TemporalResolution" | None = None,
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: Optional[float] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> list[MemoryItem]:
         """Recall items for the conversation's participants.
 
@@ -409,6 +437,14 @@ class Memory(ABC):
         """
         if not participants:
             return []
+        if self.supports_recall_context:
+            return self._recall_with_temporal(
+                query, participants[0], limit, state_changing=state_changing,
+                temporal_resolution=temporal_resolution,
+                temporal_resolution_engine=temporal_resolution_engine,
+                temporal_weight=temporal_weight,
+                recall_context=recall_context or RecallContext(audience=tuple(participants)),
+            )
         if len(participants) == 1:
             return self._recall_with_temporal(
                 query,
@@ -486,6 +522,7 @@ class Memory(ABC):
         temporal_resolution: bool | "TemporalResolution" | None = None,
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: Optional[float] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> Optional[str]:
         """Recall + format for a multi-participant conversation.
 
@@ -504,6 +541,7 @@ class Memory(ABC):
             temporal_resolution=temporal_resolution,
             temporal_resolution_engine=temporal_resolution_engine,
             temporal_weight=temporal_weight,
+            **({"recall_context": recall_context} if self.supports_recall_context else {}),
         ).body
 
     def build_section_participants_result(
@@ -516,6 +554,7 @@ class Memory(ABC):
         temporal_resolution: bool | "TemporalResolution" | None = None,
         temporal_resolution_engine: Optional["TemporalResolutionEngine"] = None,
         temporal_weight: Optional[float] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> RecallResult:
         """Group-aware equivalent of :meth:`build_section_result`.
 
@@ -535,23 +574,22 @@ class Memory(ABC):
                 temporal_resolution=temporal_resolution,
                 temporal_resolution_engine=temporal_resolution_engine,
                 temporal_weight=temporal_weight,
+                **({"recall_context": recall_context} if self.supports_recall_context else {}),
             )
         if not self.enabled:
             return RecallResult()
+        kwargs: dict[str, Any] = {}
         if self.supports_temporal_resolution:
-            items = self.recall_participants(
-                query,
-                participants,
-                limit,
-                state_changing=state_changing,
+            kwargs.update(
                 temporal_resolution=temporal_resolution,
                 temporal_resolution_engine=temporal_resolution_engine,
                 temporal_weight=temporal_weight,
             )
-        else:
-            items = self.recall_participants(
-                query, participants, limit, state_changing=state_changing
-            )
+        if self.supports_recall_context:
+            kwargs["recall_context"] = recall_context or RecallContext(audience=tuple(participants))
+        items = self.recall_participants(
+            query, participants, limit, state_changing=state_changing, **kwargs
+        )
         if not items:
             return RecallResult(items=[])
         body = self.format(items) if self.scope is MemoryScope.CHARACTER else self.format_grouped(items, participants)

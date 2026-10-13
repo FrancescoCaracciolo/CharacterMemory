@@ -70,7 +70,7 @@ from .sync import MemorySync
 SERVER_NAME = "character-memory-mcp"
 SERVER_VERSION = "0.2.0"
 PROTOCOL_VERSION = "2024-11-05"  # MCP protocol version this server speaks.
-TOOL_CATEGORIES = frozenset({"core", "memory", "events", "kg", "heartbeat", "world", "calendar"})
+TOOL_CATEGORIES = frozenset({"core", "memory", "events", "kg", "heartbeat", "world", "calendar", "groups"})
 
 # --------------------------------------------------------------------------- #
 # Small utilities
@@ -276,6 +276,73 @@ def _persist_only(agent: CharacterAgent) -> None:
             f"persist_structured failed in set_user_summary: {e!r}.",
             stacklevel=2,
         )
+
+
+def _group_directory(agent: CharacterAgent):
+    directory = getattr(agent, "group_directory", None)
+    if directory is None:
+        raise RuntimeError("This character does not expose a group directory.")
+    return directory
+
+
+def _ensure_group(agent: CharacterAgent, group_id: Any) -> Optional[str]:
+    """Normalise a caller-supplied group id, creating its metadata row once.
+
+    Manual additions accept an optional group identifier exactly like chat
+    creation: a new identifier materialises the directory row, an existing
+    one is left untouched.
+    """
+    if group_id is None:
+        return None
+    group_id = str(group_id).strip()
+    if not group_id:
+        raise ValueError("group_id must be a nonempty string.")
+    _group_directory(agent).ensure(group_id)
+    return group_id
+
+
+def _tool_list_groups(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    """Administrative directory view: identity, roster, privacy, linked chats."""
+    return {"groups": _group_directory(agent).list()}
+
+
+def _tool_get_group(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    group_id = str(_args(args, "group_id", "") or "").strip()
+    if not group_id:
+        return _json_error("group_id is required.")
+    directory = _group_directory(agent)
+    group = directory.get(group_id)
+    if group is None:
+        return _json_error(f"No group with id {group_id!r}.")
+    for name, key in (("user_facts", "facts"), ("episodic", "episodes")):
+        memory = agent.memories.get(name)
+        group[key] = (
+            memory.store.select(memory.table, {"group_id": group_id}, order_by="id")
+            if isinstance(memory, StructuredMemory) else []
+        )
+    return group
+
+
+def _tool_update_group(agent: CharacterAgent, mem: Any, args: dict) -> dict:
+    group_id = str(_args(args, "group_id", "") or "").strip()
+    if not group_id:
+        return _json_error("group_id is required.")
+    updates: dict[str, Any] = {}
+    if "display_name" in args:
+        updates["display_name"] = args["display_name"]
+    if "privacy" in args:
+        # Absent leaves the override alone; explicit null clears it.
+        updates["privacy"] = args["privacy"]
+    if not updates:
+        return _json_error("Provide display_name and/or privacy to update.")
+    directory = _group_directory(agent)
+    directory.update(group_id, **updates)
+    groups_memory = agent.memories.get("groups")
+    if isinstance(groups_memory, StructuredMemory):
+        row = directory.get(group_id)
+        groups_memory.apply_index_changes(updated_ids=[row["id"]])
+    _persist_only(agent)
+    return directory.get(group_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -687,14 +754,16 @@ def _tool_add_fact(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     content = str(_args(args, "content", "") or "").strip()
     if not user_id or not content:
         return _json_error("user_id and content are required.")
+    group_id = _ensure_group(agent, _args(args, "group_id", None))
     row_id = mem.add_fact(
         user_id=user_id, content=content,
         type=str(_args(args, "type", "general")),
         importance=_clip(_args(args, "importance", 0.5)),
         confidence=_clip(_args(args, "confidence", 0.5)),
+        group_id=group_id,
     )
     _persist_after_write(agent, mem)
-    return {"id": row_id, "memory": mem.name}
+    return {"id": row_id, "memory": mem.name, "group_id": group_id}
 
 
 def _tool_update_fact(agent: CharacterAgent, mem: Any, args: dict) -> dict:
@@ -798,6 +867,7 @@ def _tool_add_episode(agent: CharacterAgent, mem: Any, args: dict) -> dict:
     summary = str(_args(args, "summary", "") or "").strip()
     if not user_id or not summary:
         return _json_error("user_id and summary are required.")
+    group_id = _ensure_group(agent, _args(args, "group_id", None))
     row_id = mem.add_episode(
         user_id=user_id, summary=summary,
         importance=_clip(_args(args, "importance", 0.5)),
@@ -805,9 +875,10 @@ def _tool_add_episode(agent: CharacterAgent, mem: Any, args: dict) -> dict:
             _args(args, "emotional_shift", {}),
             allowed_axes=getattr(mem, "emotion_baseline", None),
         ),
+        group_id=group_id,
     )
     _persist_after_write(agent, mem)
-    return {"id": row_id, "memory": mem.name}
+    return {"id": row_id, "memory": mem.name, "group_id": group_id}
 
 
 def _tool_update_episode(agent: CharacterAgent, mem: Any, args: dict) -> dict:
@@ -1300,7 +1371,9 @@ _register(
     "sets the base importance — facts at or above the agent's "
     "`sticky_threshold` are always in the prompt. `confidence` (0..1) is "
     "the model's certainty. `type` is a free-form label (e.g. \"preference\", "
-    "\"occupation\").",
+    "\"occupation\"). `group_id` optionally stamps the fact as learned in a "
+    "persistent group (created on first use); grouped facts follow group "
+    "privacy at recall time.",
     {
         "type": "object",
         "properties": {
@@ -1310,6 +1383,10 @@ _register(
             "type": {"type": "string", "default": "general"},
             "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+            "group_id": {
+                "type": "string",
+                "description": "Optional persistent-group provenance for this fact.",
+            },
         },
         "required": ["memory", "user_id", "content"],
     },
@@ -1394,7 +1471,9 @@ _register(
     "add_episode",
     "Add a memory of what happened to `episodic`. `emotional_shift` is a "
     "sparse object mapping configured emotion axes to 0..1 intensities. "
-    "`importance` (0..1) is the base importance.",
+    "`importance` (0..1) is the base importance. `group_id` optionally "
+    "stamps the episode as learned in a persistent group (created on first "
+    "use); grouped episodes follow group privacy at recall time.",
     {
         "type": "object",
         "properties": {
@@ -1406,6 +1485,10 @@ _register(
                 "type": "object",
                 "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1},
                 "default": {},
+            },
+            "group_id": {
+                "type": "string",
+                "description": "Optional persistent-group provenance for this episode.",
             },
         },
         "required": ["memory", "user_id", "summary"],
@@ -1795,6 +1878,57 @@ _register(
     "Cancel a persisted calendar event or weekly routine without deleting its provenance.",
     {"type": "object", "properties": {"event_id": {"type": "integer"}}, "required": ["event_id"]},
     _tool_cancel_calendar, needs_memory=False, categories=("calendar",),
+)
+
+# Persistent groups ---- ---------------------------------------------------- #
+# Administrative directory operations, deliberately unrestricted: recall-time
+# privacy lives in the audience-scoped recall context, not here.
+_register(
+    "list_groups",
+    "List the character's persistent groups: display name, privacy override "
+    "and effective policy, observed users (saved human speakers only), "
+    "rolling summary, and linked chats.",
+    {"type": "object", "properties": {}, "required": []},
+    _tool_list_groups,
+    needs_memory=False,
+    categories=("groups",),
+)
+_register(
+    "get_group",
+    "Inspect one persistent group: metadata, observed roster, rolling "
+    "summary, linked chats, and its group-stamped user facts and episodes. "
+    "Administrative — not gated by the group's privacy policy.",
+    {
+        "type": "object",
+        "properties": {"group_id": {"type": "string"}},
+        "required": ["group_id"],
+    },
+    _tool_get_group,
+    needs_memory=False,
+    categories=("groups",),
+)
+_register(
+    "update_group",
+    "Edit a persistent group's display name and/or privacy override "
+    "('none', 'members', 'group_only'). The observed roster is maintained "
+    "by saved messages and cannot be edited. Omit a field to leave it "
+    "unchanged; pass privacy=null to clear the override and inherit the "
+    "character default.",
+    {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string"},
+            "display_name": {"type": "string"},
+            "privacy": {
+                "type": ["string", "null"],
+                "enum": ["none", "members", "group_only", None],
+            },
+        },
+        "required": ["group_id"],
+    },
+    _tool_update_group,
+    needs_memory=False,
+    categories=("groups",),
 )
 
 

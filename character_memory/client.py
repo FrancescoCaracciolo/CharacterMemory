@@ -56,6 +56,7 @@ class ContextResponse:
     also supplies ``context_text`` for callers that want the already-rendered
     prompt section.  ``memories`` contains the exact retrieved memory items
     used for each rendered memory section, grouped by memory name.
+    ``group_id`` is the chat's resolved persistent-group binding, if any.
     """
 
     chat_id: str
@@ -63,6 +64,7 @@ class ContextResponse:
     context_order: list[str]
     context_text: str
     memories: dict[str, list[MemoryItem]] = field(default_factory=dict)
+    group_id: Optional[str] = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ContextResponse":
@@ -102,6 +104,9 @@ class ContextResponse:
             )
         )
 
+        raw_group = payload.get("group_id")
+        group_id = None if raw_group is None else str(raw_group)
+
         raw_memories = payload.get("memories")
         memories: dict[str, list[MemoryItem]] = {}
         if raw_memories is not None:
@@ -139,6 +144,7 @@ class ContextResponse:
             context_order=context_order,
             context_text=context_text,
             memories=memories,
+            group_id=group_id,
         )
 
 
@@ -677,6 +683,52 @@ class CharacterMemoryClient:
             self._path("api", "calendar", character, "events", event_id, "cancel"),
         )
 
+    # Persistent groups: administrative directory access. Recall-time privacy
+    # is applied server-side during /context; these methods are the explicit
+    # unrestricted inspection/editing surface.
+
+    def list_groups(self, character: str) -> list[dict[str, Any]]:
+        """List the character's persistent groups (metadata, roster, chats)."""
+        payload = self._request("GET", self._path("api", "groups", character))
+        groups = payload.get("groups") if isinstance(payload, dict) else None
+        if not isinstance(groups, list):
+            raise CharacterMemoryClientError(
+                "Invalid /api/groups response: expected a 'groups' list."
+            )
+        return groups
+
+    def get_group(self, character: str, group_id: str) -> dict[str, Any]:
+        """Inspect one persistent group, including its facts and episodes."""
+        return self._request(
+            "GET", self._path("api", "groups", character, group_id)
+        )
+
+    def update_group(
+        self,
+        character: str,
+        group_id: str,
+        *,
+        display_name: Union[str, None, object] = UNSET,
+        privacy: Union[str, None, object] = UNSET,
+    ) -> dict[str, Any]:
+        """Edit a group's display name and/or privacy override.
+
+        Omitted fields are left unchanged. ``privacy=None`` clears the
+        override so the group inherits the character's default policy.
+        """
+        body: dict[str, Any] = {}
+        if display_name is not UNSET:
+            body["display_name"] = display_name
+        if privacy is not UNSET:
+            body["privacy"] = privacy
+        if not body:
+            raise ValueError(
+                "update_group requires display_name and/or privacy."
+            )
+        return self._request(
+            "PATCH", self._path("api", "groups", character, group_id), body
+        )
+
     def context(
         self,
         character: str,
@@ -684,6 +736,7 @@ class CharacterMemoryClient:
         message: str,
         *,
         chat_id: Optional[str] = None,
+        group_id: Optional[str] = None,
         save: bool = True,
         occurred_at: Optional[float] = None,
         budget: Budget = UNSET,
@@ -695,6 +748,11 @@ class CharacterMemoryClient:
         Omit ``chat_id`` for the first turn. The server creates a chat and the
         returned :attr:`ContextResponse.chat_id` should be passed on later
         turns and to :meth:`save`.
+
+        ``group_id`` optionally binds a newly created chat to a persistent
+        group (creating the group's metadata if needed); on an existing chat
+        it must match the immutable binding, and the resolved value comes
+        back as :attr:`ContextResponse.group_id`.
 
         With ``save=False``, an existing ``chat_id`` is required and ``message``
         is temporary retrieval input; no chat or conversation message is created.
@@ -718,6 +776,8 @@ class CharacterMemoryClient:
         }
         if chat_id is not None:
             body["chat_id"] = chat_id
+        if group_id is not None:
+            body["group_id"] = group_id
         if not save:
             body["save"] = False
         if occurred_at is not None:

@@ -204,6 +204,25 @@ class ContradictionPolicy:
     show_timestamps: bool = True
 
 
+class GroupPrivacy(str, Enum):
+    """Disclosure policy for persistent group profiles and learned memories."""
+
+    NONE = "none"
+    MEMBERS = "members"
+    GROUP_ONLY = "group_only"
+
+    @classmethod
+    def coerce(cls, value: object) -> "GroupPrivacy":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                pass
+        raise ValueError("group privacy must be one of: none, members, group_only")
+
+
 class CharacterSelfPrivacy(str, Enum):
     """Whether character statements respect their recorded disclosure audience."""
 
@@ -368,6 +387,7 @@ class MemoryConfig:
     enabled_emotion: bool = True
     enabled_heartbeat: bool = True
     enabled_user_summary: bool = True
+    enabled_groups: bool = False
     enabled_world: bool = False
     # Calendar is opt-in so existing characters do not suddenly learn from
     # conversations or add a new prompt section.
@@ -392,6 +412,8 @@ class MemoryConfig:
     conversation_events_k: int = 4
     heartbeat_k: int = 4
     user_summary_k: int = 2
+    groups_k: int = 4
+    group_privacy: GroupPrivacy = GroupPrivacy.MEMBERS
     world_k: int = 4
     calendar_k: int = 8
     knowledge_graph_token_budget: int = 1_000
@@ -462,6 +484,7 @@ class MemoryConfig:
         from .reranking import validate_budget
 
         self.character_self_privacy = CharacterSelfPrivacy.coerce(self.character_self_privacy)
+        self.group_privacy = GroupPrivacy.coerce(self.group_privacy)
         validate_budget(self.token_budget)
         import math
         if (not math.isfinite(self.prospective_follow_up_interval)

@@ -17,6 +17,7 @@ bookkeeping (that would skew decay statistics just for asking).
 """
 
 from __future__ import annotations
+from copy import copy
 
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -24,11 +25,38 @@ from .base import Tool
 
 if TYPE_CHECKING:  # avoid an import-time dependency on the agent package
     from ..agent import CharacterAgent
+    from ..memory.base import RecallContext
 
 
 def _agent_memories(agent: "CharacterAgent") -> dict:
     """The agent's enabled memories, keyed by name (empty if not loaded)."""
     return getattr(agent, "memories", {}) or {}
+
+class _ScopedMemoryTool(Tool):
+    """Copy-on-bind scope; the model's user_id argument is not an audience."""
+
+    recall_context: Optional[RecallContext] = None
+
+    def with_recall_context(self, context: RecallContext) -> Tool:
+        bound = copy(self)
+        bound.recall_context = context
+        return bound
+
+    def _visible_rows(self, memory, user_id: Optional[str] = None) -> list[dict]:
+        from ..memory.base import RecallContext
+        rows = memory.all_rows(user_id=user_id)
+        directory = getattr(self.agent, "group_directory", None)
+        context = self.recall_context or RecallContext()
+        return [
+            row for row in rows
+            if ((
+                directory is not None
+                and directory.is_eligible(row["group_id"], context)
+            ) if row.get("group_id") else (
+                self.recall_context is None
+                or row.get("user_id") in self.recall_context.audience
+            ))
+        ]
 
 
 def memory_tools(agent: "CharacterAgent") -> list[Tool]:
@@ -61,7 +89,7 @@ def memory_tools(agent: "CharacterAgent") -> list[Tool]:
 # --------------------------------------------------------------------------- #
 # search_memory
 # --------------------------------------------------------------------------- #
-class _SearchMemory(Tool):
+class _SearchMemory(_ScopedMemoryTool):
     name = "search_memory"
     description = (
         "Search the character's own memories for information relevant to a "
@@ -99,6 +127,7 @@ class _SearchMemory(Tool):
 
     def run(self, query: str, memory: Optional[str] = None,
             user_id: Optional[str] = None, limit: int = 5) -> str:
+        from ..memory.base import RecallContext
         all_mems = _agent_memories(self.agent)
         if memory:
             if memory not in all_mems:
@@ -123,9 +152,18 @@ class _SearchMemory(Tool):
                     if name == "knowledge_graph" and hasattr(mem, "token_budget")
                     else limit
                 )
-                effective_uid = "" if name == "knowledge_graph" and user_id is None else uid
+                context = self.recall_context or RecallContext(
+                    audience=(user_id,) if user_id else ()
+                )
+                kwargs = (
+                    {"recall_context": context}
+                    if getattr(mem, "supports_recall_context", False) else {}
+                )
+                effective_uid = (
+                    context.audience[0] if context.audience else ""
+                ) if kwargs else uid
                 items = mem.recall(
-                    query, effective_uid, recall_bound, state_changing=False
+                    query, effective_uid, recall_bound, state_changing=False, **kwargs
                 )[:limit]
             except Exception as e:  # noqa: BLE001 - one bad memory shouldn't fail the tool
                 lines.append(f"[{name}] error: {e!r}")
@@ -141,7 +179,7 @@ class _SearchMemory(Tool):
 # --------------------------------------------------------------------------- #
 # get_user_facts
 # --------------------------------------------------------------------------- #
-class _GetUserFacts(Tool):
+class _GetUserFacts(_ScopedMemoryTool):
     name = "get_user_facts"
     description = (
         "List the top facts the character remembers about a specific user, "
@@ -167,12 +205,14 @@ class _GetUserFacts(Tool):
         if not isinstance(mem, StructuredMemory):
             return "user_facts memory is not available."
         limit = max(1, min(20, int(limit)))
-        rows = mem.all_rows(user_id=user_id)
+        rows = self._visible_rows(mem, user_id)
         rows.sort(key=lambda r: float(r.get("importance", 0.0)), reverse=True)
         rows = rows[:limit]
         if not rows:
             return f"No facts stored about {user_id!r}."
-        return "\n".join(f"- {mem.row_text(r).strip()}" for r in rows if mem.row_text(r).strip())
+        return "\n".join(
+            f"- {mem.row_item(r, 0).text}" for r in rows if mem.row_text(r).strip()
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -249,7 +289,7 @@ class _GetUserEmotion(Tool):
 # --------------------------------------------------------------------------- #
 # list_known_users
 # --------------------------------------------------------------------------- #
-class _ListKnownUsers(Tool):
+class _ListKnownUsers(_ScopedMemoryTool):
     name = "list_known_users"
     description = (
         "List the distinct users the character has memories about (across "
@@ -267,7 +307,11 @@ class _ListKnownUsers(Tool):
         users: set[str] = set()
         for mem in _agent_memories(self.agent).values():
             if isinstance(mem, StructuredMemory):
-                for r in mem.all_rows():
+                rows = (
+                    self._visible_rows(mem) if mem.name in ("user_facts", "episodic")
+                    else mem.all_rows()
+                )
+                for r in rows:
                     uid = r.get("user_id")
                     if uid:
                         users.add(str(uid))

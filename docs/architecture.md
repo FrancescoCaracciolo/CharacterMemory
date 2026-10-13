@@ -22,15 +22,23 @@ flowchart LR
         EP[episodic]
         HB[heartbeat]
         US[user_summary]
+        GR[groups<br/>GroupMemory]
         EM[emotion]
         KG[knowledge_graph]
-        UF & UD & EP & HB & US -. StructuredMemory .- SQLite[(SQLiteStore<br/>memory.db)]
+        UF & UD & EP & HB & US & GR -. StructuredMemory .- SQLite[(Store<br/>SQLite / PostgreSQL)]
     end
 
     Character[Character<br/>prompt assembly + extraction]
     Agent[CharacterAgent<br/>orchestrator]
+    Chats[Linked chats<br/>immutable group_id]
+    Audience[RecallContext<br/>group + saved speakers]
+    Directory[GroupDirectory<br/>metadata + observed roster]
 
     Agent --> Character
+    Chats --> Directory
+    Directory --> Audience
+    Audience --> Character
+    Directory --> GR
     Character --> Memories
     Memories --> RAG
     Memories --> EMB
@@ -117,6 +125,7 @@ All state lives in one directory per character:
 ├── episodic_index/
 ├── heartbeat_index/
 ├── user_summary_index/
+├── groups_index/              # optional rolling group profiles
 └── kg_index/                  # optional knowledge-graph persistence
 ```
 
@@ -151,6 +160,36 @@ answering the prompt recalls for **all participants**.
   recall/render/extract path collapses to the legacy single-user path.
 
 See [Multi-user](multi_user.md) for the full design.
+
+## Persistent group scope
+
+`GroupDirectory` remains available even when `GroupMemory` is disabled.
+Multiple chats can bind the same character-scoped identifier at creation.
+The observed roster is a query over saved human messages, never chat owners
+who have not spoken. Group metadata and fact/episode `group_id` columns use
+additive migrations through `Store`; legacy rows remain ungrouped.
+
+An immutable `RecallContext(group_id, audience)` accompanies each request.
+Participating built-ins opt in with `supports_recall_context`; third-party
+memories keep their existing signatures. Facts and episodes retrieve a single
+eligible union of audience-owned ungrouped rows and group rows, independent of
+the latter's subjects. Group profiles prioritize the current group. The global
+prompt budget and reranker only see eligible candidates.
+
+`none`, `members`, and `group_only` are resolved from each group's nullable
+override or the character default (`members`). Graph evidence preserves its
+source partition, and both numeric and scalar traversal exclude inaccessible
+group evidence. Conversational tools are copy-bound to the same request scope;
+administrative inspection is a separate unrestricted operation.
+
+Extraction grounds facts in the same user/source-group partition and combines
+the previous rolling group summary with new messages. In-process extraction
+across linked chats is serialized per group; failed model calls leave messages
+unmarked for retry. Names and rosters remain derived from saved speakers.
+
+This scope covers profiles, facts, episodes, and their graph projections only:
+user summaries, directives, conversation history, and other systems retain
+their existing sharing rules.
 
 ## Tool / function calling
 

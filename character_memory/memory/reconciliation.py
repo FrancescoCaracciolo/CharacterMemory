@@ -35,7 +35,7 @@ def _order(row):
 
 
 def _scope(memory, row):
-    return row.get('user_id') if memory.scope == MemoryScope.PER_USER else None
+    return row.get('user_id'), row.get('group_id')
 
 
 def _exact_key(memory, row):
@@ -216,8 +216,13 @@ class ReconciliationPass:
                             search = memory.hybrid.search
                             if self.dry_run and getattr(memory.hybrid, 'remote', False):
                                 search = memory.hybrid.search_snapshot
+                            where = {'user_id': incoming['user_id']}
+                            if 'group_id' in memory.extra_columns:
+                                where['group_id'] = incoming.get('group_id')
+                            import inspect
+                            kwargs = {'allowed_ids': frozenset(scoped)} if 'allowed_ids' in inspect.signature(search).parameters else {}
                             hits = search(str(incoming[memory.text_column]), k=pool * 3,
-                                where={'user_id': incoming['user_id']} if memory.scope == MemoryScope.PER_USER else None)
+                                where=where, **kwargs)
                             seen = {r['id'] for r in candidates}
                             for hit in hits:
                                 cid = hit.metadata.get('id')

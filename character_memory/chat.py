@@ -31,6 +31,7 @@ _CHAT_COLUMNS: dict[str, str] = {
     "id": "TEXT PRIMARY KEY",
     "user_id": "TEXT NOT NULL",
     "title": "TEXT NOT NULL DEFAULT ''",
+    "group_id": "TEXT",
     "created_at": "REAL NOT NULL",
 }
 
@@ -70,12 +71,18 @@ class Chat:
         *,
         title: str = "",
         created_at: Optional[float] = None,
+        group_id: Optional[str] = None,
     ) -> None:
         self.id = chat_id
         self.user_id = user_id
         self.store = store
         self.title = title
+        self._group_id = group_id
         self.created_at = created_at if created_at is not None else time.time()
+    @property
+    def group_id(self) -> Optional[str]:
+        """The persistent group assigned when this chat was created."""
+        return self._group_id
 
     # ------------------------------------------------------------- messages
     def add_message(
@@ -246,6 +253,13 @@ class _ChatBackend:
         self.store = store
         self.store.create_table("chats", _CHAT_COLUMNS, pk="id")
         self.store.create_table("messages", _MESSAGE_COLUMNS, pk="id")
+        if "group_id" not in self.store.columns("chats"):
+            try:
+                self.store.execute("ALTER TABLE chats ADD COLUMN group_id TEXT")
+            except self.store.operational_errors:
+                if "group_id" not in self.store.columns("chats"):
+                    raise
+        self.store.execute("CREATE INDEX IF NOT EXISTS cm_chats_group ON chats(group_id)")
         # Additive migration: older databases predate some of the
         # `messages` columns (e.g. `user_id` the speaker, `occurred_at` the
         # source timestamp, `extracted` the learning flag). Add any that are
@@ -258,7 +272,9 @@ class _ChatBackend:
             if col not in existing:
                 self.store.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
 
-    def create_chat(self, user_id: str, *, title: str = "") -> Chat:
+    def create_chat(self, user_id: str, *, title: str = "", group_id: Optional[str] = None) -> Chat:
+        if group_id is not None and (not isinstance(group_id, str) or not group_id.strip()):
+            raise ValueError("group_id must be a nonempty string or None")
         chat_id = uuid.uuid4().hex
         now = time.time()
         self.store.upsert(
@@ -267,11 +283,12 @@ class _ChatBackend:
                 "id": chat_id,
                 "user_id": user_id,
                 "title": title,
+                "group_id": group_id,
                 "created_at": now,
             },
             pk="id",
         )
-        return Chat(chat_id, user_id, self.store, title=title, created_at=now)
+        return Chat(chat_id, user_id, self.store, title=title, created_at=now, group_id=group_id)
 
     def load_chat(self, chat_id: str) -> Optional[Chat]:
         rows = self.store.select("chats", where={"id": chat_id}, limit=1)
@@ -279,7 +296,8 @@ class _ChatBackend:
             return None
         r = rows[0]
         return Chat(
-            r["id"], r["user_id"], self.store, title=r["title"], created_at=r["created_at"]
+            r["id"], r["user_id"], self.store, title=r["title"], created_at=r["created_at"],
+            group_id=r.get("group_id"),
         )
 
     def list_chats(self, user_id: Optional[str] = None) -> list[Chat]:
@@ -290,7 +308,8 @@ class _ChatBackend:
                 "chats", where={"user_id": user_id}, order_by="created_at ASC"
             )
         return [
-            Chat(r["id"], r["user_id"], self.store, title=r["title"], created_at=r["created_at"])
+            Chat(r["id"], r["user_id"], self.store, title=r["title"], created_at=r["created_at"],
+                 group_id=r.get("group_id"))
             for r in rows
         ]
 

@@ -35,13 +35,15 @@ def pending(memory):
 
 def apply(memory, existing, incoming, replacement, evidence, reason, model):
     """Compare snapshots and atomically archive/update/delete. False means stale."""
-    from .base import MemoryScope
     if existing['id'] == incoming['id']:
         raise ValueError('Cannot reconcile a row with itself')
-    if memory.scope == MemoryScope.PER_USER and existing.get('user_id') != incoming.get('user_id'):
-        raise ValueError('Cannot reconcile different user scopes')
+    scope = lambda row: (row.get('user_id'), row.get('group_id'))
+    if scope(existing) != scope(incoming):
+        raise ValueError('Cannot reconcile different user/group scopes')
     if replacement is not None and replacement['id'] != existing['id']:
         raise ValueError('A revision must preserve the canonical row ID')
+    if replacement is not None and scope(replacement) != scope(existing):
+        raise ValueError('A revision must preserve the user/group scope')
     if not getattr(memory, '_reconciliation_tables_ready', False):
         ensure_tables(memory.store)
         memory._reconciliation_tables_ready = True

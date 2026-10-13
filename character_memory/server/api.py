@@ -289,6 +289,14 @@ class ContextRequest(BaseModel):
         default=None,
         description="Existing chat id. If absent, a new chat is created only when save is true.",
     )
+    group_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional persistent-group identifier. Binds a newly created chat "
+            "to the group (creating the group's metadata row if needed) and "
+            "must match an existing chat's immutable group binding."
+        ),
+    )
     occurred_at: Optional[float] = Field(
         default=None,
         description="Optional Unix timestamp for when the user message occurred.",
@@ -333,6 +341,13 @@ class ContextRequest(BaseModel):
 
 class ContextResponse(BaseModel):
     chat_id: str
+    group_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The chat's resolved persistent-group binding, if any. New chats "
+            "inherit the requested group_id; existing chats keep theirs."
+        ),
+    )
     context: dict[str, str]
     memories: dict[str, list[MemoryItem]] = Field(
         default_factory=dict,
@@ -394,6 +409,17 @@ class CalendarMutationRequest(BaseModel):
     """Calendar event/routine fields used by the agenda editor."""
 
     values: dict = Field(default_factory=dict)
+
+
+class GroupMutationRequest(BaseModel):
+    """Group settings submitted by the persistent-groups editor.
+
+    Absence means "leave unchanged"; ``privacy: null`` clears the group's
+    override so it inherits the character default again.
+    """
+
+    display_name: Optional[str] = None
+    privacy: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -486,6 +512,8 @@ def context(req: ContextRequest) -> ContextResponse:
     """
     agent = _get_agent(req.character)
 
+    if req.group_id is not None and not req.group_id.strip():
+        raise HTTPException(status_code=422, detail="group_id must be a nonempty string.")
     if not req.save and not req.chat_id:
         raise HTTPException(status_code=422, detail="save=false requires an existing chat_id.")
     chat = None
@@ -496,8 +524,19 @@ def context(req: ContextRequest) -> ContextResponse:
                 status_code=404,
                 detail=f"chat_id {req.chat_id!r} does not exist for {req.character!r}.",
             )
+        if req.group_id is not None and req.group_id != chat.group_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"chat_id {req.chat_id!r} is bound to group "
+                    f"{chat.group_id!r}; a chat's group binding is immutable."
+                ),
+            )
     if chat is None:
-        chat = agent.create_chat(req.user, title=req.message[:60])
+        try:
+            chat = agent.create_chat(req.user, title=req.message[:60], group_id=req.group_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Persist the user turn attributed to the current speaker. For a group
     # chat this is what makes each participant's messages attributable.
@@ -539,6 +578,7 @@ def context(req: ContextRequest) -> ContextResponse:
         pass
     return ContextResponse(
         chat_id=chat.id,
+        group_id=chat.group_id,
         context=snapshot.sections,
         memories={
             name: list(recall.items)
@@ -812,6 +852,62 @@ def remove_memory_record(character: str, memory: str, record_id: str) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"ok": True, "id": deleted_id, "memory": memory}
+
+
+# ----------------------------- persistent groups ----------------------------- #
+# Administrative directory access for the WebUI: listing, inspection and
+# metadata editing. Privacy never gates these reads — audience-scoped recall
+# lives in /context; this is the explicitly administrative view.
+
+
+@app.get("/api/groups/{character}")
+def list_groups(character: str) -> dict:
+    """List every persistent group with roster, privacy and linked chats."""
+    agent = _get_agent(character)
+    return {"groups": agent.list_groups()}
+
+
+@app.get("/api/groups/{character}/{group_id}")
+def read_group(character: str, group_id: str) -> dict:
+    """Inspect one group: metadata, roster, summary, linked chats, and its
+    group-stamped facts and episodes."""
+    agent = _get_agent(character)
+    group = agent.get_group(group_id)
+    if group is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"group_id {group_id!r} does not exist for {character!r}.",
+        )
+    return group
+
+
+@app.patch("/api/groups/{character}/{group_id}")
+def update_group(character: str, group_id: str, req: GroupMutationRequest) -> dict:
+    """Edit a group's display name and privacy override.
+
+    The observed roster is maintained by saved messages and cannot be edited.
+    """
+    agent = _get_agent(character)
+    updates: dict[str, Any] = {}
+    fields = req.model_fields_set
+    if "display_name" in fields:
+        updates["display_name"] = req.display_name
+    if "privacy" in fields:
+        updates["privacy"] = req.privacy
+    if not updates:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide display_name and/or privacy to update.",
+        )
+    try:
+        return agent.update_group(group_id, **updates)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"group_id {group_id!r} does not exist for {character!r}.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _calendar_for_api(character: str) -> tuple[CharacterAgent, CalendarMemory]:

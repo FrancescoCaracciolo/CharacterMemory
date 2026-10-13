@@ -43,6 +43,7 @@ class PromptConfig:
     heartbeat_header: str = "Recent discoveries / actions of yours"
     user_summary_header: str = "Summary of this user"
     user_summary_header_multi: str = "Summaries of these users"
+    groups_header: str = "Conversation groups"
     emotion_header: str = "Emotional state"
     world_header: str = "Current World"
     calendar_header: str = "Calendar"
@@ -139,6 +140,7 @@ class PromptConfig:
             "calendar",
             "prospective",
             "user_directives",
+            "groups",
             "user_facts",
             "episodic",
             "conversation_events",

@@ -27,12 +27,14 @@ class EpisodicMemory(StructuredMemory):
 
     name = "episodic"
     table = "episodic"
+    supports_recall_context = True
     extra_columns = {
         "summary": "TEXT NOT NULL",
         "emotional_shift": "TEXT NOT NULL DEFAULT '{}'",
         # The chat an episode was learned in (NULL ⇒ legacy / single-user).
         # Used by the knowledge graph to link facts and episodes of the same chat.
         "chat_id": "TEXT",
+        "group_id": "TEXT",
         "source_message_ids": "TEXT NOT NULL DEFAULT '[]'",
         # Semantic event time, distinct from when extraction stored the row.
         "occurred_at": "REAL",
@@ -123,6 +125,7 @@ class EpisodicMemory(StructuredMemory):
         chat_id: Optional[str] = None,
         source_message_ids: Optional[list[int]] = None,
         occurred_at: Optional[float] = None,
+        group_id: Optional[str] = None,
     ) -> int:
         return self.add(
             user_id,
@@ -133,6 +136,7 @@ class EpisodicMemory(StructuredMemory):
                 allowed_axes=self.emotion_baseline,
             ),
             chat_id=chat_id,
+            group_id=group_id,
             source_message_ids=json.dumps(source_message_ids or []),
             occurred_at=(
                 float(occurred_at)
@@ -183,7 +187,7 @@ class EpisodicMemory(StructuredMemory):
         metadata["emotion_similarity"] = similarity
         metadata["impact"] = impact
         metadata["similarity"] = similarity
-        return MemoryItem(text=row.get("summary", ""), score=score, kind=self.name, metadata=metadata)
+        return MemoryItem(text=self._group_label(row) + row.get("summary", ""), score=score, kind=self.name, metadata=metadata)
 
     # Extraction ----------------------------------------------------------
     def extraction_spec(self, context: "ExtractionContext | None" = None) -> ExtractionSpec:
@@ -228,7 +232,12 @@ class EpisodicMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
+    def apply_extraction_with_context(self, value, context, *, chat_id=None):
+        return self.apply_extraction(value, context.user_name, chat_id=chat_id,
+                                     group_id=getattr(context, "group_id", None))
+
+    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None,
+                         group_id: Optional[str] = None) -> list[MemoryItem]:
         added: list[MemoryItem] = []
         for e in value or []:
             summary = (e.get("summary") or "").strip()
@@ -249,12 +258,24 @@ class EpisodicMemory(StructuredMemory):
             # Multi-user: attribute to the participant the LLM named, else the
             # caller's default user (the chat owner / current speaker).
             uid = str(e.get("user_id") or user_id)
+            source_ids = sorted(set(int(source_id) for source_id in source_message_ids))
+            # Identical evidence is a retry. Identical text with new evidence
+            # can describe another occurrence and is left to reconciliation.
+            existing = self.store.select(self.table, {"user_id": uid, "group_id": group_id})
+            if any(
+                row.get("chat_id") == chat_id
+                and str(row.get("summary") or "").strip().casefold() == summary.casefold()
+                and sorted(set(json.loads(row.get("source_message_ids") or "[]"))) == source_ids
+                for row in existing
+            ):
+                continue
             row_id = self.add_episode(
                 uid,
                 summary,
                 importance=self._clip(e.get("importance", 0.5)),
                 emotional_shift=emotional_shift,
                 chat_id=chat_id,
+                group_id=group_id,
                 source_message_ids=source_message_ids,
                 occurred_at=self._source_timestamp(source_message_ids),
             )

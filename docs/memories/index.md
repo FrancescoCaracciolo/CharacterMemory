@@ -9,13 +9,13 @@ itself into a prompt section. Every memory subclasses `Memory` (in
 `memory/base.py`). The agent iterates the *enabled* memories, asks each for a
 rendered section, and concatenates them into the system prompt.
 
-There are **twelve** built-in memories, each independently enable/disable-able.
+There are **thirteen** built-in memories, each independently enable/disable-able.
 They come in three architectural flavors:
 
 | Flavor | Backed by | Examples |
 |---|---|---|
 | **RAG memory** | a pure `HybridSearch` index over pre-built chunks | `character_info`, `dialogue_style` |
-| **Structured memory** | a SQLite table (rows) **plus** a `HybridSearch` index over those rows, with decay + recall bookkeeping | `user_facts`, `user_directives`, `episodic`, `heartbeat`, `user_summary`, `calendar` |
+| **Structured memory** | a SQLite table (rows) **plus** a `HybridSearch` index over those rows, with decay + recall bookkeeping | `user_facts`, `user_directives`, `episodic`, `heartbeat`, `user_summary`, `calendar`, `groups` |
 | **Custom** | a bespoke backing store | `emotion`, `knowledge_graph` |
 
 | Memory | Flavor | Scope | Learns from chat? | Page |
@@ -31,6 +31,7 @@ They come in three architectural flavors:
 | `heartbeat` | Structured | CHARACTER | no (autonomous loop) | [→](heartbeat.md) |
 | `user_summary` | Structured | PER_USER | yes | [→](user_summary.md) |
 | `calendar` | Structured | PER_USER | yes | [→](calendar.md) |
+| `groups` | Structured | CHARACTER | yes (rolling group summaries) | [→](groups.md) |
 | `knowledge_graph` | Custom | PER_USER | indirectly (reads other memories) | [→](knowledge_graph.md) |
 
 ---

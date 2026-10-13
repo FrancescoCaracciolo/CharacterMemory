@@ -8,7 +8,7 @@ from ._timing import time_memory
 from character_memory.llm.base import LLMClient
 from character_memory.prompts import INTERMEDIATE_PROMPT_PREFIX, PromptConfig
 from .memory.extract import Extractor, ExtractionContext, build_extraction
-from .memory.base import Memory, MemoryItem, RecallResult
+from .memory.base import Memory, MemoryItem, RecallContext, RecallResult
 from .memory.structured import StructuredMemory
 from .rag.base import Query
 from .temporal import TemporalResolution
@@ -44,6 +44,8 @@ class ContextSnapshot:
     memory_token_count: int = 0
     memory_budget: Optional[int] = None
     memory_types: Optional[list[str]] = None
+    group_id: Optional[str] = None
+    recall_context: Optional[RecallContext] = None
 
 
 class Character:
@@ -75,6 +77,7 @@ class Character:
         temporal_resolution: Optional[TemporalResolution] = None,
         temporal_weight: float = 1.0,
         memory_types: Optional[Sequence[str]] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> ContextSnapshot:
         """Select memories and return their items, sections and token usage.
 
@@ -91,6 +94,7 @@ class Character:
             query, user_id, limits=limits, participants=participants,
             temporal_resolution=temporal_resolution, temporal_weight=temporal_weight,
             budget=budget, reranker=reranker, memory_types=memory_types,
+            recall_context=recall_context,
         )
 
     def _count_memory_tokens(self, text: str) -> int:
@@ -126,6 +130,13 @@ class Character:
             if candidate.id in seen:
                 raise ValueError("reranker returned a duplicate candidate")
             seen.add(candidate.id)
+        # Preserve the current profile's reserved position after global
+        # ranking, without resurrecting candidates a custom reranker removed.
+        ranked.sort(key=lambda candidate: bool(
+            candidate.memory_name == "groups"
+            and candidate.item is not None
+            and candidate.item.metadata.get("current_group")
+        ), reverse=True)
 
         def render(selected: set[int]) -> dict[str, MemoryRecallSnapshot]:
             grouped: dict[str, list[MemoryItem]] = {}
@@ -169,7 +180,8 @@ class Character:
         return self._by_name[name].title
 
     def _known_user_facts(
-        self, user_id: str, limit: int = 8, participants: Optional[list[str]] = None
+        self, user_id: str, limit: int = 8, participants: Optional[list[str]] = None,
+        group_id: Optional[str] = None,
     ) -> list[str]:
         """Top known user-fact texts, highest importance first.
 
@@ -185,6 +197,9 @@ class Character:
         facts: list[str] = []
         for uid in users:
             rows = mem.all_rows(user_id=uid)
+            # Ground extraction only in the source partition. An unrestricted
+            # previous profile must never contaminate a restricted new row.
+            rows = [row for row in rows if row.get("group_id") == group_id]
             rows.sort(key=lambda r: float(r.get("importance", 0.0)), reverse=True)
             for r in rows[:limit]:
                 text = mem.row_text(r).strip()
@@ -193,10 +208,12 @@ class Character:
         return facts
 
     def _extraction_context(
-        self, user_id: str, participants: Optional[list[str]] = None
+        self, user_id: str, participants: Optional[list[str]] = None,
+        *, group_id: Optional[str] = None, group_summary: str = "",
+        group_users: Optional[list[str]] = None,
     ) -> ExtractionContext:
         """Build the identity + grounding context for an extraction call."""
-        known = self._known_user_facts(user_id, participants=participants)
+        known = self._known_user_facts(user_id, participants=participants, group_id=group_id)
         p = self.prompts
         return ExtractionContext(
             character_name=self.character_name,
@@ -204,6 +221,9 @@ class Character:
             persona=self.base_instruction.strip(),
             known_facts=known,
             participants=list(participants) if participants else [],
+            group_id=group_id,
+            group_summary=group_summary,
+            group_users=list(group_users or []),
             header=p.extraction_header if p is not None else ExtractionContext.header,
             sentence_rule=p.extraction_sentence_rule if p is not None else ExtractionContext.sentence_rule,
             known_facts_intro=p.extraction_known_facts_intro if p is not None else ExtractionContext.known_facts_intro,
@@ -218,6 +238,9 @@ class Character:
         llm: Optional[LLMClient] = None,
         participants: Optional[list[str]] = None,
         chat_id: Optional[str] = None,
+        group_id: Optional[str] = None,
+        group_summary: str = "",
+        group_users: Optional[list[str]] = None,
     ) -> Optional[dict]:
         """Run extraction over `turns`.
 
@@ -238,7 +261,10 @@ class Character:
         if llm is None:
             raise ValueError("No LLM specified. Character.extract needs a LLM configured")
         parts = participants if participants else None
-        context = self._extraction_context(user_id, participants=parts)
+        context = self._extraction_context(
+            user_id, participants=parts, group_id=group_id,
+            group_summary=group_summary, group_users=group_users,
+        )
         context.turns = turns
         # Only enabled memories that opt into extraction.
         participating = [
@@ -252,6 +278,8 @@ class Character:
             return None
         schema, instruction = build_extraction([spec for _, spec in participating], context=context)
         extracted = Extractor(llm).extract(turns, schema=schema, instruction=instruction, context=context)
+        if extracted.get("error"):
+            raise RuntimeError(f"Memory extraction failed: {extracted['error']}")
         added: dict[str, list[MemoryItem]] = {}
         for mem, spec in participating:
             from .concurrency import object_lock
@@ -278,6 +306,7 @@ class Character:
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> ContextSnapshot:
         """Build the context and retain the exact items recalled by each memory.
 
@@ -335,6 +364,10 @@ class Character:
             if budget == 0:
                 continue
             recall_kwargs = {"state_changing": False} if selective else {}
+            if getattr(mem, "supports_recall_context", False):
+                recall_kwargs["recall_context"] = recall_context or RecallContext(
+                    audience=tuple(participants or ([user_id] if user_id else []))
+                )
             with time_memory(self.character_name, name):
                 if multi:
                     result: RecallResult = mem.build_section_participants_result(
@@ -422,7 +455,14 @@ class Character:
             for name, recall in recalls.items():
                 mem = self._by_name[name]
                 with object_lock(mem):
-                    mem.record_recall(recall.items)
+                    if getattr(mem, "supports_recall_context", False):
+                        mem.record_recall_with_context(
+                            recall.items, recall_context or RecallContext(
+                                audience=tuple(participants or ([user_id] if user_id else []))
+                            )
+                        )
+                    else:
+                        mem.record_recall(recall.items)
         else:
             memory_tokens = self._count_memory_tokens("\n\n".join(r.section for r in recalls.values()))
         return ContextSnapshot(
@@ -431,6 +471,8 @@ class Character:
             query=query,
             user_id=user_id,
             participants=list(participants or [user_id]),
+            group_id=recall_context.group_id if recall_context is not None else None,
+            recall_context=recall_context,
             temporal_resolution=temporal_resolution,
             memory_token_count=memory_tokens,
             memory_budget=budget,
@@ -449,6 +491,7 @@ class Character:
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> dict[str, str]:
         """Return ordered rendered memory sections and intermediate prompts."""
         return self.build_context_snapshot(
@@ -461,6 +504,7 @@ class Character:
             budget=budget,
             reranker=reranker,
             memory_types=memory_types,
+            recall_context=recall_context,
         ).sections
 
     def _header_for_multi(self, name: str) -> str:
@@ -484,6 +528,7 @@ class Character:
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> str:
         """Full system-style context block (system line + all sections)."""
         sections = self.build_context(
@@ -496,6 +541,7 @@ class Character:
             budget=budget,
             reranker=reranker,
             memory_types=memory_types,
+            recall_context=recall_context,
         )
         if self.prompts is None:
             parts = []

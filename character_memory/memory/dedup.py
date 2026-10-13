@@ -178,7 +178,7 @@ class Deduplicator:
         if k <= 0:
             return []
         try:
-            hits = memory.hybrid.search(query, k=k, where={"user_id": user_id})
+            hits = memory._search_rows(query, k, rows, where={"user_id": user_id})
         except Exception:
             return []
         out: list[dict[str, Any]] = []
@@ -264,6 +264,8 @@ class Deduplicator:
         overwrites the text column.
         """
         merged = dict(survivor)
+        if (survivor.get("user_id"), survivor.get("group_id")) != (loser.get("user_id"), loser.get("group_id")):
+            raise ValueError("Cannot merge different user/group scopes")
         merged["importance"] = max(
             float(survivor.get("importance") or 0.0),
             float(loser.get("importance") or 0.0),
@@ -444,7 +446,9 @@ class Deduplicator:
             text = str(current.get(text_col, ""))
             # Compare against all surviving rows; exclude_ids keeps the RAG
             # search from matching this item against itself in the index.
-            all_rows = [r for r in rows_by_id.values() if r.get("user_id") == current.get("user_id")]
+            all_rows = [r for r in rows_by_id.values()
+                        if (r.get("user_id"), r.get("group_id")) ==
+                        (current.get("user_id"), current.get("group_id"))]
             dup_row, merged_text, reason = self._find_duplicate(
                 memory, text, user_id, all_rows,
                 exclude_ids={row_id},
@@ -499,10 +503,9 @@ class Deduplicator:
     ) -> DedupReport:
         """Compact a whole memory in place, merging/dropping duplicates.
 
-        When ``user_id`` is given, only that user's rows are swept. When it is
-        ``None`` and ``per_user`` is set, each user is swept independently;
-        otherwise all rows are compared together. Index deltas are applied once
-        at the end.
+        When ``user_id`` is given, only that user's rows are swept. Every
+        user/group partition is swept independently, even with the legacy
+        ``per_user`` option disabled. Index deltas are applied once at the end.
         """
         if self.decision_client is not None:
             from .reconciliation import ReconciliationPass
@@ -511,22 +514,13 @@ class Deduplicator:
                 rows, {int(r['id']) for r in rows})
         if dry_run:
             memory = _PreviewMemory(memory)
-        cfg = self.config
         report = DedupReport(dry_run=dry_run)
-        if user_id is not None:
-            groups: list[Optional[str]] = [user_id]
-        else:
-            distinct: list[Optional[str]] = []
-            for r in memory.all_rows():
-                uid = r.get("user_id")
-                if uid not in distinct:
-                    distinct.append(uid)
-            groups = distinct if cfg.per_user else [None]
-
-        for uid in groups:
-            self._sweep_group(memory, uid, report)
-
-        report.checked = sum(len(memory.all_rows(u)) for u in groups)
+        rows = memory.all_rows(user_id)
+        # Privacy partitions are mandatory even when legacy per_user=False.
+        groups = list(dict.fromkeys((row.get("user_id"), row.get("group_id")) for row in rows))
+        report.checked = len(rows)
+        for uid, group_id in groups:
+            self._sweep_group(memory, uid, report, group_id=group_id)
         memory.apply_index_changes(
             removed_ids=report.removed_ids,
             updated_ids=report.updated_ids,
@@ -538,12 +532,14 @@ class Deduplicator:
         memory: StructuredMemory,
         user_id: Optional[str],
         report: DedupReport,
+        *,
+        group_id: Optional[str] = None,
     ) -> None:
         cfg = self.config
         text_col = memory.text_column
         policy = memory.contradiction_policy()
         contra_on = bool(policy.enabled and policy.similarity_threshold is not None)
-        rows = memory.all_rows(user_id)
+        rows = [row for row in memory.all_rows(user_id) if row.get("group_id") == group_id]
         if len(rows) < 2:
             return
 

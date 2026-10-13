@@ -43,7 +43,8 @@ from .config import (
 )
 from .llm.base import LLMClient
 from .llm.embedding_base import EmbeddingProvider
-from .memory.base import Memory
+from .memory.base import Memory, RecallContext
+from .memory.groups import GroupDirectory, GroupMemory
 from .reranking import Budget, UNSET, MemoryReranker, TokenCounter
 from .memory.character_base import CharacterInfoMemory, DialogueStyleMemory
 from .memory.conversation_events import ConversationEventMemory
@@ -56,7 +57,7 @@ from .memory.heartbeat import HeartbeatJournal
 from .memory.knowledge_graph_memory import KnowledgeGraphMemory
 from .memory.store import SQLiteStore
 from .memory.store_base import Store
-from .concurrency import Coalescer, chat_lock, chat_serialized
+from .concurrency import Coalescer, chat_lock, chat_serialized, object_lock
 from .rag.base import RAGSystem
 from .memory.structured import StructuredMemory
 from .memory.user_directives import UserDirectiveMemory
@@ -108,6 +109,7 @@ _STRUCTURED_MEMORIES = (
     "user_summary",
     "world",
     "calendar",
+    "groups",
 )
 _DEDUP_MEMORIES = (
     "user_facts", "user_directives", "episodic", "heartbeat", "user_summary"
@@ -205,6 +207,7 @@ class CharacterAgent:
         # Per-memory recall bounds: top-k counts, except KG prompt tokens.
         self._limits: dict[str, int] = {}
         self._chats: Optional[_ChatBackend] = None
+        self.group_directory: Optional[GroupDirectory] = None
         #: Per-pass extraction changelog (``extraction_runs`` table). None when
         #: disabled via ``MemoryConfig.extraction_log_limit = 0``.
         self.extraction_log: Optional[ExtractionLog] = None
@@ -324,9 +327,12 @@ class CharacterAgent:
 
         self._open_store()
         try:
+            self._chats = _ChatBackend(self.store)
+            self.group_directory = GroupDirectory(
+                self.store, default_privacy=full.memory.group_privacy
+            )
             self._build_memories(full.memory)
             self._wire_character()
-            self._chats = _ChatBackend(self.store)
             self._open_extraction_log()
         except BaseException:
             self.character = None
@@ -354,9 +360,10 @@ class CharacterAgent:
         self.embedder = embedder
         self._configure_temporal_resolution(None)
         self._open_store()
+        self._chats = _ChatBackend(self.store)
+        self.group_directory = GroupDirectory(self.store)
         self.memories = {m.name: m for m in memories}
         self._wire_character()
-        self._chats = _ChatBackend(self.store)
         self._open_extraction_log()
         return self
 
@@ -450,6 +457,10 @@ class CharacterAgent:
             self.store, hybrid("user_facts"), enabled=m.is_enabled("user_facts"),
             half_life=half, sticky_threshold=sticky,
         )
+        self.memories["groups"] = GroupMemory(
+            self.store, hybrid("groups"), group_directory=self.group_directory,
+            enabled=m.enabled_groups, half_life=half, sticky_threshold=sticky,
+        )
         self.memories["user_directives"] = UserDirectiveMemory(
             self.store, hybrid("user_directives"), enabled=m.is_enabled("user_directives"),
             half_life=half, sticky_threshold=sticky,
@@ -531,6 +542,8 @@ class CharacterAgent:
             else TemporalResolutionConfig()
         )
         for memory in self.memories.values():
+            if getattr(memory, "supports_recall_context", False):
+                memory.group_directory = self.group_directory
             memory.temporal_resolution_engine = self.temporal_resolution_engine
             memory.temporal_resolution_timezone = temporal_config.timezone
             memory.temporal_resolution_weight = temporal_config.weight
@@ -560,6 +573,7 @@ class CharacterAgent:
         # so it can ingest/update/apply-deduplication against the others.
         kg = self.memories.get(_KG_MEMORY)
         if isinstance(kg, KnowledgeGraphMemory):
+            kg.retriever.group_directory = self.group_directory
             kg.attach_backends(self.llm, self.embedder)
             kg.wire_sources(self.memories)
             # Pass the character identity (name + persona + aliases) to the
@@ -878,12 +892,37 @@ class CharacterAgent:
         return reports
 
     # Target resolution
+    def resolve_recall_context(
+        self, target: Optional[Target] = None, *, user_id: str = "default",
+        group_id: Optional[str] = None, participants: Optional[list[str]] = None,
+    ) -> RecallContext:
+        """Resolve a conversational audience without adding observed speakers.
+
+        A linked chat uses the group's saved roster. Raw requests can specify
+        a group but never enroll their caller merely by recalling memories.
+        """
+        self._require_loaded()
+        chat = target if isinstance(target, Chat) else (
+            self._as_chat(target) if isinstance(target, str) else None
+        )
+        if chat is not None:
+            if group_id is not None and group_id != chat.group_id:
+                raise ValueError("group_id conflicts with the chat's immutable group binding")
+            group_id = chat.group_id
+            participants = chat.participants()
+        if group_id is not None:
+            assert self.group_directory is not None
+            self.group_directory.ensure(group_id)
+            audience = self.group_directory.observed_users(group_id)
+        else:
+            audience = participants if participants is not None else ([user_id] if user_id else [])
+        return RecallContext(group_id=group_id, audience=tuple(audience))
     def _as_chat(self, target: Union[Chat, str]) -> Optional[Chat]:
         """Resolve a `Chat` or chat id to a `Chat` (or `None` if missing)."""
-        assert self._chats is not None
         if isinstance(target, Chat):
             return target
-        return self._chats.load_chat(target)
+        backend = getattr(self, "_chats", None)
+        return backend.load_chat(target) if backend is not None else None
 
     def _resolve_target(
         self, target: Target, user_id: str
@@ -1035,6 +1074,7 @@ class CharacterAgent:
         self, target: Target, *, user_id: str = "default",
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        group_id: Optional[str] = None,
     ) -> ContextSnapshot:
         """Recall selected memories with rendered sections and token usage.
 
@@ -1044,17 +1084,20 @@ class CharacterAgent:
         return self.build_context_snapshot(
             target, user_id=user_id, budget=budget, reranker=reranker,
             memory_types=memory_types,
+            group_id=group_id,
         )
 
     def build_context(
         self, target: Target, *, user_id: str = "default",
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        group_id: Optional[str] = None,
     ) -> dict[str, str]:
         """Return ordered rendered memory sections and intermediate prompts."""
         return self.build_context_snapshot(
             target, user_id=user_id, budget=budget, reranker=reranker,
             memory_types=memory_types,
+            group_id=group_id,
         ).sections
 
     def build_context_snapshot(
@@ -1063,6 +1106,7 @@ class CharacterAgent:
         memory_types: Optional[Sequence[str]] = None,
         message: Optional[str] = None,
         occurred_at: Optional[float] = None,
+        group_id: Optional[str] = None,
     ) -> ContextSnapshot:
         """Build context once, optionally using a temporary message for retrieval.
 
@@ -1072,6 +1116,9 @@ class CharacterAgent:
         self._require_loaded()
         assert self.character is not None
         last_user_msg, uid, prior, participants, reference = self._resolve_target(target, user_id)
+        recall_context = self.resolve_recall_context(
+            target, user_id=uid, group_id=group_id, participants=participants
+        )
         if message is not None:
             last_user_msg = message
             prior = [*prior, {"role": "user", "content": message}]
@@ -1088,17 +1135,22 @@ class CharacterAgent:
             budget=self._memory_budget(budget),
             reranker=reranker,
             memory_types=memory_types,
+            recall_context=recall_context,
         )
 
     def render_prompt(
         self, target: Target, *, user_id: str = "default",
         budget: Budget = UNSET, reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        group_id: Optional[str] = None,
     ) -> str:
         """Full system-style context block (system line + all sections)."""
         self._require_loaded()
         assert self.character is not None
         last_user_msg, uid, prior, participants, reference = self._resolve_target(target, user_id)
+        recall_context = self.resolve_recall_context(
+            target, user_id=uid, group_id=group_id, participants=participants
+        )
         query = self._weighted_query(last_user_msg, prior)
         temporal = self._resolve_temporal(query, reference)
         return self.character.render_prompt(
@@ -1111,14 +1163,54 @@ class CharacterAgent:
             budget=self._memory_budget(budget),
             reranker=reranker,
             memory_types=memory_types,
+            recall_context=recall_context,
         )
 
     # Chat management
-    def create_chat(self, user: str, *, title: str = "") -> Chat:
+    def create_chat(self, user: str, *, title: str = "", group_id: Optional[str] = None) -> Chat:
         """Create and persist a new chat for `user`."""
         self._require_loaded()
         assert self._chats is not None
-        return self._chats.create_chat(user, title=title)
+        if group_id is not None:
+            assert self.group_directory is not None
+            self.group_directory.ensure(group_id)
+        return self._chats.create_chat(user, title=title, group_id=group_id)
+
+    def list_groups(self) -> list[dict[str, Any]]:
+        """Administrative inspection of all character-scoped group metadata."""
+        self._require_loaded()
+        assert self.group_directory is not None
+        return self.group_directory.list()
+
+    def get_group(self, group_id: str) -> Optional[dict[str, Any]]:
+        """Administrative inspection, deliberately independent of recall privacy."""
+        self._require_loaded()
+        assert self.group_directory is not None
+        group = self.group_directory.get(group_id)
+        if group is None:
+            return None
+        for name, key in (("user_facts", "facts"), ("episodic", "episodes")):
+            memory = self.memories.get(name)
+            group[key] = (
+                memory.store.select(memory.table, {"group_id": group_id}, order_by="id")
+                if isinstance(memory, StructuredMemory) else []
+            )
+        return group
+
+    def update_group(self, group_id: str, **metadata: Any) -> dict[str, Any]:
+        """Edit display name/privacy override, never the observed roster."""
+        self._require_loaded()
+        unknown = set(metadata) - {"display_name", "privacy"}
+        if unknown:
+            raise ValueError(f"Unsupported group metadata: {sorted(unknown)}")
+        assert self.group_directory is not None
+        self.group_directory.update(group_id, **metadata)
+        memory = self.memories.get("groups")
+        if isinstance(memory, StructuredMemory):
+            row = self.group_directory.get(group_id)
+            memory.apply_index_changes(updated_ids=[row["id"]])
+        self.persist_structured()
+        return self.get_group(group_id)
 
     def load_chat(self, chat_id: str) -> Optional[Chat]:
         """Load any chat by id (across users)."""
@@ -1144,6 +1236,7 @@ class CharacterAgent:
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        recall_context: Optional[RecallContext] = None,
     ) -> list[dict[str, str]]:
         assert self.character is not None
         system = self.character.render_prompt(
@@ -1156,6 +1249,7 @@ class CharacterAgent:
             budget=self._memory_budget(budget),
             reranker=reranker,
             memory_types=memory_types,
+            recall_context=recall_context,
         )
         return [{"role": "system", "content": system}, *prior]
 
@@ -1216,6 +1310,7 @@ class CharacterAgent:
         budget: Budget = UNSET,
         reranker: Optional[MemoryReranker] = None,
         memory_types: Optional[Sequence[str]] = None,
+        group_id: Optional[str] = None,
     ) -> Union[str, Iterator[Any]]:
         """Generate an assistant reply for `target`.
 
@@ -1264,6 +1359,9 @@ class CharacterAgent:
         self._require_loaded()
         assert self.llm is not None
         last_user_msg, uid, prior, participants, reference = self._resolve_target(target, user_id)
+        recall_context = self.resolve_recall_context(
+            target, user_id=uid, group_id=group_id, participants=participants
+        )
         query = self._weighted_query(last_user_msg, prior)
         temporal = self._resolve_temporal(query, reference)
         messages = self._build_messages(
@@ -1275,6 +1373,7 @@ class CharacterAgent:
             budget=budget,
             reranker=reranker,
             memory_types=memory_types,
+            recall_context=recall_context,
         )
 
         chat: Optional[Chat] = None
@@ -1291,7 +1390,13 @@ class CharacterAgent:
             self._after_generate(chat, save, reply, auto_extract)
             return reply
 
-        registry = _as_registry(tools)
+        # Bind copies, not shared tool or memory instances: concurrent turns
+        # retain independent audiences, including lazy streaming generators.
+        registry = ToolRegistry(
+            tool.with_recall_context(recall_context)
+            if callable(getattr(tool, "with_recall_context", None)) else tool
+            for tool in _as_registry(tools)
+        )
         if len(registry) == 0:
             # Empty tool set is equivalent to no tools; don't insist on a
             # tool-calling client for it.
@@ -1636,6 +1741,7 @@ class CharacterAgent:
         user_id: str,
         participants: Optional[list[str]] = None,
         chat_id: Optional[str] = None,
+        group_id: Optional[str] = None,
     ) -> None:
         """Run extraction over a batch of message rows.
 
@@ -1677,8 +1783,15 @@ class CharacterAgent:
             for r in rows
         ]
         ids = [int(r["id"]) for r in rows]
+        group = (
+            self.group_directory.get(group_id)
+            if group_id is not None and self.group_directory is not None else None
+        )
         result = self.character.extract(
-            turns, user_id=user_id, participants=participants, chat_id=chat_id
+            turns, user_id=user_id, participants=participants, chat_id=chat_id,
+            group_id=group_id,
+            group_summary=str((group or {}).get("summary") or ""),
+            group_users=list((group or {}).get("observed_users") or []),
         )
         added: dict[str, list] = {}
         dedup_reports: dict[str, DedupReport] = {}
@@ -1772,12 +1885,22 @@ class CharacterAgent:
         self._extract_chat_unlocked(chat)
 
     def _extract_chat_unlocked(self, chat: Chat) -> None:
+        if chat.group_id is not None:
+            # Different linked chats share one previous summary. Read it only
+            # after acquiring this group-scoped lock, outside the KG lock.
+            with object_lock(self.store, ("group-extraction", chat.group_id)):
+                self._extract_chat_batch(chat)
+        else:
+            self._extract_chat_batch(chat)
+
+    def _extract_chat_batch(self, chat: Chat) -> None:
         window = max(self._extract_interval() * 2, 4)
         rows = chat.unextracted()
         if not rows:
             return
         self._extract_messages(
-            rows[-window:], chat.user_id, participants=chat.participants(), chat_id=chat.id
+            rows[-window:], chat.user_id, participants=chat.participants(), chat_id=chat.id,
+            group_id=chat.group_id,
         )
 
     def _update_knowledge_graph(self, added: dict[str, list]) -> None:

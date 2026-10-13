@@ -123,6 +123,11 @@ class ExtractionContext:
     known_facts_intro: str = _DEFAULT_KNOWN_FACTS_INTRO
     footer: str = _DEFAULT_EXTRACTION_FOOTER
     multi_note: str = _DEFAULT_MULTI_NOTE
+    # Source-group identity and previous profile are authoritative caller data,
+    # never identities proposed by the model.
+    group_id: Optional[str] = None
+    group_summary: str = ""
+    group_users: list[str] = field(default_factory=list)
 
     @property
     def multi_user(self) -> bool:

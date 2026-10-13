@@ -21,6 +21,7 @@ class UserFactMemory(StructuredMemory):
 
     name = "user_facts"
     table = "user_facts"
+    supports_recall_context = True
     extra_columns = {
         "type": "TEXT NOT NULL DEFAULT 'general'",
         "content": "TEXT NOT NULL",
@@ -28,6 +29,7 @@ class UserFactMemory(StructuredMemory):
         # The chat a fact was learned in (NULL ⇒ legacy / single-user). Used
         # by the knowledge graph to link facts and episodes of the same chat.
         "chat_id": "TEXT",
+        "group_id": "TEXT",
         # Stable provenance into the messages table. Empty only for facts added
         # directly through the public API rather than conversation extraction.
         "source_message_ids": "TEXT NOT NULL DEFAULT '[]'",
@@ -45,6 +47,7 @@ class UserFactMemory(StructuredMemory):
         confidence: float = 0.5,
         chat_id: Optional[str] = None,
         source_message_ids: Optional[list[int]] = None,
+        group_id: Optional[str] = None,
     ) -> int:
         return self.add(
             user_id,
@@ -53,6 +56,7 @@ class UserFactMemory(StructuredMemory):
             content=content,
             confidence=confidence,
             chat_id=chat_id,
+            group_id=group_id,
             source_message_ids=json.dumps(source_message_ids or []),
         )
 
@@ -60,7 +64,7 @@ class UserFactMemory(StructuredMemory):
         return f"[{row.get('type', 'general')}] {row.get('content', '')}"
 
     def row_item(self, row: dict[str, Any], score: float) -> MemoryItem:
-        text = f"{row.get('content', '')} (type: {row.get('type', 'general')}, confidence: {row.get('confidence', 0):.2f})"
+        text = self._group_label(row) + f"{row.get('content', '')} (type: {row.get('type', 'general')}, confidence: {row.get('confidence', 0):.2f})"
         return MemoryItem(text=text, score=score, kind=self.name, metadata=dict(row))
 
     def contradiction_policy(self) -> ContradictionPolicy:
@@ -105,7 +109,12 @@ class UserFactMemory(StructuredMemory):
             ),
         )
 
-    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None) -> list[MemoryItem]:
+    def apply_extraction_with_context(self, value, context, *, chat_id=None):
+        return self.apply_extraction(value, context.user_name, chat_id=chat_id,
+                                     group_id=getattr(context, "group_id", None))
+
+    def apply_extraction(self, value: Any, user_id: str, *, chat_id: Optional[str] = None,
+                         group_id: Optional[str] = None) -> list[MemoryItem]:
         added: list[MemoryItem] = []
         for f in value or []:
             content = (f.get("content") or "").strip()
@@ -114,7 +123,7 @@ class UserFactMemory(StructuredMemory):
             if (
                 not content
                 or not source_message_ids
-                or self._has_text(uid, content, "content")
+                or self._has_text(uid, content, "content", group_id=group_id)
             ):
                 continue
             # Multi-user: attribute to the participant the LLM named, else the
@@ -126,6 +135,7 @@ class UserFactMemory(StructuredMemory):
                 importance=self._clip(f.get("importance", 0.5)),
                 confidence=self._clip(f.get("confidence", 0.5)),
                 chat_id=chat_id,
+                group_id=group_id,
                 source_message_ids=source_message_ids,
             )
             row = self.get_row(row_id)
