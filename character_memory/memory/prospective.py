@@ -5,11 +5,15 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import math
+import logging
 from typing import Any, Optional
 
 from .base import ExtractionSpec, MemoryItem
 from .continuity import ContinuityMemory, SOURCE_IDS_SCHEMA
 from .extract import ExtractionContext
+
+
+_logger = logging.getLogger(__name__)
 
 
 class ProspectiveMemory(ContinuityMemory):
@@ -140,9 +144,29 @@ class ProspectiveMemory(ContinuityMemory):
                     "resolution": {"type": "string"},
                     "source_message_ids": SOURCE_IDS_SCHEMA,
                 }, "required": ["operation", "source_message_ids"],
+                "allOf": [
+                    {"if": {"properties": {"operation": {"enum": ["create"]}}},
+                     "then": {"required": ["content"], "properties": {
+                         "content": {"type": "string", "pattern": r"\S"}}}},
+                    {"if": {"properties": {"operation": {"enum": ["update", "resolve", "dismiss", "reopen"]}}},
+                     "then": {"required": ["thread_id"]}},
+                    {"if": {"properties": {"operation": {"enum": ["resolve", "dismiss"]}}},
+                     "then": {"required": ["resolution"], "properties": {
+                         "resolution": {"type": "string", "pattern": r"\S"}}}},
+                ],
             }},
             instruction=(
-                "- open_threads: unresolved concerns, intentions, unanswered questions or promises worth "
+                "- open_threads: first reconcile stored open threads against the recent conversation, "
+                "then create any new unresolved matters. Emit resolve for clear completion evidence "
+                "even when no new thread needs creating; the user need not say 'mark resolved'. "
+                "For an unanswered question, an actual answer completes it; for a promise to explain X, "
+                "the assistant actually providing that explanation fulfills it. A reported outcome "
+                "such as 'the surgery went well' resolves waiting to hear how surgery went. "
+                "Resolve only what the evidence establishes: a scheduled surgery is not a completed "
+                "surgery, and an outcome does not automatically end an ongoing recovery concern. "
+                "Hypothetical outcomes and promises to do something later are not completion. "
+                "Copy the stored id into thread_id and cite the completing transcript message IDs. "
+                "New threads are unresolved concerns, intentions, unanswered questions or promises worth "
                 "revisiting with a participant. No date is required. Examples: Francesco is nervous about "
                 "his mother's surgery (ask how it went, without assuming it happened); the character "
                 "promised to explain X next time (offer that explanation at a suitable opportunity). "
@@ -155,19 +179,38 @@ class ProspectiveMemory(ContinuityMemory):
                 "(explicit cancellation or request not to ask), or reopen (explicit renewed concern). "
                 "Resolve/dismiss require a resolution sentence. Mere mention, asking about progress, "
                 "elapsed time or recalling a thread does not resolve it. Do not recreate closed threads "
-                "or duplicate paraphrases. Stored threads below are context, not new evidence:\n"
+                "or duplicate paraphrases. Reconciliation may produce NO operations: leave a thread "
+                "open unless the transcript actually establishes its completion or cancellation. "
+                "Negative examples: for 'Alice intends to finish her essay', 'How is the essay coming "
+                "along?' leaves it OPEN; 'If I finish tomorrow, I will celebrate' leaves it OPEN; "
+                "'I will finish tomorrow' leaves it OPEN. Return open_threads: [] for these examples "
+                "when there are no other updates. Only 'I finished the essay' supports resolve. "
+                "A resolution sentence must describe the completed matter, never merely that someone "
+                "asked about it or mentioned a future possibility. "
+                "Stored threads below are context, not new evidence:\n"
                 + json.dumps(existing, ensure_ascii=False)
             ),
         )
 
+    def _rejected_update(self, update, reason: str) -> None:
+        operation = update.get("operation")
+        # Log only recognized operations and numeric IDs, never arbitrary model text.
+        safe_operation = operation if operation in ("create", "update", "resolve", "dismiss", "reopen") else "invalid"
+        thread_id = update.get("thread_id")
+        safe_id = thread_id if type(thread_id) is int else None
+        _logger.warning("Rejected prospective update operation=%s thread_id=%s: %s",
+                        safe_operation, safe_id, reason)
+
     def _apply_update(self, update, context, chat_id, source_ids):
         uid = str(update.get("user_id") or context.user_name)
         if uid not in self.people(context):
+            self._rejected_update(update, "unknown participant")
             return None
         operation = update.get("operation")
         content = str(update.get("content") or "").strip()
         if operation == "create":
             if not content or self._has_text(uid, content):
+                self._rejected_update(update, "empty or duplicate content")
                 return None
             return self.add_thread(
                 uid, content, kind=update.get("kind", "concern"),
@@ -175,21 +218,28 @@ class ProspectiveMemory(ContinuityMemory):
                 importance=update.get("importance", 0.7), chat_id=chat_id,
                 source_message_ids=source_ids,
             )
-        if operation not in {"update", "resolve", "dismiss", "reopen"}:
+        if operation not in ("update", "resolve", "dismiss", "reopen"):
+            self._rejected_update(update, "unsupported operation")
             return None
-        row = self.get_row(int(update["thread_id"]))
+        if type(update.get("thread_id")) is not int:
+            self._rejected_update(update, "thread_id must be an integer")
+            return None
+        row = self.get_row(update["thread_id"])
         if row is None or row["user_id"] != uid:
+            self._rejected_update(update, "unknown thread or owner mismatch")
             return None
         changes = {}
         if operation in {"resolve", "dismiss"}:
             resolution = str(update.get("resolution") or "").strip()
             if not resolution or row["status"] != "open":
+                self._rejected_update(update, "missing resolution or thread already closed")
                 return None
             changes.update(status="resolved" if operation == "resolve" else "dismissed",
                            resolution=resolution, resolved_at=self._now())
         elif operation == "reopen":
             changes.update(status="open", resolution="", resolved_at=None, last_recalled=None)
         elif row["status"] != "open":
+            self._rejected_update(update, "ordinary update cannot reopen a closed thread")
             return None
         if content:
             changes["content"] = content

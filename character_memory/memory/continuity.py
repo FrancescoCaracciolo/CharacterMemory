@@ -65,22 +65,28 @@ class ContinuityMemory(StructuredMemory):
                 continue
             supplied = update.get("source_message_ids")
             if not isinstance(supplied, list):
+                self._rejected_update(update, "source_message_ids must be a list")
                 continue
             ids = list(dict.fromkeys(
                 mid for mid in supplied
                 if isinstance(mid, int) and not isinstance(mid, bool) and mid in evidence
             ))
             if not ids:
+                self._rejected_update(update, "no valid transcript evidence")
                 continue
             try:
                 row_id = self._apply_update(update, context, chat_id, ids)
             except (KeyError, TypeError, ValueError):
                 # A malformed update must not drop other valid updates.
+                self._rejected_update(update, "missing or invalid operation fields")
                 continue
             row = self.get_row(row_id) if row_id is not None else None
             if row is not None:
                 changed[row_id] = self.row_item(row, self._effective(row))
         return list(changed.values())
+
+    def _rejected_update(self, update, reason: str) -> None:
+        """Optional diagnostic hook; never include transcript content."""
 
     @abstractmethod
     def _apply_update(self, update, context, chat_id, source_ids) -> Optional[int]:

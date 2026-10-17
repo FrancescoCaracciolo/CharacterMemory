@@ -52,7 +52,9 @@ _DEFAULT_KNOWN_FACTS_INTRO = (
     "genuinely new information):"
 )
 _DEFAULT_EXTRACTION_FOOTER = (
-    "Only include genuinely new, non-trivial items. Return [] where nothing "
+    "Include new, non-trivial information and evidence-backed updates to existing memories. "
+    "Completing, cancelling, or reopening an existing thread is new information. "
+    "Return [] where nothing "
     "fits, and omit fields entirely if they are not present in the schema.\n\n"
     "Recent conversation:"
 )
