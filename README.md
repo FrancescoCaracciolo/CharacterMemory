@@ -195,7 +195,10 @@ Still in beta, not available to the public yet.
 https://github.com/user-attachments/assets/ade9442e-b19a-4a71-a275-756d935a8b47
 
 - [**Amadeus Project**](https://github.com/reflectors02/Amadeus-Project/tree/main): experimenting with the new memory system 
-- [**Nyarch Assistant**](https://github.com/NyarchLinux/NyarchAssistant): will have native support to CharacterMemory starting from v1.6.0 
+- [**Nyarch Assistant**](https://github.com/NyarchLinux/NyarchAssistant)
+
+<img width="1767" height="976" alt="Schermata del 2026-10-16 11-12-48" src="https://github.com/user-attachments/assets/b2a7146f-a358-4fcc-a4ab-2731870cd208" />
+
 
 ### Credits and AI Disclosure
 - The logo, banner and graphics are designed by [GiuliettesPhotography](https://www.instagram.com/giuliettesphotography) 
