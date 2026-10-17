@@ -2855,3 +2855,126 @@ html.live-graph-embed #groups-pane { display: none !important; }
   .chat-group-bar { padding: 12px; }
   .tab { font-size: 10px; }
 }
+
+/* Embedded graph chrome follows the same palette as the canvas.  The iframe
+   accepts graph-specific colour tokens in its URL, while these controls used
+   the application theme tokens directly and therefore stayed purple/orange
+   when a host supplied a custom palette. */
+html.live-graph-embed .live-embed-toolbar {
+  color: var(--graph-label);
+  background: color-mix(in srgb, var(--graph-a) 88%, transparent);
+  border-color: var(--graph-ink);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--graph-ink) 22%, transparent);
+}
+html.live-graph-embed .live-embed-connection,
+html.live-graph-embed .live-embed-identity { color: var(--graph-muted); }
+html.live-graph-embed .live-panel-label { color: var(--graph-muted); }
+html.live-graph-embed .live-status-dot { background: var(--graph-muted); }
+html.live-graph-embed .live-status-dot.connected {
+  background: var(--graph-node-self);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--graph-node-self) 15%, transparent);
+}
+html.live-graph-embed .live-status-dot.connecting { background: var(--graph-node-default); }
+html.live-graph-embed .live-status-dot.error { background: var(--graph-edge-transition); }
+html.live-graph-embed .live-embed-toolbar .user-filter {
+  color: var(--graph-label);
+  background: var(--graph-b);
+  border-color: var(--graph-ink);
+}
+html.live-graph-embed .live-embed-full-btn {
+  color: var(--graph-label);
+  background: var(--graph-b);
+  border-color: var(--graph-ink);
+}
+html.live-graph-embed .live-embed-full-btn:hover {
+  color: var(--graph-label);
+  background: color-mix(in srgb, var(--graph-node-default) 30%, var(--graph-a));
+}
+html.live-graph-embed .live-embed-full-btn.graph-freeze-on {
+  color: var(--graph-label);
+  background: color-mix(in srgb, var(--graph-node-self) 22%, var(--graph-a));
+}
+html.live-graph-embed .live-embed-full-btn.graph-freeze-on:hover {
+  background: color-mix(in srgb, var(--graph-node-self) 32%, var(--graph-a));
+}
+html.live-graph-embed .live-embed-recalls-btn {
+  color: var(--graph-label);
+  background: color-mix(in srgb, var(--graph-node-default) 24%, var(--graph-a));
+  border-color: var(--graph-ink);
+  box-shadow: 2px 2px 0 color-mix(in srgb, var(--graph-ink) 28%, transparent);
+}
+html.live-graph-embed .live-embed-recalls-btn:hover {
+  background: color-mix(in srgb, var(--graph-node-default) 38%, var(--graph-a));
+}
+html.live-graph-embed .live-embed-recalls-count {
+  color: var(--graph-label);
+  background: var(--graph-b);
+  border-color: var(--graph-ink);
+}
+html.live-graph-embed .graph-nav-btn {
+  color: var(--graph-label);
+  background: color-mix(in srgb, var(--graph-a) 94%, transparent);
+  border-color: var(--graph-ink);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--graph-ink) 22%, transparent);
+}
+html.live-graph-embed .graph-nav-btn:hover {
+  color: var(--graph-node-self);
+}
+html.live-graph-embed .graph-nav-btn:focus-visible {
+  outline-color: var(--graph-node-self);
+}
+html.live-graph-embed .live-embed-drawer {
+  color: var(--graph-label);
+  background: var(--graph-a);
+  border-color: var(--graph-ink);
+  box-shadow: 6px 8px 0 color-mix(in srgb, var(--graph-ink) 30%, transparent);
+}
+html.live-graph-embed .live-embed-drawer-head {
+  background: var(--graph-b);
+  border-color: var(--graph-ink);
+}
+html.live-graph-embed .live-embed-drawer-actions .btn,
+html.live-graph-embed .live-embed-drawer-head .modal-close {
+  color: var(--graph-label);
+  background: var(--graph-b);
+  border-color: var(--graph-ink);
+}
+html.live-graph-embed .live-embed-drawer-actions .btn:hover,
+html.live-graph-embed .live-embed-drawer-head .modal-close:hover {
+  color: var(--graph-label);
+  background: color-mix(in srgb, var(--graph-node-default) 30%, var(--graph-a));
+  border-color: var(--graph-node-self);
+}
+html.live-graph-embed .live-embed-request {
+  color: var(--graph-muted);
+  background: var(--graph-b);
+  border-color: var(--graph-ink);
+}
+html.live-graph-embed .live-memory {
+  background: color-mix(in srgb, var(--graph-b) 70%, transparent);
+  border-color: var(--graph-muted);
+}
+html.live-graph-embed .live-memory[open] {
+  border-color: color-mix(in srgb, var(--graph-node-self) 48%, var(--graph-ink));
+}
+html.live-graph-embed .live-memory-chev { color: var(--graph-muted); }
+html.live-graph-embed .live-memory[open] .live-memory-chev { color: var(--graph-node-self); }
+html.live-graph-embed .live-memory-scope,
+html.live-graph-embed .live-memory-prompt,
+html.live-graph-embed .live-item-kind,
+html.live-graph-embed .live-item-meta { color: var(--graph-muted); }
+html.live-graph-embed .live-memory-count,
+html.live-graph-embed .live-item-score { color: var(--graph-node-self); }
+html.live-graph-embed .live-memory-count {
+  background: color-mix(in srgb, var(--graph-node-self) 18%, var(--graph-a));
+  border-color: color-mix(in srgb, var(--graph-node-self) 45%, transparent);
+}
+html.live-graph-embed .live-item {
+  background: var(--graph-b);
+  border-color: var(--graph-muted);
+}
+html.live-graph-embed .live-embed-backdrop {
+  background: color-mix(in srgb, var(--graph-ink) 62%, transparent);
+}
+html.live-graph-embed .live-empty-mark { color: var(--graph-node-self); }
+html.live-graph-embed .live-empty code { color: var(--graph-node-person); }
