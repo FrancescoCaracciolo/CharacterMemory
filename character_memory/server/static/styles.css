@@ -2978,3 +2978,54 @@ html.live-graph-embed .live-embed-backdrop {
 }
 html.live-graph-embed .live-empty-mark { color: var(--graph-node-self); }
 html.live-graph-embed .live-empty code { color: var(--graph-node-person); }
+
+/* ====================================================================== */
+/* Dropdowns: drop the native widget and draw a themed chevron.           */
+/* The caret is two gradients rather than an SVG so it can follow theme   */
+/* tokens. Several earlier rules use `background`/`padding` shorthands at */
+/* higher specificity, hence !important on the caret's own properties.    */
+/* ====================================================================== */
+select:not([multiple]):not([size]) {
+  --select-caret: var(--text-dim);
+  -webkit-appearance: none; -moz-appearance: none; appearance: none;
+  padding-right: 34px !important;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--select-caret) 50%),
+    linear-gradient(135deg, var(--select-caret) 50%, transparent 50%) !important;
+  background-position: calc(100% - 18px) 52%, calc(100% - 13px) 52% !important;
+  background-size: 5px 5px, 5px 5px !important;
+  background-repeat: no-repeat !important;
+  cursor: pointer; text-overflow: ellipsis; white-space: nowrap;
+}
+select:not([multiple]):not([size]):not(:disabled):hover { --select-caret: var(--accent); border-color: var(--accent); }
+select:not([multiple]):not([size]):not(:disabled):focus { --select-caret: var(--info); }
+select:not([multiple]):not([size]):disabled { --select-caret: var(--text-faint); cursor: not-allowed; opacity: .65; }
+html.live-graph-embed select:not([multiple]):not([size]):not(:disabled) { --select-caret: var(--graph-label); }
+select option, select optgroup { background: var(--surface); color: var(--text); font: 600 13px var(--sans); }
+select option:checked { background: var(--accent-soft); color: var(--accent); }
+select option:disabled { color: var(--text-faint); }
+
+/* Browsers with customizable selects also get a themed popup list. */
+@supports (appearance: base-select) {
+  select:not([multiple]):not([size]), ::picker(select) { appearance: base-select; }
+  select:not([multiple]):not([size])::picker-icon { display: none; }
+  ::picker(select) {
+    margin-top: 6px; padding: 5px; max-height: min(320px, 60vh); overflow-y: auto;
+    color: var(--text); background: var(--surface);
+    border: 2px solid var(--outline); border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+    opacity: 0; transform: translateY(-4px);
+    transition: opacity .14s ease, transform .14s ease, overlay .14s allow-discrete, display .14s allow-discrete;
+  }
+  ::picker(select):popover-open { opacity: 1; transform: none; }
+  @starting-style { ::picker(select):popover-open { opacity: 0; transform: translateY(-4px); } }
+  select:not([multiple]):not([size]):open { --select-caret: var(--info); border-color: var(--info); }
+  select option {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px;
+    background: transparent; cursor: pointer; transition: background .12s ease, color .12s ease;
+  }
+  select option:hover, select option:focus-visible { background: var(--surface-alt); color: var(--text); outline: none; }
+  select option:checked { background: var(--accent-soft); color: var(--accent); font-weight: 800; }
+  select option::checkmark { order: 1; margin-left: auto; color: var(--accent); }
+  select optgroup { padding: 4px 0; background: transparent; color: var(--text-faint); font: 900 10px/1.3 var(--sans); letter-spacing: .08em; text-transform: uppercase; }
+}
